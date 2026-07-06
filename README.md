@@ -43,7 +43,7 @@
 
 ## 팀원 구성
 - 멘토: 박해규 멘토님
-- 팀장: 고명재 (AI Vision)
+- 팀장: 고명재 (Frontend & 3D Engineer)
 - 팀원: 이정기 (Backend & Streaming Engineer)
-- 팀원: 이주현 (Frontend & 3D Engineer)
+- 팀원: 이주현 (AI Vision)
 - 팀원: 이한종 (Edge H/W & PM)
