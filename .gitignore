@@ -12,3 +12,11 @@ venv/
 
 # VS Code 설정 파일들 (개인 환경 설정이라 굳이 공유 안 함)
 .vscode/
+
+# colcon (ROS 2) 빌드 산출물
+build/
+install/
+log/
+
+# Node.js
+node_modules/
