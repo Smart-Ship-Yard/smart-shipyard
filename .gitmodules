@@ -6,3 +6,6 @@
 	path = edge/ros2_ws/src/wit_ros2_imu
 	url = https://github.com/ElettraSciComp/witmotion_IMU_ros.git
 	branch = ros2
+[submodule "edge/vision/third_party/pyorbbecsdk"]
+	path = edge/vision/third_party/pyorbbecsdk
+	url = https://github.com/orbbec/pyorbbecsdk.git

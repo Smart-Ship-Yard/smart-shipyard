@@ -3,15 +3,33 @@
 <package format="3">
   <name>ship_ugv_perception</name>
   <version>0.1.0</version>
-  <description>Depth camera event detection to map-frame point conversion via TF lookup (change_point.py)</description>
+  <description>Depth camera event to map-point conversion via TF (change_point.py) + YOLO/Depth publisher (yolo_depth_publisher.py)</description>
   <maintainer email="you@example.com">jh</maintainer>
   <license>Apache-2.0</license>
 
-  <depend>rclpy</depend>
-  <depend>std_msgs</depend>
-  <depend>geometry_msgs</depend>
-  <depend>tf2_ros</depend>
-  <depend>tf2_geometry_msgs</depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
+  <!-- yolo_depth_publisher.py 신규 의존성 (rosdep으로 자동 설치 가능) -->
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+
+  <!--
+    아래 두 의존성은 rosdep 키가 존재하지 않아 여기 선언할 수 없음.
+    각자 수동 설치 필요 (CONTRIBUTING.md 8번 / PROJECT_SUMMARY.md 3절 참고):
+    - ultralytics : pip3 install ultralytics ==no-deps (Jetson은 torch 덮어쓰기 방지 필수)
+    - pyorbbecsdk : edge/vision/third_party/pyorbbecsdk 에서 소스 빌드
+                    (Astra+는 반드시 v1 계열 = main 브랜치! v2-main은 미지원)
+    - torch/torchvision : Jetson 전용 wheel 사용
+                    (pypi.jetson-ai-lab.io/jp6/cu126, 일반 pip install torch 금지)
+  -->
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

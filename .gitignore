@@ -20,3 +20,7 @@ log/
 
 # Node.js
 node_modules/
+
+# Orbbec SDK 런타임 로그 (실행 위치에 자동 생성됨)
+Log/
+OrbbecSDK.log*
