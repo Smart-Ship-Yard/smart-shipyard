@@ -1,0 +1,22 @@
+# 파이썬 캐시 파일 무시 (프로그램 속도 향상용 파일들)
+__pycache__/
+*.pyc
+*.pyo
+
+# 가상환경 폴더 무시 (용량이 너무 크고 컴퓨터마다 환경이 다르니까!)
+venv/
+.venv/
+
+# 비밀번호가 담긴 금고 파일 무시
+.env
+
+# VS Code 설정 파일들 (개인 환경 설정이라 굳이 공유 안 함)
+.vscode/
+
+# colcon (ROS 2) 빌드 산출물
+build/
+install/
+log/
+
+# Node.js
+node_modules/
