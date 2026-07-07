@@ -1,0 +1,8 @@
+[submodule "edge/ros2_ws/src/rplidar_ros"]
+	path = edge/ros2_ws/src/rplidar_ros
+	url = https://github.com/Slamtec/rplidar_ros.git
+	branch = ros2
+[submodule "edge/ros2_ws/src/wit_ros2_imu"]
+	path = edge/ros2_ws/src/wit_ros2_imu
+	url = https://github.com/ElettraSciComp/witmotion_IMU_ros.git
+	branch = ros2

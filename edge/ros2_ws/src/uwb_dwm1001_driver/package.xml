@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>uwb_dwm1001_driver</name>
+  <version>0.1.0</version>
+  <description>DWM1001 UWB UART driver publishing gated pose to uwb_frame</description>
+  <maintainer email="you@example.com">jh</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <!-- import serial (pyserial). rosdep 키 python3-serial → apt python3-serial.
+       setup.py의 install_requires만으로는 rosdep install 시 안 잡히므로 여기 필수 -->
+  <exec_depend>python3-serial</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

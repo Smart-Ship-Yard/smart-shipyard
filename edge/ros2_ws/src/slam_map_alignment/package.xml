@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>slam_map_alignment</name>
+  <version>0.1.0</version>
+  <description>Aligns slam_toolbox's slam_map frame to the UWB-calibrated map frame using trajectory correspondence + RANSAC rigid transform, recorded during a mapping session</description>
+  <maintainer email="you@example.com">jh</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2_ros</depend>
+  <!-- _uwb_cb에서 do_transform_point 사용 (map<-uwb_frame 변환) — 누락 시 새 환경에서 rosdep 미해결 -->
+  <depend>tf2_geometry_msgs</depend>
+  <depend>python3-numpy</depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
