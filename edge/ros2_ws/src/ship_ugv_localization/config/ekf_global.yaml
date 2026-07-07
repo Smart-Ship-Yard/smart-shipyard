@@ -1,0 +1,97 @@
+### ekf_global.yaml
+# EKF #2 (global): ekf_local 출력 + UWB pose + heading_complementary_filter yaw
+#                  -> map -> odom (TF 트리 단일부모 제약으로 인해 map->base_link를
+#                     내부적으로 계산한 뒤 odom->base_link(ekf_local, 항상 매끈함)의
+#                     역변환으로 map->odom을 역산해 발행함)
+#
+# *** 중요 버그 노트 ***
+# odom0(=ekf_local의 /odometry/local 출력)의 "위치"는 odom 프레임 기준이라
+# map 프레임에서는 의미가 없다. 반드시 속도(vx, vyaw)만 fuse해야 한다.
+# 과거 heading_complementary_filter README 예시에서도 이 실수(위치까지 fuse)가
+# 있었던 것을 발견해 같이 정정했다. 위치를 fuse하면 map 프레임 위치 추정이
+# 엉뚱한 odom 좌표로 오염된다.
+ekf_global:
+  ros__parameters:
+    frequency: 30.0
+    two_d_mode: true
+    print_diagnostics: true
+    debug: false
+
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: map            # global EKF는 map이 world
+
+    publish_tf: true            # map -> odom 발행 (slam_toolbox는 publish_tf:false로 침묵)
+
+    # ---- ekf_local 결과 (odom0) : 속도만! 위치는 넣지 않는다 ----
+    odom0: /odometry/local
+    odom0_config: [false, false, false,   # x, y, z  <- 절대 넣지 말 것 (odom 프레임 위치라 map에서 무의미)
+                   false, false, false,   # roll, pitch, yaw
+                   true,  false, false,   # vx
+                   false, false, true,    # vyaw
+                   false, false, false]
+    odom0_differential: false
+    odom0_relative: false
+    odom0_queue_size: 10
+
+    # ---- UWB pose (map -> uwb_frame 캘리브레이션 적용된 후 EKF 입력 시점에는
+    #      TF tree를 통해 자동으로 map 프레임 기준으로 해석됨. pose 메시지의
+    #      frame_id는 'uwb_frame'이며 EKF가 TF lookup으로 map으로 변환) ----
+    pose0: /uwb/pose
+    pose0_config: [true,  true,  false,   # x, y
+                   false, false, false,   # UWB는 orientation 없음 (heading_complementary_filter가 별도 공급)
+                   false, false, false,
+                   false, false, false,
+                   false, false, false]
+    pose0_differential: false
+    pose0_relative: false
+    pose0_queue_size: 10
+    pose0_rejection_threshold: 3.0   # 마할라노비스 거리 기반 - 실측 후 튜닝 필요 (TODO)
+
+    # ---- heading_complementary_filter 융합 yaw (orientation-only IMU 메시지) ----
+    imu1: /heading/imu_uwb_fused
+    imu1_config: [false, false, false,
+                  false, false, true,     # yaw만
+                  false, false, false,
+                  false, false, false,
+                  false, false, false]
+    imu1_differential: false
+    imu1_relative: false
+    imu1_remove_gravitational_acceleration: false
+    imu1_queue_size: 10
+
+    # ---- [운영 모드 전용] slam_toolbox localization의 /pose를 두 번째 절대위치 소스로 ----
+    # 매핑 모드에서는 반드시 주석 상태 유지! (매핑 중 slam pose는 slam_map 프레임이고
+    # map->slam_map 정합 TF가 아직 없어 EKF가 변환 불가 → 오염 위험)
+    # 운영 모드 launch에서 아래 3블록의 주석을 해제하거나, 별도 yaml 오버레이로 켤 것.
+    # 사전 확인: (1) slam_toolbox는 자기 네임스페이스 기준 'pose'로 발행하므로
+    #   실제 토픽명이 /pose 일 수 있음. `ros2 topic list | grep -i pose`로 확인 후
+    #   launch에서 remappings=[('pose', '/slam_toolbox/pose')]로 통일하거나 아래 pose1 값을 맞출 것.
+    #   타입은 geometry_msgs/PoseWithCovarianceStamped여야 함 (PoseStamped면 릴레이 노드 필요)
+    # (2) covariance가 현실적인 값인지 확인 (과소 covariance면 LiDAR 과신)
+    # pose1: /slam_toolbox/pose
+    # pose1_config: [true,  true,  false,   # x, y
+    #                false, false, true,    # yaw
+    #                false, false, false,
+    #                false, false, false,
+    #                false, false, false]
+    # pose1_differential: false
+    # pose1_relative: false
+    # pose1_queue_size: 10
+    # pose1_rejection_threshold: 3.0   # 마할라노비스 거리 - 실측 튜닝 필요 (TODO)
+
+    process_noise_covariance: [0.05, 0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0.05, 0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0.06, 0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0.03, 0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0.03, 0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0.06, 0,     0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0.025, 0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0.025, 0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0.04, 0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0,    0.01, 0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0.01, 0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0.02, 0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0.01, 0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0.01, 0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0.015]

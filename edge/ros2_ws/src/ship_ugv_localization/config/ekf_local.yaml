@@ -1,0 +1,60 @@
+### ekf_local.yaml
+# EKF #1 (local): 엔코더 + IMU -> odom -> base_link
+# world_frame이 odom이므로, 여기서 나온 값은 "얼마나 매끄럽게 이어지는가"만 보장하고
+# 절대 위치의 정확성은 보장하지 않는다 (drift 발생, 정상 동작).
+#
+# 중요: odom0(엔코더)는 위치가 아니라 속도(vx, vyaw)만 fuse한다.
+# 엔코더 오도메트리 위치값 자체도 누적 오차가 있고, 어차피 이 EKF의 목적은
+# odom 프레임 내에서의 매끄러운 로컬 추정이므로 위치는 이 필터가 자체 적분해
+# 산출하도록 둔다. (속도만 넣고 위치는 필터가 추정하게 하는 것이 관례)
+ekf_local:
+  ros__parameters:
+    frequency: 50.0
+    two_d_mode: true
+    print_diagnostics: true
+    debug: false
+
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom          # local EKF는 odom이 world
+
+    publish_tf: true           # odom -> base_link 발행
+
+    # ---- 엔코더 오도메트리 ----
+    odom0: /wheel/odom
+    odom0_config: [false, false, false,   # x, y, z (위치는 fuse 안 함)
+                   false, false, false,   # roll, pitch, yaw
+                   true,  false, false,   # vx, vy, vz  (선속도 vx만)
+                   false, false, true,    # vroll, vpitch, vyaw (각속도 vyaw만)
+                   false, false, false]   # ax, ay, az
+    odom0_differential: false
+    odom0_relative: false
+    odom0_queue_size: 10
+
+    # ---- IMU (자이로 yaw rate + 가속도 x,y만; 마그네토미터 절대 yaw 배제) ----
+    imu0: /imu/data
+    imu0_config: [false, false, false,    # x, y, z
+                  false, false, false,    # roll, pitch, yaw  <- 절대 orientation 미사용
+                  false, false, false,    # vx, vy, vz
+                  false, false, true,     # vroll, vpitch, vyaw
+                  true,  true,  false]    # ax, ay, az  (ax, ay만)
+    imu0_differential: false
+    imu0_relative: false
+    imu0_remove_gravitational_acceleration: true
+    imu0_queue_size: 10
+
+    process_noise_covariance: [0.05, 0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0.05, 0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0.06, 0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0.03, 0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0.03, 0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0.06, 0,     0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0.025, 0,     0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0.025, 0,    0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0.04, 0,    0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0,    0.01, 0,    0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0.01, 0,    0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0.02, 0,    0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0.01, 0,    0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0.01, 0,
+                                0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0.015]
