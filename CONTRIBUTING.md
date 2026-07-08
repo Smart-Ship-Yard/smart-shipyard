@@ -92,11 +92,11 @@ venv 생성이나 패키지 설치 같은 세팅은 각 파트 섹션(6번~)의 
    ```
 3. 작업 후 커밋. **그날 작업물은 그날 브랜치에 push까지 해둡니다.**
    ```bash
-   git status   # 뭐가 바뀌었는지 확인
-   # 주의!! 내가 건드린 파일만!! 아래처럼 콕 집어 add하기!!!
-   git add backend/routes/user.js backend/controllers/auth.js   
-   # 최상위 폴더(smart-shipyard)에서 add하면 다른 작업자의 최신 파일이 변경될 수 있음!!
-   # 추가로 남의 파일 건들지 말기!(git add .을 할 거면 자신의 폴더[예를 들어 backend폴더] 안에서 하기)
+  git status   # 뭐가 바뀌었는지 확인
+  # 주의!! 내가 건드린 파일만!! 아래처럼 콕 집어 add하기!!!
+  git add backend/<내가_수정한_파일1> backend/<내가_수정한_파일2>
+  # 최상위 폴더(smart-shipyard)에서 add하면 다른 작업자의 최신 파일이 변경될 수 있음!!
+  # 추가로 남의 파일 건들지 말기!(git add .을 할 거면 자신의 폴더[예를 들어 backend폴더] 안에서 하기)
    git commit -m "feat: 작업 내용"
    git push -u origin feature/기능이름
    ```
