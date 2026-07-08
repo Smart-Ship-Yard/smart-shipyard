@@ -597,12 +597,11 @@ class SceneManager {
     this.blockMeshes.forEach((rec, id) => {
       // 배 전체가 아니라 해당 구획 메쉬만 살짝 띄운다
       rec.mesh.position.y = id === blockId ? 0.25 : 0;
-      if (rec.state !== "danger") {
-        rec.mesh.material.emissiveIntensity = id === blockId ? 0.6 : 0.0;
-        if (id === blockId) rec.mesh.material.emissive = new THREE.Color("#2dd4bf");
-        else if (rec.mesh.material.emissive.getHexString() !== "ff3b47")
-          rec.mesh.material.emissive = new THREE.Color("#000000");
-      }
+      rec.mesh.material.emissiveIntensity = id === blockId ? 0.6 : 0.0;
+
+      if (id === blockId) rec.mesh.material.emissive = new THREE.Color("#2dd4bf");
+      else if (rec.mesh.material.emissive.getHexString() !== "ff3b47")
+        rec.mesh.material.emissive = new THREE.Color("#000000");
     });
   }
 
