@@ -511,6 +511,7 @@ class SceneManager {
   /* 요구사항 3: 서버 좌표 → 3D 매핑 + Red Alert Ping */
   spawnPing(payload) {
     const meta = CLASS_META[payload.cls];
+    if (!meta) return;
     const color = new THREE.Color(SEV_COLOR[meta.severity]);
     const pos = serverToWorld(payload.blockId, payload.local);
 
