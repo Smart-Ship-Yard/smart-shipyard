@@ -92,7 +92,11 @@ venv 생성이나 패키지 설치 같은 세팅은 각 파트 섹션(6번~)의 
    ```
 3. 작업 후 커밋. **그날 작업물은 그날 브랜치에 push까지 해둡니다.**
    ```bash
-   git add .
+   git status   # 뭐가 바뀌었는지 확인
+   # 주의!! 내가 건드린 파일만!! 아래처럼 콕 집어 add하기!!!
+   git add backend/routes/user.js backend/controllers/auth.js   
+   # 최상위 폴더(smart-shipyard)에서 add하면 다른 작업자의 최신 파일이 변경될 수 있음!!
+   # 추가로 남의 파일 건들지 말기!(git add .을 할 거면 자신의 폴더[예를 들어 backend폴더] 안에서 하기)
    git commit -m "feat: 작업 내용"
    git push -u origin feature/기능이름
    ```
@@ -152,14 +156,50 @@ deactivate
 pip freeze > requirements.txt
 ```
 
-## 7. 프론트엔드 세팅 (frontend/) — 담당자가 채울 예정
+## 7. 프론트엔드 세팅 (frontend/)
 
 프론트엔드는 Node.js 기반이라 venv/requirements.txt 대신
-`package.json`과 `npm install`을 사용합니다.
+`package.json`(패키지 목록)과 `npm install`(패키지 설치)을 사용합니다.
+백엔드의 venv ↔ requirements.txt 관계가 여기서는 node_modules ↔ package.json입니다.
+
+### Node.js 설치 (최초 1회, 없는 컴퓨터만)
+
+버전 확인부터 해보세요. 두 명령이 모두 버전을 출력하면 이미 설치된 것입니다.
 
 ```bash
-# (예정) cd frontend && npm install && npm run dev
+node -v    # v20 이상 권장
+npm -v
 ```
+
+없다면 nvm(Node 버전 관리자)으로 설치하는 것을 권장합니다 (Ubuntu 기준):
+
+```bash
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+# 터미널을 완전히 닫았다가 다시 연 뒤
+nvm install 20
+```
+
+(참고: `sudo apt install nodejs`는 아주 오래된 버전이 깔릴 수 있어 권장하지 않습니다.)
+
+### 실행
+
+```bash
+cd frontend
+
+# 패키지 설치 (최초 1회 — node_modules 폴더가 생성됨, 커밋 금지)
+npm install
+
+# 개발 서버 실행
+npm run dev
+```
+
+터미널에 뜨는 주소(기본 http://localhost:5173)를 브라우저로 열면 대시보드가 뜹니다.
+현재는 백엔드 없이 모의 이벤트로 단독 동작합니다. 종료는 Ctrl+C.
+
+새 패키지를 설치했다면(`npm install 패키지명`) `package.json`과 `package-lock.json`이
+자동으로 갱신되므로 **둘 다 함께 커밋**하세요. (`pip freeze` 같은 별도 명령은 없습니다.)
+
+상세 구조와 백엔드 연동 지점은 `frontend/README.md`를 참고하세요.
 
 ## 8. 엣지 — AI 비전 세팅 (edge/ 내 비전 폴더) — 담당자가 채울 예정
 
