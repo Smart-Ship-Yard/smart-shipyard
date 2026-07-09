@@ -31,7 +31,6 @@ import json
 import math
 import re
 import time
-from collections import deque
 
 import serial
 import rclpy
