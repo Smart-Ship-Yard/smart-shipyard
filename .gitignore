@@ -21,6 +21,10 @@ log/
 # Node.js 의존성 폴더 (npm install로 각자 재생성)
 node_modules/
 
+# Orbbec SDK 런타임 로그 (실행 위치에 자동 생성됨)
+Log/
+OrbbecSDK.log*
+
 # 프론트엔드(Vite) 빌드 산출물 — npm run build가 만드는 배포용 파일
 dist/
 dist-ssr/
@@ -46,3 +50,4 @@ lerna-debug.log*
 
 # Claude Code 등 AI 도구의 개인 로컬 설정
 .claude/
+

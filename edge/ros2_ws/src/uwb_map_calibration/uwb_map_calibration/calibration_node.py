@@ -189,8 +189,7 @@ class UwbMapCalibration(Node):
 
         # map 상에서는 known_heading_in_map_rad 방향으로 움직였다고 알고 있으므로
         # 회전각 theta = (map에서의 방향) - (uwb_frame에서의 방향)
-        # 이 theta는 uwb_frame -> map 회전. 우리는 map -> uwb_frame TF를 발행해야 하므로
-        # 최종적으로 역변환을 적용한다.
+        # 이 theta는 "uwb 좌표 -> map 좌표" 변환의 회전각이다.
         theta_uwb_to_map = self._wrap(self.known_heading - uwb_heading)
 
         # 시작점을 이용한 평행이동 계산:
@@ -204,16 +203,19 @@ class UwbMapCalibration(Node):
         tx_uwb_to_map = 0.0 - rotated_start_x
         ty_uwb_to_map = 0.0 - rotated_start_y
 
-        # 우리가 실제로 발행할 static TF는 map -> uwb_frame (부모: map, 자식: uwb_frame)
-        # 이는 uwb_frame -> map 변환의 역변환이다.
-        theta_map_to_uwb = -theta_uwb_to_map
-        cos_i, sin_i = math.cos(theta_map_to_uwb), math.sin(theta_map_to_uwb)
-        tx_map_to_uwb = -(cos_i * tx_uwb_to_map - sin_i * ty_uwb_to_map)
-        ty_map_to_uwb = -(sin_i * tx_uwb_to_map + cos_i * ty_uwb_to_map)
-
-        self.theta = theta_map_to_uwb
-        self.tx = tx_map_to_uwb
-        self.ty = ty_map_to_uwb
+        # *** TF 의미론 주의 (2026-07-08 시뮬레이션 테스트로 잡은 부호 버그) ***
+        # ROS TF에서 parent=map, child=uwb_frame으로 발행하는 변환값은
+        # "child(uwb_frame) 좌표를 parent(map) 좌표로 옮기는 변환"
+        # (= uwb_frame 원점/자세를 map 기준으로 표현한 것)이다.
+        # 즉 위에서 구한 theta_uwb_to_map / T_uwb_to_map을 *그대로* 발행해야 한다.
+        # 과거 버그: "map->uwb 방향이니 역변환을 넣어야 한다"고 오해해 한 번 더
+        # 뒤집어(이중 반전) 발행했고, 그 결과 heading filter와 ekf_global이
+        # TF lookup으로 얻는 회전이 정확히 반대 부호가 되어 map 변환이
+        # 캘리브레이션 각도의 2배만큼 틀어졌다 (시뮬레이션: 기대 0도 -> 실측 -34도).
+        # 절대 다시 역변환을 넣지 말 것.
+        self.theta = theta_uwb_to_map
+        self.tx = tx_uwb_to_map
+        self.ty = ty_uwb_to_map
 
         self._publish_static_tf()
         self._save_result(travel, uwb_heading, theta_uwb_to_map)
@@ -250,9 +252,10 @@ class UwbMapCalibration(Node):
             'travel_distance_m': travel,
             'uwb_heading_rad': uwb_heading,
             'theta_uwb_to_map_rad': theta_uwb_to_map,
-            'published_map_to_uwb_theta_rad': self.theta,
-            'published_map_to_uwb_tx': self.tx,
-            'published_map_to_uwb_ty': self.ty,
+            # TF(parent=map, child=uwb_frame)에 발행된 값 = uwb->map 좌표 변환
+            'published_tf_theta_rad': self.theta,
+            'published_tf_tx': self.tx,
+            'published_tf_ty': self.ty,
             'num_samples': len(self.samples),
         }
         with open(path, 'w') as f:

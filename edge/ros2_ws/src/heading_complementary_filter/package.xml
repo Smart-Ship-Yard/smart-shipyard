@@ -3,7 +3,7 @@
 <package format="3">
   <name>heading_complementary_filter</name>
   <version>0.1.0</version>
-  <description>Circular complementary filter fusing IMU gyro yaw rate with UWB course-over-ground</description>
+  <description>Circular complementary filter fusing IMU gyro yaw rate with UWB course-over-ground (map-frame via TF)</description>
   <maintainer email="you@example.com">jh</maintainer>
   <license>Apache-2.0</license>
 
@@ -11,6 +11,8 @@
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
+  <!-- [2026-07-08] UWB 좌표를 map 프레임으로 변환하기 위한 TF 조회에 필요 -->
+  <depend>tf2_ros</depend>
 
   <test_depend>python3-pytest</test_depend>
 

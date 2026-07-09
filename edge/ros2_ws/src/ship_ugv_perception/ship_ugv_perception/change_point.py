@@ -57,7 +57,7 @@ class ChangePointDetector(Node):
         self.declare_parameter('camera_offset_y', 0.0)
         self.declare_parameter('camera_offset_z', 0.20)
         # 카메라 내부 파라미터 (u,v를 각도로 변환하기 위한 간이 핀홀 모델)
-        self.declare_parameter('camera_hfov_deg', 69.0)  # 예: RealSense D435 수평 FOV
+        self.declare_parameter('camera_hfov_deg', 74.0)  # Astra+ 카메라 스펙에 맞춰 hfov 기본값 69→74도 수정
         self.declare_parameter('image_width', 640)
         # depth 의미 해석 (카메라 모델 확정 시 datasheet로 반드시 확인!):
         #   False (기본): depth = Z-depth (광축에 수직인 평면까지의 거리; RealSense 등 대부분의 뎁스카메라 표준)
