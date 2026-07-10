@@ -108,20 +108,22 @@ venv 생성이나 패키지 설치 같은 세팅은 각 파트 섹션(6번~)의 
 7. 머지 직후 뜨는 **Delete branch 버튼으로 해당 브랜치를 삭제**합니다.
    커밋 기록은 main과 PR 페이지에 영구 보존되므로 잃는 것이 없습니다.
 8. 깃허브에서 PR 머지 후 로컬 정리하는 전형적인 순서 :
-# 1. main(또는 master) 브랜치로 이동
-git checkout main
+   ```bash
+   # 1. main(또는 master) 브랜치로 이동
+   git checkout main
 
-# 2. 원격 저장소의 최신 내용을 받아오기 (머지된 내용 포함)
-git pull origin main
+   # 2. 원격 저장소의 최신 내용을 받아오기 (머지된 내용 포함)
+   git pull origin main
 
-# 3. 다 쓴 로컬 feature 브랜치 삭제
-git branch -d feature-branch-이름
+   # 3. 다 쓴 로컬 feature 브랜치 삭제
+   git branch -d feature-branch-이름
 
-# 4. (선택) 원격에 브랜치가 남아있다면 삭제
-git push origin --delete feature-branch-이름
+   # 4. (선택) 원격에 브랜치가 남아있다면 삭제
+   git push origin --delete feature-branch-이름
 
-# 5. (선택) 로컬에 남아있는 원격 브랜치 참조 정리
-git fetch --prune
+   # 5. (선택) 로컬에 남아있는 원격 브랜치 참조 정리
+   git fetch --prune
+   ```
 
 
 
