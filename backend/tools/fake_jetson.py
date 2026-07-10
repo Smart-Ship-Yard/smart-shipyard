@@ -98,7 +98,10 @@ async def json_channel(server: str, duration: float):
 
         recv_task = asyncio.create_task(recv_loop())
         await send_loop()
+        # cancel만 하고 방치하면 "Task was destroyed but it is pending" 경고가
+        # 날 수 있으므로, 취소가 완료될 때까지 기다렸다가 종료한다.
         recv_task.cancel()
+        await asyncio.gather(recv_task, return_exceptions=True)
 
     print("🚗 [가짜 젯슨] JSON 채널 종료")
 

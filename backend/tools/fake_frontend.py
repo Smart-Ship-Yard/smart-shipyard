@@ -43,8 +43,9 @@ async def json_channel(server: str, duration: float):
         stop_task = None
         start = time.monotonic()
         try:
-            while time.monotonic() - start < duration:
-                raw = await asyncio.wait_for(ws.recv(), timeout=duration)
+            # 남은 시간만큼만 수신을 기다려서 전체 실행이 duration을 넘지 않게 함.
+            while (remaining := duration - (time.monotonic() - start)) > 0:
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
                 data = json.loads(raw)
                 etype = data.get("event_type")
 
@@ -82,8 +83,9 @@ async def stream_channel(server: str, duration: float):
         count = 0
         last_size = 0
         try:
-            while time.monotonic() - start < duration:
-                frame = await asyncio.wait_for(ws.recv(), timeout=duration)
+            # 남은 시간만큼만 수신을 기다려서 전체 실행이 duration을 넘지 않게 함.
+            while (remaining := duration - (time.monotonic() - start)) > 0:
+                frame = await asyncio.wait_for(ws.recv(), timeout=remaining)
                 count += 1
                 last_size = len(frame)
 

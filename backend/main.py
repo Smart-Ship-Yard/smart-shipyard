@@ -55,8 +55,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 # 타입 힌트용 List/Optional (연결 목록, 젯슨 단일 연결 참조 타입 표기에 사용)
 from typing import List, Optional
 
-# 이벤트 저장 시각을 기록하기 위한 datetime
-from datetime import datetime
+# 이벤트 저장 시각을 기록하기 위한 datetime (시간대 명시 기록용 timedelta/timezone 포함)
+from datetime import datetime, timedelta, timezone
 
 # .env 파일(금고)에 적힌 값들을 실제로 읽어들여 환경변수로 등록.
 # 이 줄이 없으면 아래 os.getenv("MONGO_URL")이 None을 반환함.
@@ -78,6 +78,10 @@ SHIP_POSE = "ship_pose"          # 배 위치 측량 결과 (block_id, map_xy, y
 # 프론트→서버→젯슨 방향 명령 (DB 저장 대상 아님).
 # 프론트가 영상 팝업을 열/닫을 때 젯슨의 영상 화질을 전환시키는 명령.
 STREAM_BOOST = "stream_boost"    # action: "start"(부스트) / "stop"(원복)
+
+# 이벤트 timestamp 기록용 한국 표준시.
+# 시간대 정보 없는(naive) 시각은 환경마다 해석이 달라지므로 +09:00을 명시한다.
+KST = timezone(timedelta(hours=9))
 
 # DB 저장 대상 이벤트 목록 — 위험 이벤트 4종 + 공정 단계 변화 + 배 위치 측량.
 # block_level/ship_pose는 '바뀔 때만' 오는 희소 이벤트라 저장량 부담이 없고,
@@ -225,7 +229,9 @@ async def get_init_data():
             {"event_type": BLOCK_LEVEL, "block_id": block["id"]},
             sort=[("_id", -1)],  # _id 내림차순 정렬 = 가장 최근 문서 1개
         )
-        block["level"] = latest["level"] if latest else 1
+        # .get() 사용: level 필드가 빠진 비정상 문서가 섞여 있어도
+        # KeyError로 init-data 전체가 500 나지 않도록 기본값 1로 방어.
+        block["level"] = latest.get("level", 1) if latest else 1
 
         # 가장 최근 ship_pose(배 위치 측량) 결과로 블록 좌표·방향을 덮어씀.
         # 측량 기록이 없으면 위의 하드코딩 좌표 + yaw 0.0을 그대로 사용.
@@ -233,8 +239,10 @@ async def get_init_data():
             {"event_type": SHIP_POSE, "block_id": block["id"]},
             sort=[("_id", -1)],
         )
-        if latest_pose:
-            block["x"], block["y"] = latest_pose["map_xy"]
+        # map_xy가 [x, y] 형태로 온전할 때만 덮어씀 (불완전한 문서 방어).
+        map_xy = latest_pose.get("map_xy") if latest_pose else None
+        if isinstance(map_xy, (list, tuple)) and len(map_xy) == 2:
+            block["x"], block["y"] = map_xy
             block["yaw"] = latest_pose.get("yaw", 0.0)
         else:
             block["yaw"] = 0.0
@@ -272,6 +280,8 @@ async def get_history():
 @app.websocket("/ws/frontend")
 async def websocket_frontend(websocket: WebSocket):
     """프론트엔드가 실시간 알림을 받기 위해 연결하는 웹소켓 채널."""
+    global jetson_connection
+
     # ConnectionManager에 등록 (accept + 목록 추가가 여기서 함께 처리됨).
     await manager.connect(websocket)
     print("🖥️ [프론트엔드] 대시보드 웹소켓 연결됨!")
@@ -302,8 +312,11 @@ async def websocket_frontend(websocket: WebSocket):
                     await jetson_connection.send_json(data)
                     print(f"🎥 [중계] stream_boost {data['action']} → 젯슨 전달 완료")
                 except Exception:
-                    # 전달 도중 젯슨 연결이 끊긴 경우 — 젯슨 재접속 시 자연 복구됨.
-                    print("⚠️ [중계] stream_boost 전달 중 젯슨 연결 끊김")
+                    # 전달 도중 젯슨 연결이 끊긴 경우: 끊긴 연결 참조를 계속
+                    # 들고 있으면 이후 요청도 계속 실패하므로 즉시 비워서
+                    # 다음 요청부터 '미접속'으로 정확히 처리되게 한다.
+                    jetson_connection = None
+                    print("⚠️ [중계] stream_boost 전달 중 젯슨 연결 끊김 → 참조 해제")
             else:
                 print(f"프론트엔드에서 온 메시지: {data}")
 
@@ -337,11 +350,14 @@ async def websocket_jetson(websocket: WebSocket):
             event_type = data.get("event_type")
 
             # 🚨 [DB 저장 로직] 팀이 합의한 저장 대상(위험 이벤트 4종 +
-            # BLOCK_LEVEL 단계 변화)에 해당할 때만 DB에 영구 저장한다.
+            # BLOCK_LEVEL 단계 변화 + SHIP_POSE 배 위치)만 DB에 영구 저장한다.
             # (평상시 위치 핑 등 그 외 메시지는 저장하지 않고 브로드캐스트만 함)
             if event_type in LOGGED_EVENT_TYPES:
                 # 서버 수신 시각을 timestamp 필드로 추가 (감사/증빙 자료 용도).
-                data["timestamp"] = datetime.now().isoformat()
+                # 한국 표준시 + 오프셋 명시(+09:00 포함 ISO 8601)로 기록 —
+                # DB를 눈으로 볼 때 한국 시간 그대로 읽히고, 오프셋이 있어
+                # 프론트 JS의 new Date()도 정확히 해석함.
+                data["timestamp"] = datetime.now(KST).isoformat()
 
                 # data.copy()로 복사본을 저장 — 원본 dict는 곧이어 그대로
                 # broadcast()에도 쓰이므로, insert_one이 원본을 변형하지
