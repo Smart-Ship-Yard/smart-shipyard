@@ -6,7 +6,9 @@ main.py — 스마트 조선소 FastAPI 백엔드 서버
             - WebSocket으로 젯슨의 실시간 센서/AI 감지 이벤트를 수신하여
               프론트엔드(React+Three.js 대시보드)로 즉시 브로드캐스트
             - 위험 이벤트 4종 + block_level + ship_pose는 MongoDB에 영구 로그 저장
-            - 실시간 영상(JPEG 바이너리)을 전용 채널로 젯슨→프론트 중계
+            - WebRTC 시그널링(webrtc_signal) 쪽지를 프론트↔젯슨 양방향 중계
+              (영상은 WebRTC P2P 직결로 변경 — 2026-07-10 팀 결정)
+            - 실시간 영상(JPEG 바이너리) 중계 채널은 P2P 실패 시 폴백용으로 유지
             - 프론트의 stream_boost(영상 화질 전환) 명령을 젯슨으로 전달
             - REST API로 대시보드 초기 로딩 데이터 및 과거 이벤트 이력 제공
 
@@ -78,6 +80,16 @@ SHIP_POSE = "ship_pose"          # 배 위치 측량 결과 (block_id, map_xy, y
 # 프론트→서버→젯슨 방향 명령 (DB 저장 대상 아님).
 # 프론트가 영상 팝업을 열/닫을 때 젯슨의 영상 화질을 전환시키는 명령.
 STREAM_BOOST = "stream_boost"    # action: "start"(부스트) / "stop"(원복)
+
+# WebRTC 시그널링 쪽지 (영상 P2P 직결용, 양방향, DB 저장 대상 아님).
+# payload 안의 내용(SDP/ICE)은 WebRTC 라이브러리가 자동 생성한 것 —
+# 서버는 열어보지 않고 반대편에 그대로 배달만 한다.
+# (예: {"event_type": "webrtc_signal", "payload": {...}})
+WEBRTC_SIGNAL = "webrtc_signal"
+
+# 프론트→서버→젯슨 방향으로 '그대로 전달'하는 메시지 종류 모음.
+# (젯슨→프론트 방향은 기존 브로드캐스트가 모든 메시지를 전달하므로 목록 불필요)
+JETSON_BOUND_TYPES = {STREAM_BOOST, WEBRTC_SIGNAL}
 
 # 이벤트 timestamp 기록용 한국 표준시.
 # 시간대 정보 없는(naive) 시각은 환경마다 해석이 달라지므로 +09:00을 명시한다.
@@ -288,7 +300,7 @@ async def websocket_frontend(websocket: WebSocket):
 
     try:
         # 연결이 살아있는 동안 무한 대기하며 메시지를 수신.
-        # 프론트→서버 방향 메시지는 현재 stream_boost(영상 화질 명령) 하나뿐.
+        # 프론트→서버 방향 메시지: stream_boost(화질 명령), webrtc_signal(시그널링).
         while True:
             raw = await websocket.receive_text()
 
@@ -299,24 +311,29 @@ async def websocket_frontend(websocket: WebSocket):
                 print(f"⚠️ [프론트엔드] JSON이 아닌 메시지 무시: {raw[:100]}")
                 continue
 
-            if data.get("event_type") == STREAM_BOOST:
-                # 팝업 열림(start)/닫힘(stop)에 맞춰 젯슨의 영상 화질을 전환.
-                # 서버는 내용을 판단하지 않고 젯슨에게 그대로 전달만 한다.
-                if data.get("action") not in ("start", "stop"):
+            event_type = data.get("event_type")
+
+            # 프론트→젯슨 전달 대상: stream_boost(화질 명령), webrtc_signal(시그널링).
+            # 서버는 내용을 판단하지 않고 젯슨에게 그대로 배달만 한다.
+            if event_type in JETSON_BOUND_TYPES:
+                # stream_boost만 action 값을 검증. webrtc_signal의 payload는
+                # WebRTC 라이브러리가 만든 것이라 서버가 검사할 필요가 없다.
+                if event_type == STREAM_BOOST and data.get("action") not in ("start", "stop"):
                     print(f"⚠️ [프론트엔드] stream_boost의 action 값이 이상함: {data}")
                     continue
+
                 if jetson_connection is None:
-                    print("⚠️ [중계] stream_boost 전달 실패: 젯슨 미접속 상태")
+                    print(f"⚠️ [중계] {event_type} 전달 실패: 젯슨 미접속 상태")
                     continue
                 try:
                     await jetson_connection.send_json(data)
-                    print(f"🎥 [중계] stream_boost {data['action']} → 젯슨 전달 완료")
+                    print(f"📮 [중계] {event_type} → 젯슨 전달 완료")
                 except Exception:
                     # 전달 도중 젯슨 연결이 끊긴 경우: 끊긴 연결 참조를 계속
                     # 들고 있으면 이후 요청도 계속 실패하므로 즉시 비워서
                     # 다음 요청부터 '미접속'으로 정확히 처리되게 한다.
                     jetson_connection = None
-                    print("⚠️ [중계] stream_boost 전달 중 젯슨 연결 끊김 → 참조 해제")
+                    print(f"⚠️ [중계] {event_type} 전달 중 젯슨 연결 끊김 → 참조 해제")
             else:
                 print(f"프론트엔드에서 온 메시지: {data}")
 

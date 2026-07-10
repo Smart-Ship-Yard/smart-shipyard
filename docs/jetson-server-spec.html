@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>젯슨–서버 통신 스펙 v1.2</title>
+<title>젯슨–서버 통신 스펙 v1.3</title>
 <style>
   :root {
     --bg: #FAF9F6;
@@ -230,7 +230,7 @@
 
   <header class="doc">
     <div class="eyebrow">Smart Shipyard · Interface Spec</div>
-    <h1>젯슨 → 서버 통신 스펙 <span style="color:var(--muted);font-weight:400">v1.2</span></h1>
+    <h1>젯슨 → 서버 통신 스펙 <span style="color:var(--muted);font-weight:400">v1.3</span></h1>
     <p class="lede">젯슨(UGV)이 백엔드 서버로 보내야 하는 데이터 전부와 그 형식.
     연산(추론·좌표 융합·판별)은 전부 젯슨에서 끝내고, 서버는 결과를 중계·저장만 한다.</p>
   </header>
@@ -238,11 +238,11 @@
   <div class="tldr">
     <div class="cell">
       <b>보내는 것 5종 <span class="chip send">젯슨 → 서버</span></b>
-      <span>① 위치 핑 · ② 위험 이벤트 · ③ 조립 단계 · ④ 배 위치 — JSON 텍스트<br>⑤ 실시간 영상 — JPEG 바이너리 (별도 채널)</span>
+      <span>① 위치 핑 · ② 위험 이벤트 · ③ 조립 단계 · ④ 배 위치 — JSON 텍스트<br>⑤ 실시간 영상 — WebRTC P2P 직결로 변경 (시그널링만 서버 중계)</span>
     </div>
     <div class="cell">
       <b>받는 것 1종 <span class="chip recv">서버 → 젯슨</span></b>
-      <span>⑥ <code class="inline">stream_boost</code> — 영상 화질 올려/내려 명령</span>
+      <span>⑥ <code class="inline">stream_boost</code> — 영상 화질 올려/내려 명령<br>⑦ <code class="inline">webrtc_signal</code> — P2P 연결용 시그널링 (양방향, 서버는 그대로 배달)</span>
     </div>
   </div>
 
@@ -251,7 +251,7 @@
     <div class="card">
       <ul>
         <li>JSON 채널: <code class="inline">ws://&lt;서버IP&gt;:8000/ws/jetson</code> — ①~④ 전송 + ⑥ 수신</li>
-        <li>영상 채널: <code class="inline">ws://&lt;서버IP&gt;:8000/ws/jetson-stream</code> — ⑤ 전송 (바이너리 전용, JSON과 분리) <b>← 서버 구현 완료</b></li>
+        <li>영상 폴백 채널: <code class="inline">ws://&lt;서버IP&gt;:8000/ws/jetson-stream</code> — P2P 실패 시에만 사용 (JPEG 바이너리)</li>
         <li>서버 IP는 같은 공유기 내부 IP라 그때그때 공유함 (공유기 DHCP 고정 할당 예정)</li>
       </ul>
     </div>
@@ -317,13 +317,13 @@
   </section>
 
   <section>
-    <h2>⑤ 실시간 영상 <span class="chip send">젯슨 → 서버</span> <span class="chip nodb">DB 저장 안 함</span></h2>
+    <h2>⑤ 실시간 영상 <span class="chip send">젯슨 ↔ 프론트 P2P</span> <span class="chip nodb">서버 경유 안 함</span></h2>
     <div class="card">
-      <p class="when">상시 전송. YOLO 추론에 쓰는 프레임을 재활용 (카메라를 따로 또 열지 않음).</p>
+      <p class="when">2026-07-10 팀 결정: 영상은 서버를 거치지 않고 <b>WebRTC로 젯슨↔프론트 직접 연결</b>. 연결 성사용 시그널링(⑦)만 서버가 중계.</p>
       <ul>
-        <li>JPEG 인코딩 후 <b>바이너리 프레임</b>으로 영상 채널에 전송</li>
-        <li><b>평상시</b>: 480×360 · JPEG 품질 60 · 초당 5장 (~1 Mbps)</li>
-        <li><b>부스트 모드</b>: 640×480 · 품질 80 · 초당 15장 (~6 Mbps) — 아래 ⑥ 명령을 받았을 때만</li>
+        <li>화질 기준(권장): 평상시 480×360/5fps 수준, 부스트 시 640×480/15fps 수준 — WebRTC 파라미터로 조절</li>
+        <li><b>폴백</b>: P2P 실패 시 서버 중계 채널(JPEG 바이너리)로 즉시 전환 가능 — 구현된 상태로 유지</li>
+        <li>주의: 서로 다른 네트워크 간 P2P는 TURN 서버 없이 실패할 수 있음 (같은 공유기 안은 항상 성공)</li>
       </ul>
     </div>
   </section>
@@ -342,6 +342,19 @@
   </section>
 
   <section>
+    <h2>⑦ webrtc_signal 시그널링 <span class="chip send">양방향</span> <span class="chip nodb">DB 저장 안 함</span></h2>
+    <div class="card">
+      <p class="when">WebRTC P2P 연결 성사 전에 교환하는 연결 정보(SDP offer/answer, ICE candidate). <b>payload는 WebRTC 라이브러리가 자동 생성</b> — 사람이 정하거나 읽을 필요 없음. 서버는 열어보지 않고 반대편에 배달만 함.</p>
+      <pre>{<span class="j-k">"event_type"</span>: <span class="j-s">"webrtc_signal"</span>, <span class="j-k">"payload"</span>: { ...라이브러리가 만든 SDP/ICE 그대로... }}</pre>
+      <ul>
+        <li>프론트가 <code class="inline">/ws/frontend</code>로 보내면 → 서버가 젯슨으로 전달</li>
+        <li>젯슨이 <code class="inline">/ws/jetson</code>으로 보내면 → 서버가 프론트로 브로드캐스트</li>
+        <li>규칙은 하나: <b>양쪽 다 이 봉투(event_type + payload)에 담아 보낼 것</b></li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
     <h2>JSON 키 전체 요약</h2>
     <div class="tablebox">
       <table>
@@ -349,7 +362,7 @@
           <tr><th>키</th><th>타입 / 허용 값</th><th>들어가는 메시지</th></tr>
         </thead>
         <tbody>
-          <tr><td><code class="inline">event_type</code></td><td>문자열 — 전송: position · fallen_person · fire · no_helmet · ship_defect · block_level · ship_pose / 수신: stream_boost</td><td>모든 메시지 (필수)</td></tr>
+          <tr><td><code class="inline">event_type</code></td><td>문자열 — 전송: position · fallen_person · fire · no_helmet · ship_defect · block_level · ship_pose / 수신: stream_boost / 양방향: webrtc_signal</td><td>모든 메시지 (필수)</td></tr>
           <tr><td><code class="inline">ekf_global</code></td><td>숫자 2개 배열 [x, y], 미터</td><td>① 위치 핑, ② 위험 이벤트</td></tr>
           <tr><td><code class="inline">confidence</code></td><td>숫자 0.5~1.0</td><td>② 위험 이벤트</td></tr>
           <tr><td><code class="inline">depth_xyz</code></td><td>숫자 3개 배열 [X, Y, Z], 미터</td><td>② 위험 이벤트</td></tr>
@@ -358,6 +371,7 @@
           <tr><td><code class="inline">map_xy</code></td><td>숫자 2개 배열 [x, y], 미터 — 배 중심</td><td>④ 배 위치</td></tr>
           <tr><td><code class="inline">yaw</code></td><td>숫자, 라디안 — 배 방향각</td><td>④ 배 위치</td></tr>
           <tr><td><code class="inline">action</code></td><td><code class="inline">"start"</code> · <code class="inline">"stop"</code></td><td>⑥ stream_boost (수신)</td></tr>
+          <tr><td><code class="inline">payload</code></td><td>WebRTC 라이브러리가 생성한 SDP/ICE 객체 그대로</td><td>⑦ webrtc_signal</td></tr>
           <tr><td><code class="inline">timestamp</code></td><td>서버가 자동 추가 — 젯슨은 생략</td><td>DB 저장 대상 6종</td></tr>
         </tbody>
       </table>
@@ -382,7 +396,7 @@
   </section>
 
   <footer>
-    v1.2 · 2026-07-10 · 작성: 백엔드 담당 · 변경 요청은 슬랙 #backend 채널로 · v1.2: ship_pose(배 위치) 메시지 추가
+    v1.3 · 2026-07-10 · 작성: 백엔드 담당 · 변경 요청은 슬랙 #backend 채널로 · v1.3: 영상 WebRTC P2P 전환 + webrtc_signal 추가 · v1.2: ship_pose 추가
   </footer>
 
 </div>
