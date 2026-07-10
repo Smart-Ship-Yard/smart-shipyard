@@ -1,0 +1,381 @@
+<title>젯슨–서버 통신 스펙 v1.2</title>
+<style>
+  :root {
+    --bg: #FAF9F6;
+    --surface: #FFFFFF;
+    --ink: #1D2833;
+    --muted: #5D6C7B;
+    --line: #E4E1D9;
+    --accent: #C94F09;
+    --accent-soft: #FBEADF;
+    --steel: #2E5F8A;
+    --steel-soft: #E7EFF6;
+    --good: #2E7D4F;
+    --good-soft: #E5F2EA;
+    --code-bg: #F3F1EC;
+    --code-line: #E8E5DD;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131920;
+      --surface: #1B242E;
+      --ink: #E6EAEE;
+      --muted: #93A1B0;
+      --line: #2B3644;
+      --accent: #FF8A3D;
+      --accent-soft: #3A2517;
+      --steel: #7FB2DE;
+      --steel-soft: #1E3145;
+      --good: #5BBE8A;
+      --good-soft: #16322426;
+      --code-bg: #10161D;
+      --code-line: #232E3B;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #131920;
+    --surface: #1B242E;
+    --ink: #E6EAEE;
+    --muted: #93A1B0;
+    --line: #2B3644;
+    --accent: #FF8A3D;
+    --accent-soft: #3A2517;
+    --steel: #7FB2DE;
+    --steel-soft: #1E3145;
+    --good: #5BBE8A;
+    --good-soft: #16322426;
+    --code-bg: #10161D;
+    --code-line: #232E3B;
+  }
+  :root[data-theme="light"] {
+    --bg: #FAF9F6;
+    --surface: #FFFFFF;
+    --ink: #1D2833;
+    --muted: #5D6C7B;
+    --line: #E4E1D9;
+    --accent: #C94F09;
+    --accent-soft: #FBEADF;
+    --steel: #2E5F8A;
+    --steel-soft: #E7EFF6;
+    --good: #2E7D4F;
+    --good-soft: #E5F2EA;
+    --code-bg: #F3F1EC;
+    --code-line: #E8E5DD;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Pretendard Variable", Pretendard, "Apple SD Gothic Neo", "Malgun Gothic", "Segoe UI", sans-serif;
+    font-size: 15px;
+    line-height: 1.65;
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 40px 20px 72px;
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+  }
+
+  header.doc h1 {
+    font-size: 25px;
+    line-height: 1.3;
+    margin: 6px 0 8px;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+  .eyebrow {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    color: var(--accent);
+    text-transform: uppercase;
+  }
+  .lede { color: var(--muted); margin: 0; max-width: 62ch; }
+
+  .tldr {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  @media (max-width: 560px) { .tldr { grid-template-columns: 1fr; } }
+  .tldr .cell {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 12px 16px;
+  }
+  .tldr .cell b { display: block; font-size: 13px; margin-bottom: 2px; }
+  .tldr .cell span { color: var(--muted); font-size: 13.5px; }
+
+  h2 {
+    font-size: 17px;
+    margin: 0;
+    letter-spacing: -0.005em;
+  }
+  section { display: flex; flex-direction: column; gap: 12px; }
+
+  .chip {
+    display: inline-block;
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    padding: 2px 9px;
+    border-radius: 99px;
+    vertical-align: 2px;
+  }
+  .chip.send { background: var(--accent-soft); color: var(--accent); }
+  .chip.recv { background: var(--steel-soft); color: var(--steel); }
+  .chip.db   { background: var(--good-soft); color: var(--good); }
+  .chip.nodb { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px 20px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .card .when {
+    font-size: 13.5px;
+    color: var(--muted);
+    margin: 0;
+  }
+  .card ul { margin: 0; padding-left: 20px; font-size: 13.5px; }
+  .card li { margin: 3px 0; }
+  .card li::marker { color: var(--muted); }
+
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--code-line);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin: 0;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  code, pre {
+    font-family: ui-monospace, "Cascadia Code", Consolas, "D2Coding", monospace;
+  }
+  code.inline {
+    background: var(--code-bg);
+    border: 1px solid var(--code-line);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 12.5px;
+  }
+  .j-k { color: var(--steel); }
+  .j-s { color: var(--accent); }
+  .j-n { color: var(--good); }
+
+  .tablebox { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 13.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td {
+    text-align: left;
+    padding: 9px 14px;
+    border-top: 1px solid var(--line);
+    vertical-align: top;
+  }
+  thead th {
+    border-top: none;
+    font-size: 12px;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  td:first-child code.inline { white-space: nowrap; }
+
+  .rules { margin: 0; padding-left: 20px; }
+  .rules li { margin: 5px 0; }
+  .rules b { color: var(--accent); }
+
+  .note {
+    border-left: 3px solid var(--steel);
+    background: var(--surface);
+    border-radius: 0 8px 8px 0;
+    padding: 10px 16px;
+    font-size: 13.5px;
+    color: var(--muted);
+  }
+
+  footer {
+    color: var(--muted);
+    font-size: 12.5px;
+    border-top: 1px solid var(--line);
+    padding-top: 14px;
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="doc">
+    <div class="eyebrow">Smart Shipyard · Interface Spec</div>
+    <h1>젯슨 → 서버 통신 스펙 <span style="color:var(--muted);font-weight:400">v1.2</span></h1>
+    <p class="lede">젯슨(UGV)이 백엔드 서버로 보내야 하는 데이터 전부와 그 형식.
+    연산(추론·좌표 융합·판별)은 전부 젯슨에서 끝내고, 서버는 결과를 중계·저장만 한다.</p>
+  </header>
+
+  <div class="tldr">
+    <div class="cell">
+      <b>보내는 것 5종 <span class="chip send">젯슨 → 서버</span></b>
+      <span>① 위치 핑 · ② 위험 이벤트 · ③ 조립 단계 · ④ 배 위치 — JSON 텍스트<br>⑤ 실시간 영상 — JPEG 바이너리 (별도 채널)</span>
+    </div>
+    <div class="cell">
+      <b>받는 것 1종 <span class="chip recv">서버 → 젯슨</span></b>
+      <span>⑥ <code class="inline">stream_boost</code> — 영상 화질 올려/내려 명령</span>
+    </div>
+  </div>
+
+  <section>
+    <h2>접속 주소</h2>
+    <div class="card">
+      <ul>
+        <li>JSON 채널: <code class="inline">ws://&lt;서버IP&gt;:8000/ws/jetson</code> — ①~④ 전송 + ⑥ 수신</li>
+        <li>영상 채널: <code class="inline">ws://&lt;서버IP&gt;:8000/ws/jetson-stream</code> — ⑤ 전송 (바이너리 전용, JSON과 분리) <b>← 서버 구현 완료</b></li>
+        <li>서버 IP는 같은 공유기 내부 IP라 그때그때 공유함 (공유기 DHCP 고정 할당 예정)</li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <h2>① 위치 핑 <span class="chip send">젯슨 → 서버</span> <span class="chip nodb">DB 저장 안 함</span></h2>
+    <div class="card">
+      <p class="when">평상시 계속 전송. 주기는 일단 0.5초에 1번으로 시작 (조절 가능).</p>
+      <pre>{<span class="j-k">"event_type"</span>: <span class="j-s">"position"</span>, <span class="j-k">"ekf_global"</span>: [<span class="j-n">3.2</span>, <span class="j-n">7.8</span>]}</pre>
+      <ul>
+        <li><code class="inline">ekf_global</code> = map 기준 차체 절대좌표 <code class="inline">[x, y]</code>, 미터 — ekf_global(융합) 출력값</li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <h2>② 위험 이벤트 <span class="chip send">젯슨 → 서버</span> <span class="chip db">DB 저장 ✓</span></h2>
+    <div class="card">
+      <p class="when">감지 시에만 전송. conf 0.5 미만은 버림. 같은 상황을 프레임마다 연사하지 말고 안정 감지 시 1번.</p>
+      <pre>{
+  <span class="j-k">"event_type"</span>: <span class="j-s">"fallen_person"</span>,
+  <span class="j-k">"confidence"</span>: <span class="j-n">0.91</span>,
+  <span class="j-k">"depth_xyz"</span>: [<span class="j-n">1.2</span>, <span class="j-n">0.4</span>, <span class="j-n">2.1</span>],
+  <span class="j-k">"ekf_global"</span>: [<span class="j-n">3.2</span>, <span class="j-n">7.8</span>]
+}</pre>
+      <ul>
+        <li><code class="inline">event_type</code> 허용 값 4개: <code class="inline">fallen_person</code> · <code class="inline">fire</code> · <code class="inline">no_helmet</code> · <code class="inline">ship_defect</code> (모델 클래스 이름 그대로)</li>
+        <li><code class="inline">person</code>, <code class="inline">helmet</code> 같은 정상 상태 클래스는 <b>보내지 않음</b></li>
+        <li><code class="inline">confidence</code> = YOLO conf 그대로 (0.5~1.0)</li>
+        <li><code class="inline">depth_xyz</code> = 카메라 기준 객체 3D 좌표 <code class="inline">[X, Y, Z]</code> 미터 — depth_yolo_test.py에서 계산하는 그 값, 배열 하나로</li>
+        <li><code class="inline">ekf_global</code> = 감지한 순간의 차체 위치</li>
+        <li><code class="inline">timestamp</code>는 서버가 자동으로 붙임 → <b>보내지 마</b></li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <h2>③ 조립 단계 변화 <span class="chip send">젯슨 → 서버</span> <span class="chip db">DB 저장 ✓</span></h2>
+    <div class="card">
+      <p class="when">단계가 바뀌었을 때 1번 + 부팅·재접속 시 현재 단계 1번.</p>
+      <pre>{<span class="j-k">"event_type"</span>: <span class="j-s">"block_level"</span>, <span class="j-k">"block_id"</span>: <span class="j-s">"B1"</span>, <span class="j-k">"level"</span>: <span class="j-n">2</span>}</pre>
+      <ul>
+        <li><code class="inline">level</code> = 클래스 이름(level1/2/3)이 아니라 <b>숫자만</b> 1, 2, 3</li>
+        <li><code class="inline">block_id</code> = 당분간 <code class="inline">"B1"</code> 고정 (배 1척이라)</li>
+        <li>YOLO가 프레임마다 흔들리니, 몇 초간 같은 단계로 안정 감지됐을 때만 "바뀜"으로 인정</li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <h2>④ 배 위치 (측량 결과) <span class="chip send">젯슨 → 서버</span> <span class="chip db">DB 저장 ✓</span></h2>
+    <div class="card">
+      <p class="when">세션 시작 측량 후 1번 + <b>조립 단계가 바뀔 때마다</b> 재측량 후 1번 (직접 조립하는 과정에서 배가 밀리거나 돌아갈 수 있음).</p>
+      <pre>{<span class="j-k">"event_type"</span>: <span class="j-s">"ship_pose"</span>, <span class="j-k">"block_id"</span>: <span class="j-s">"B1"</span>, <span class="j-k">"map_xy"</span>: [<span class="j-n">5.1</span>, <span class="j-n">4.8</span>], <span class="j-k">"yaw"</span>: <span class="j-n">1.57</span>}</pre>
+      <ul>
+        <li><code class="inline">map_xy</code> = 배 중심의 map 좌표 <code class="inline">[x, y]</code>, 미터</li>
+        <li><code class="inline">yaw</code> = 배 방향각, 라디안 (map x축 기준 반시계)</li>
+        <li>실시간 아님 — 측량(맵에서 배 지정 등)이 끝났을 때만 1번씩</li>
+        <li>서버가 저장해뒀다가 프론트 초기 로딩(init-data)에 제공 → 3D 배 모델 배치에 쓰임</li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <h2>⑤ 실시간 영상 <span class="chip send">젯슨 → 서버</span> <span class="chip nodb">DB 저장 안 함</span></h2>
+    <div class="card">
+      <p class="when">상시 전송. YOLO 추론에 쓰는 프레임을 재활용 (카메라를 따로 또 열지 않음).</p>
+      <ul>
+        <li>JPEG 인코딩 후 <b>바이너리 프레임</b>으로 영상 채널에 전송</li>
+        <li><b>평상시</b>: 480×360 · JPEG 품질 60 · 초당 5장 (~1 Mbps)</li>
+        <li><b>부스트 모드</b>: 640×480 · 품질 80 · 초당 15장 (~6 Mbps) — 아래 ⑥ 명령을 받았을 때만</li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <h2>⑥ stream_boost 명령 <span class="chip recv">서버 → 젯슨</span></h2>
+    <div class="card">
+      <p class="when">프론트가 영상 팝업을 크게 열면(위험 이벤트 시 자동 + 사용자가 미리보기 클릭) 서버가 전달함.</p>
+      <pre>{<span class="j-k">"event_type"</span>: <span class="j-s">"stream_boost"</span>, <span class="j-k">"action"</span>: <span class="j-s">"start"</span>}</pre>
+      <ul>
+        <li><code class="inline">action: "start"</code> → 부스트 모드로 전환</li>
+        <li><code class="inline">action: "stop"</code> → 평상시 화질로 원복 (프론트에서 닫기 버튼 눌렀을 때 옴)</li>
+        <li>안전장치: start 후 <b>5분</b> 동안 stop이 안 오면 스스로 원복 (프론트 비정상 종료 대비)</li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <h2>JSON 키 전체 요약</h2>
+    <div class="tablebox">
+      <table>
+        <thead>
+          <tr><th>키</th><th>타입 / 허용 값</th><th>들어가는 메시지</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code class="inline">event_type</code></td><td>문자열 — 전송: position · fallen_person · fire · no_helmet · ship_defect · block_level · ship_pose / 수신: stream_boost</td><td>모든 메시지 (필수)</td></tr>
+          <tr><td><code class="inline">ekf_global</code></td><td>숫자 2개 배열 [x, y], 미터</td><td>① 위치 핑, ② 위험 이벤트</td></tr>
+          <tr><td><code class="inline">confidence</code></td><td>숫자 0.5~1.0</td><td>② 위험 이벤트</td></tr>
+          <tr><td><code class="inline">depth_xyz</code></td><td>숫자 3개 배열 [X, Y, Z], 미터</td><td>② 위험 이벤트</td></tr>
+          <tr><td><code class="inline">block_id</code></td><td>문자열, <code class="inline">"B1"</code> 고정</td><td>③ 조립 단계, ④ 배 위치</td></tr>
+          <tr><td><code class="inline">level</code></td><td>정수 1 · 2 · 3</td><td>③ 조립 단계</td></tr>
+          <tr><td><code class="inline">map_xy</code></td><td>숫자 2개 배열 [x, y], 미터 — 배 중심</td><td>④ 배 위치</td></tr>
+          <tr><td><code class="inline">yaw</code></td><td>숫자, 라디안 — 배 방향각</td><td>④ 배 위치</td></tr>
+          <tr><td><code class="inline">action</code></td><td><code class="inline">"start"</code> · <code class="inline">"stop"</code></td><td>⑥ stream_boost (수신)</td></tr>
+          <tr><td><code class="inline">timestamp</code></td><td>서버가 자동 추가 — 젯슨은 생략</td><td>DB 저장 대상 6종</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>공통 규칙</h2>
+    <div class="card">
+      <ul class="rules">
+        <li><b>철자 정확히.</b> 서버는 모르는 event_type을 에러 없이 조용히 무시함 — 오타 나면 아무 일도 안 일어나서 디버깅 지옥임. 위 표에서 복붙 권장.</li>
+        <li>사진/스냅샷을 이벤트 JSON에 넣지 않음 — 영상 채널이 항상 흐르니까 프론트가 거기서 봄.</li>
+        <li>JSON은 텍스트 프레임, 영상은 바이너리 프레임 — 채널을 섞지 말 것.</li>
+      </ul>
+    </div>
+    <div class="note">
+      좌표계 메모 — <code class="inline">ekf_global</code>의 원점·축 정의(맵 만드는 방식)는 슬램 쪽에서 확정한 그대로 가되,
+      프론트(3D 매핑)와 <b>직접</b> 공유 필요. 서버는 좌표를 변환하지 않고 그대로 중계·저장만 함.<br><br>
+      배(블록) 위치는 ④ <code class="inline">ship_pose</code> 메시지로 정식 편입됨 — 세션 시작 + 조립 단계 변경 시마다
+      재측량해서 전송. 프론트는 이 값으로 3D 배 모델을 배치하므로, 이게 틀어지면 로봇 마커가 배를 뚫고 다니는 화면이 됨.
+    </div>
+  </section>
+
+  <footer>
+    v1.2 · 2026-07-10 · 작성: 백엔드 담당 · 변경 요청은 슬랙 #backend 채널로 · v1.2: ship_pose(배 위치) 메시지 추가
+  </footer>
+
+</div>
