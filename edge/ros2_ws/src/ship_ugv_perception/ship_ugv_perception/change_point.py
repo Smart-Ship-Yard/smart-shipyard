@@ -1,32 +1,17 @@
 #!/usr/bin/env python3
 """
-change_point.py (리팩터링판)
+change_point.py (리팩터링판 + 2차 중복 제거 필터 추가)
 ----------------------------
 Depth camera 이벤트 감지 (u, v, depth)를 map 좌표계의 절대 위치로 변환한다.
 
-과거 버전과의 차이 (리팩터링 핵심)
------------------------------------
-1. 자체 UART 연결(UwbTagReader)과 자체 이동벡터 기반 heading 추정(HeadingEstimator)을
-   완전히 제거했다. 이제는 ekf_global이 발행하는 map -> base_link TF를 조회해서
-   로봇의 현재 pose(위치+자세)를 얻는다. 중복된 위치추정 로직을 두 곳에서
-   유지보수하는 것을 방지하고, 시스템 전체의 단일 진실 공급원(EKF)을 따른다.
-2. 좌표축 버그 수정: 카메라 좌표계에서 화면 왼쪽(-u 방향)에 있는 물체가
-   로봇 기준 왼쪽(+y, REP-103/CCW 규약)에 있어야 하는데, 과거에는
-   local_y = x_cam 으로 부호가 뒤집혀 있어 로봇이 회전할 때마다 감지된
-   물체 위치가 좌우 반전되어 나타났다. local_y = -x_cam 으로 수정.
-3. quality(과거 UWB QF 기반)를 ekf_global의 pose covariance 기반
-   "위치 불확실성" 지표로 대체했다. UWB 품질이 아니라 최종 위치 추정치의
-   실제 신뢰도를 반영하는 것이 더 정확하다.
-4. 카메라 감지 입력은 아직 AI 파이프라인이 없으므로 /event_detection/uvd
-   placeholder 토픽(u, v, depth, class_id 등 JSON)을 임시로 구독한다.
-
-REP-103 / CCW 좌표계 규약
--------------------------
-base_link: x=전방, y=좌측, z=상방 (오른손 좌표계, yaw는 CCW 양수)
-카메라(광학) 좌표계: x=우측, y=하방, z=전방 (표준 OpenCV/광학 좌표계)
-따라서 카메라의 +x_cam(화면 오른쪽)은 로봇 기준 -y(우측) 방향이 된다.
-  local_y = -x_cam   <-- 이번에 고친 부분 (과거: local_y = x_cam, 좌우 반전 버그)
-  local_x = depth (전방 거리, 카메라 z_cam)
+[2026-07-08 추가] map 좌표 기준 중복 제거 (2차 필터)
+------------------------------------------------------
+같은 클래스의 이벤트가 map 좌표상 일정 반경(dedup_radius_m) 안에서 이미
+보고된 적이 있으면 재발행하지 않는다. yolo_depth_publisher.py의 track ID
+기반 1차 필터(같은 프레임 흐름 안에서의 중복 방지)와 별개로, 로봇이
+이동하며 같은 지점을 다시 지나치는 경우까지 커버하기 위한 것.
+일정 시간(event_ttl_s) 동안 재감지가 없으면 목록에서 제거해, 같은 위치에서
+실제로 새로 발생한 이벤트(예: 꺼졌던 불이 다시 남)는 다시 보고될 수 있게 한다.
 """
 
 import json
@@ -52,19 +37,17 @@ class ChangePointDetector(Node):
         self.declare_parameter('output_topic', '/event_detection/map_point')
         self.declare_parameter('map_frame_id', 'map')
         self.declare_parameter('base_frame_id', 'base_link')
-        # base_link -> camera_link 오프셋 (아직 TF로 편입 전이므로 코드 상수로 유지)
-        self.declare_parameter('camera_offset_x', 0.15)  # 전방 오프셋 (m)
+        self.declare_parameter('camera_offset_x', 0.15)
         self.declare_parameter('camera_offset_y', 0.0)
         self.declare_parameter('camera_offset_z', 0.20)
-        # 카메라 내부 파라미터 (u,v를 각도로 변환하기 위한 간이 핀홀 모델)
-        self.declare_parameter('camera_hfov_deg', 74.0)  # Astra+ 카메라 스펙에 맞춰 hfov 기본값 69→74도 수정
+        self.declare_parameter('camera_hfov_deg', 74.0)  # Astra+ RGB FOV
         self.declare_parameter('image_width', 640)
-        # depth 의미 해석 (카메라 모델 확정 시 datasheet로 반드시 확인!):
-        #   False (기본): depth = Z-depth (광축에 수직인 평면까지의 거리; RealSense 등 대부분의 뎁스카메라 표준)
-        #   True        : depth = radial distance (카메라 원점에서 픽셀 방향으로의 직선거리/빗변)
-        # 잘못 설정하면 화각 가장자리에서 위치 오차가 커진다 (중심부는 차이 미미).
         self.declare_parameter('depth_is_radial', False)
         self.declare_parameter('tf_timeout_s', 0.3)
+
+        # ★ 2차 필터 파라미터
+        self.declare_parameter('dedup_radius_m', 1.0)   # 같은 이벤트로 볼 거리 반경
+        self.declare_parameter('event_ttl_s', 600.0)    # 이 시간 이상 재감지 없으면 "새 이벤트"로 취급
 
         self.map_frame = self.get_parameter('map_frame_id').value
         self.base_frame = self.get_parameter('base_frame_id').value
@@ -78,6 +61,13 @@ class ChangePointDetector(Node):
         self.depth_is_radial = self.get_parameter('depth_is_radial').value
         self.tf_timeout = Duration(seconds=self.get_parameter('tf_timeout_s').value)
 
+        self.dedup_radius = self.get_parameter('dedup_radius_m').value
+        self.event_ttl = Duration(seconds=self.get_parameter('event_ttl_s').value)
+
+        # ★ 2차 필터: 이미 보고한 이벤트 기록
+        # 각 항목: {'class_id': str, 'x': float, 'y': float, 'last_seen': rclpy.time.Time}
+        self.reported_events = []
+
         # ---- TF ----
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -90,8 +80,27 @@ class ChangePointDetector(Node):
             String, self.get_parameter('output_topic').value, 10)
 
         self.get_logger().info(
-            "change_point_detector 시작: map->base_link TF 조회 기반 (독자 UART/heading 로직 없음)"
+            "change_point_detector 시작: map->base_link TF 조회 기반 + "
+            f"위치 기반 중복 제거(반경 {self.dedup_radius}m, TTL {self.event_ttl.nanoseconds/1e9:.0f}s)"
         )
+
+    # ------------------------------------------------------------------
+    def _find_matching_event(self, class_id, map_x, map_y):
+        """같은 클래스이면서 반경 안에 있는 기존 이벤트를 찾아 반환 (없으면 None)."""
+        for ev in self.reported_events:
+            if ev['class_id'] != class_id:
+                continue
+            dist = math.hypot(map_x - ev['x'], map_y - ev['y'])
+            if dist < self.dedup_radius:
+                return ev
+        return None
+
+    def _cleanup_old_events(self, now):
+        """일정 시간 이상 재감지가 없었던 이벤트는 목록에서 제거."""
+        self.reported_events = [
+            ev for ev in self.reported_events
+            if (now - ev['last_seen']) < self.event_ttl
+        ]
 
     # ------------------------------------------------------------------
     def _detection_cb(self, msg: String):
@@ -110,24 +119,21 @@ class ChangePointDetector(Node):
             self.get_logger().debug("depth<=0, 무효 감지 스킵")
             return
 
-        # --- 1) (u, v, depth) -> 카메라 좌표계 (x_cam, y_cam, z_cam) ---
-        # 간이 핀홀 모델: 수평 각도만 이용 (2D 로봇 평면 투영 목적이므로 v는 참고용)
+        # --- 1) (u, v, depth) -> 카메라 좌표계 ---
         focal_px = (self.image_width / 2.0) / math.tan(self.hfov / 2.0)
         cx = self.image_width / 2.0
-        angle = math.atan2(u - cx, focal_px)  # 화면 중심 기준 좌우 각도
+        angle = math.atan2(u - cx, focal_px)
 
         if self.depth_is_radial:
-            # depth = 빗변 (radial): 삼각분해
-            x_cam = depth * math.sin(angle)   # 카메라 좌우축상의 오프셋
-            z_cam = depth * math.cos(angle)   # 카메라 전방 거리
+            x_cam = depth * math.sin(angle)
+            z_cam = depth * math.cos(angle)
         else:
-            # depth = Z-depth (기본, RealSense류 표준): 광축 성분이 그대로 depth
             z_cam = depth
             x_cam = depth * math.tan(angle)
 
-        # --- 2) 카메라 좌표계 -> base_link 좌표계 (REP-103, 좌우축 버그 수정 지점) ---
+        # --- 2) 카메라 좌표계 -> base_link 좌표계 ---
         local_x = z_cam + self.cam_offset[0]
-        local_y = -x_cam + self.cam_offset[1]   # <-- 수정: 과거 local_y = x_cam (좌우 반전 버그)
+        local_y = -x_cam + self.cam_offset[1]
         local_z = self.cam_offset[2]
 
         # --- 3) base_link -> map 변환 (TF 조회) ---
@@ -141,38 +147,58 @@ class ChangePointDetector(Node):
         try:
             transform = self.tf_buffer.lookup_transform(
                 self.map_frame, self.base_frame,
-                Time(),  # 최신 TF 사용 (헤더 타임스탬프에 타임아웃 이슈 있어 임시로 최신값 사용 중 - TODO 항목)
+                Time(),
                 timeout=self.tf_timeout)
         except Exception as e:
             self.get_logger().warn(f"TF 조회 실패 ({self.map_frame}<-{self.base_frame}): {e}")
             return
 
         point_in_map = tf2_geometry_msgs.do_transform_point(point_in_base, transform)
+        map_x = point_in_map.point.x
+        map_y = point_in_map.point.y
 
-        # --- 4) 위치 불확실성: ekf_global pose covariance 기반 (TODO: 실제 구독 연동) ---
-        # 현재는 placeholder 상수. ekf_global의 /odometry/filtered 또는
-        # /amcl_pose 유사 covariance 토픽을 구독해 xy covariance trace로 대체 예정.
+        # --- ★ 2차 필터: map 좌표 기준 중복 제거 ---
+        now = self.get_clock().now()
+        self._cleanup_old_events(now)
+
+        existing = self._find_matching_event(class_id, map_x, map_y)
+        if existing is not None:
+            # 이미 보고된 이벤트 → 재발행하지 않고, "최근에 봤다"는 시각만 갱신
+            existing['last_seen'] = now
+            self.get_logger().debug(
+                f"[{class_id}] 중복 이벤트로 판단 (기존 위치와 "
+                f"{math.hypot(map_x - existing['x'], map_y - existing['y']):.2f}m 이내) - 재발행 안 함"
+            )
+            return
+
+        # 새 이벤트로 확정 → 기록하고 발행
+        self.reported_events.append({
+            'class_id': class_id,
+            'x': map_x,
+            'y': map_y,
+            'last_seen': now,
+        })
+
         position_uncertainty_m = self._estimate_position_uncertainty()
 
         out = {
             'stamp': self.get_clock().now().to_msg().sec,
             'class_id': class_id,
             'confidence': confidence,
-            'map_x': point_in_map.point.x,
-            'map_y': point_in_map.point.y,
+            'map_x': map_x,
+            'map_y': map_y,
             'position_uncertainty_m': position_uncertainty_m,
         }
         out_msg = String()
         out_msg.data = json.dumps(out)
         self.pub.publish(out_msg)
 
+        self.get_logger().info(
+            f"[{class_id}] 새 이벤트 발행: map=({map_x:.2f}, {map_y:.2f})"
+        )
+
     # ------------------------------------------------------------------
     def _estimate_position_uncertainty(self) -> float:
-        """
-        ekf_global pose covariance 기반 위치 불확실성.
-        TODO: /odometry/filtered(ekf_global) 구독 후 covariance[0], covariance[7]의
-        trace(sqrt(cov_xx + cov_yy))로 대체. 현재는 임시 고정값.
-        """
         return 0.15  # meters, placeholder
 
 

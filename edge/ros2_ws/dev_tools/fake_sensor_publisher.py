@@ -93,7 +93,7 @@ class FakeSensorPublisher(Node):
 
         imu = Imu()
         imu.header.stamp = now
-        imu.header.frame_id = 'imu_link'
+        imu.header.frame_id = 'imu'
         imu.angular_velocity.z = w
         imu.linear_acceleration.x = 0.0
         imu.linear_acceleration.y = 0.0
