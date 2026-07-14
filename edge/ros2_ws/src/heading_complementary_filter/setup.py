@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'complementary_filter_node = heading_complementary_filter.complementary_filter_node:main',
+            'imu_axis_correction_node = heading_complementary_filter.imu_axis_correction_node:main',
         ],
     },
 )
