@@ -59,8 +59,12 @@ class UwbMapCalibration(Node):
         self.declare_parameter('uwb_pose_topic', '/uwb/pose')
         self.declare_parameter('map_frame_id', 'map')
         self.declare_parameter('uwb_frame_id', 'uwb_frame')
-        self.declare_parameter('collection_duration_s', 5.0)
+        self.declare_parameter('collection_duration_s', 5.0)  # 더 이상 종료 조건으로 안 씀, 하위 호환용
         self.declare_parameter('min_travel_distance_m', 1.0)  # 직선 피팅 신뢰를 위한 최소 이동거리
+        # ★ 로봇 최고속도(예: 0.15m/s)로는 고정된 5초 안에 1.0m를 못 채우는 구조적
+        #   모순이 있어, 시간이 아니라 "실제 이동거리"를 종료 조건으로 바꿈.
+        #   이 값은 순수 안전장치(로봇이 안 움직이거나 UWB가 끊겼을 때 무한 대기 방지)로만 씀.
+        self.declare_parameter('max_collection_timeout_s', 30.0)
         self.declare_parameter('known_heading_in_map_rad', 0.0)  # 로봇이 직진한 방향 (map 기준, 보통 +x = 0)
         self.declare_parameter('result_save_dir', '/tmp/uwb_calibration_results')
 
@@ -68,6 +72,7 @@ class UwbMapCalibration(Node):
         self.uwb_frame_id = self.get_parameter('uwb_frame_id').value
         self.collection_duration = self.get_parameter('collection_duration_s').value
         self.min_travel = self.get_parameter('min_travel_distance_m').value
+        self.max_collection_timeout = self.get_parameter('max_collection_timeout_s').value
         self.known_heading = self.get_parameter('known_heading_in_map_rad').value
         self.save_dir = self.get_parameter('result_save_dir').value
         os.makedirs(self.save_dir, exist_ok=True)
@@ -100,7 +105,8 @@ class UwbMapCalibration(Node):
         self.get_logger().info(
             "uwb_map_calibration IDLE 상태로 대기 중. "
             "'~/calibrate' 서비스 호출 시 로봇을 known_heading_in_map_rad 방향으로 "
-            f"{self.collection_duration}초간 직진시키세요."
+            f"직진시키세요 (최소 {self.min_travel}m 이동 시 자동 종료, "
+            f"최대 {self.max_collection_timeout}초 타임아웃)."
         )
 
     # ------------------------------------------------------------------
@@ -138,7 +144,7 @@ class UwbMapCalibration(Node):
             return response
 
         self.get_logger().info(
-            f"캘리브레이션 시작: {self.collection_duration}초간 "
+            f"캘리브레이션 시작: 최소 {self.min_travel}m 이동할 때까지 "
             "/uwb/pose 샘플을 수집합니다. 지금부터 로봇을 직진시키세요. "
             "결과는 수집 종료 후 로그/저장 파일로 확인하세요."
         )
@@ -148,24 +154,42 @@ class UwbMapCalibration(Node):
 
         response.success = True
         response.message = (
-            f"수집 시작됨 ({self.collection_duration}s). "
+            f"수집 시작됨 (최소 {self.min_travel}m 이동 시 종료). "
             "종료 후 결과는 로그와 result_save_dir 파일로 확인."
         )
         return response
 
     def _check_collection_done(self):
-        """주기 타이머: 수집 시간이 다 되면 계산을 수행."""
+        """주기 타이머: 시간이 아니라 '실제 이동거리(min_travel)'에 도달하면 계산 수행.
+        (로봇 최고속도로는 고정된 5초 안에 min_travel을 못 채우는 구조적 모순이 있어
+         거리 기반으로 변경. 안 움직이거나 UWB가 끊긴 경우를 대비해 안전 타임아웃도 둠.)"""
         if self.state != CalibState.COLLECTING:
             return
-        if time.time() - self.collect_start_time < self.collection_duration:
+
+        elapsed = time.time() - self.collect_start_time
+
+        travel = 0.0
+        if len(self.samples) >= 2:
+            start = self.samples[0]
+            end = self.samples[-1]
+            travel = math.hypot(end[1] - start[1], end[2] - start[2])
+
+        if travel >= self.min_travel:
+            self.state = CalibState.IDLE
+            success, message = self._compute_calibration()
+            if success:
+                self.get_logger().info(f"[캘리브레이션 성공] {message}")
+            else:
+                self.get_logger().error(f"[캘리브레이션 실패] {message}")
             return
 
-        self.state = CalibState.IDLE
-        success, message = self._compute_calibration()
-        if success:
-            self.get_logger().info(f"[캘리브레이션 성공] {message}")
-        else:
-            self.get_logger().error(f"[캘리브레이션 실패] {message}")
+        if elapsed >= self.max_collection_timeout:
+            self.state = CalibState.IDLE
+            self.get_logger().error(
+                f"[캘리브레이션 실패] 타임아웃({self.max_collection_timeout}초 경과). "
+                f"이동거리 {travel:.2f}m < {self.min_travel}m. "
+                "로봇이 실제로 움직이고 있는지, /uwb/pose가 정상 발행되는지 확인하세요."
+            )
 
     # ------------------------------------------------------------------
     def _compute_calibration(self):

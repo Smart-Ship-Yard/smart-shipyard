@@ -1,0 +1,27 @@
+/**:
+  ros__parameters:
+    filter1:
+      name: angle_filter_back
+      type: laser_filters/LaserScanAngularBoundsFilterInPlace
+      params:
+        lower_angle: -1.1990   # -68.7도
+        upper_angle: 1.9425    # 111.3도 (이 사이, 즉 후방 180도가 지워짐)
+
+    filter2:
+      name: range_filter
+      type: laser_filters/LaserScanRangeFilter
+      params:
+        use_message_range_limits: false
+        lower_threshold: 0.15
+        upper_threshold: 12.0
+        lower_replacement_value: .nan
+        upper_replacement_value: .inf
+
+    filter3:
+      name: speckle_filter
+      type: laser_filters/LaserScanSpeckleFilter
+      params:
+        filter_type: 0
+        max_range: 12.0
+        max_range_difference: 0.1
+        filter_window: 2

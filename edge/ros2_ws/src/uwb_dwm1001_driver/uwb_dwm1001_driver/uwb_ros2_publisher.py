@@ -42,7 +42,7 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 # POS,x,-1.23,y,4.56,z,0.00,qf,87
 # DIST,4,AN0,1783,x,0.00,y,0.00,z,0.00,dist,2.31,AN1,...
 LEC_POS_RE = re.compile(
-    r"POS,x,(?P<x>-?\d+\.?\d*),y,(?P<y>-?\d+\.?\d*),z,(?P<z>-?\d+\.?\d*),qf,(?P<qf>\d+)"
+    r"POS,(?P<x>-?\d+\.?\d*),(?P<y>-?\d+\.?\d*),(?P<z>-?\d+\.?\d*),(?P<qf>\d+)"
 )
 
 
@@ -100,6 +100,7 @@ class UwbDwm1001Driver(Node):
 
         # ---- 시리얼 연결 ----
         self.ser = None
+        self._rx_buffer = ''  # ★ 시리얼 조각을 줄바꿈 경계까지 이어붙이는 버퍼
         self._connect_serial()
         self._ensure_lec_mode()
 
@@ -166,22 +167,31 @@ class UwbDwm1001Driver(Node):
     # 폴링 / 파싱
     # ------------------------------------------------------------------
     def _poll_serial(self):
+        # ★ in_waiting에 의존하지 않고 바로 read 시도 (엔코더 브리지에서
+        #   겪었던 것과 같은 종류의 문제 - 이 클래스 드라이버에서 in_waiting이
+        #   부정확할 수 있음). 짧은 타임아웃(timeout=0.2)이 이미 설정돼 있어
+        #   빈 채로 바로 리턴하니 블로킹 걱정은 없다.
         try:
-            n = self.ser.in_waiting
+            chunk = self.ser.read(256).decode('utf-8', errors='ignore')
         except (OSError, serial.SerialException) as e:
             self.get_logger().error(f"시리얼 읽기 오류, 재연결 시도: {e}")
             self._reconnect()
             return
 
-        if n == 0:
+        if not chunk:
             return
 
-        raw = self.ser.read(n).decode('utf-8', errors='ignore')
-        for line in raw.splitlines():
+        # ★ 핵심 수정: 이번에 읽은 조각을 버퍼에 이어붙이고, 완성된 줄(\n으로
+        #   끝나는 것)만 꺼내 처리한다. DWM1001은 한 줄이 "DIST,...POS,..."처럼
+        #   길어서 한 번의 read()로 다 안 들어오고 중간에 잘리는 경우가 흔하다.
+        #   splitlines()로 즉시 나눠버리면 잘린 조각이 영영 합쳐질 기회가
+        #   없어서, 실제로 POS 파싱이 계속 실패하는 문제가 있었다.
+        self._rx_buffer += chunk
+        while '\n' in self._rx_buffer:
+            line, self._rx_buffer = self._rx_buffer.split('\n', 1)
             line = line.strip()
-            if not line:
-                continue
-            self._handle_line(line)
+            if line:
+                self._handle_line(line)
 
     def _reconnect(self):
         try:
@@ -201,9 +211,13 @@ class UwbDwm1001Driver(Node):
         raw_msg.data = line
         self.raw_pub.publish(raw_msg)
 
+        # ★ 실기 확인 결과, DWM1001 출력은 "DIST,...POS,x,y,z,qf" 형태로
+        #   거리 정보와 위치 정보가 한 줄에 같이 옴. DIST로 시작한다고
+        #   POS가 없는 게 아니므로, DIST 처리 후 return하지 않고
+        #   같은 줄에서 POS도 계속 찾아야 한다.
         if line.startswith('DIST'):
             self._handle_distances(line)
-            return
+            # return 제거 - 같은 줄에 POS가 이어질 수 있음
 
         m = LEC_POS_RE.search(line)
         if not m:

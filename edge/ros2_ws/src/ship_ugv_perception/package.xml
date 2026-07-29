@@ -15,7 +15,9 @@
   <!-- yolo_depth_publisher.py 신규 의존성 (rosdep으로 자동 설치 가능) -->
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
-
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  
   <!--
     아래 두 의존성은 rosdep 키가 존재하지 않아 여기 선언할 수 없음.
     각자 수동 설치 필요 (CONTRIBUTING.md 8번 / PROJECT_SUMMARY.md 3절 참고):
