@@ -44,9 +44,23 @@ import select
 import threading
 import time
 
+import math
+
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+
+
+def quaternion_to_yaw(q) -> float:
+    """쿼터니언 -> yaw(rad). motion_controller_node.py와 동일한 계산."""
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def wrap_to_pi(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
 
 
 INSTRUCTIONS = """
@@ -82,6 +96,16 @@ class KeyboardTeleopNode(Node):
         self.declare_parameter('linear_accel_limit', 0.15)   # m/s^2
         self.declare_parameter('angular_accel_limit', 1.0)   # rad/s^2
 
+        # ★ heading hold - motion_controller_node와 동일한 방식.
+        #   w/s(직진/후진) 중에는 trim/PID로도 못 지운 미세한 좌우 잔차가
+        #   시간이 지날수록 누적되어 크게 휘는데(이 노드는 원래 오픈루프라
+        #   이 보정이 아예 없었음), /odometry/local의 실제 yaw를 실시간으로
+        #   보면서 그 잔차를 계속 상쇄한다.
+        self.declare_parameter('odom_topic', '/odometry/local')
+        self.declare_parameter('enable_heading_hold', True)
+        self.declare_parameter('kp_heading_hold', 1.0)
+        self.declare_parameter('ki_heading_hold', 0.5)
+
         cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
         self.linear_step = self.get_parameter('linear_step_mps').value
         self.angular_step = self.get_parameter('angular_step_radps').value
@@ -103,6 +127,20 @@ class KeyboardTeleopNode(Node):
         self._speed_scale = 1.0  # +/- 로 조절되는 배율 (0.2 ~ 2.0로 제한)
         self.linear_accel_limit = self.get_parameter('linear_accel_limit').value
         self.angular_accel_limit = self.get_parameter('angular_accel_limit').value
+        self._heading_error_integral = 0.0
+
+        self.enable_heading_hold = self.get_parameter('enable_heading_hold').value
+        self.kp_heading_hold = self.get_parameter('kp_heading_hold').value
+        self.ki_heading_hold = self.get_parameter('ki_heading_hold').value
+        odom_topic = self.get_parameter('odom_topic').value
+
+        # ---- heading hold 상태 ----
+        self.cur_yaw = 0.0
+        self._odom_ready = False
+        self._drive_mode = 'stop'          # 'stop' | 'straight' | 'rotate'
+        self._straight_start_yaw = 0.0     # 직진 시작 시점의 기준 방향
+
+        self.create_subscription(Odometry, odom_topic, self._odom_cb, 20)
 
         self._stop_flag = threading.Event()
         self._key_thread = threading.Thread(target=self._key_loop, daemon=True)
@@ -116,6 +154,11 @@ class KeyboardTeleopNode(Node):
             f"keyboard_teleop 시작: {cmd_vel_topic} 발행, "
             f"idle_timeout={self.idle_timeout}s, publish_rate={publish_rate}Hz"
         )
+
+    # ------------------------------------------------------------------
+    def _odom_cb(self, msg: Odometry):
+        self.cur_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
+        self._odom_ready = True
 
     # ------------------------------------------------------------------
     def _key_loop(self):
@@ -140,18 +183,31 @@ class KeyboardTeleopNode(Node):
             scale = self._speed_scale
 
             if c == 'w':
+                # 이전이 직진/후진이 아니었다면(=새로 시작하는 직진 구간이라면)
+                # 지금 이 순간의 방향을 기준선으로 새로 잡는다.
+                if self._drive_mode != 'straight':
+                    self._straight_start_yaw = self.cur_yaw
+                    self._drive_mode = 'straight'
+                    self._heading_error_integral = 0.0
                 self._target_v = self.max_linear * scale
                 self._target_w = 0.0
             elif c == 's':
+                if self._drive_mode != 'straight':
+                    self._straight_start_yaw = self.cur_yaw
+                    self._drive_mode = 'straight'
+                    self._heading_error_integral = 0.0
                 self._target_v = -self.max_linear * scale
                 self._target_w = 0.0
             elif c == 'a':
+                self._drive_mode = 'rotate'
                 self._target_v = 0.0
                 self._target_w = self.max_angular * scale
             elif c == 'd':
+                self._drive_mode = 'rotate'
                 self._target_v = 0.0
                 self._target_w = -self.max_angular * scale
             elif c in (' ', 'x'):
+                self._drive_mode = 'stop'
                 self._target_v = 0.0
                 self._target_w = 0.0
             elif c in ('+', '='):
@@ -180,6 +236,7 @@ class KeyboardTeleopNode(Node):
                 if self._target_v != 0.0 or self._target_w != 0.0:
                     self._target_v = 0.0
                     self._target_w = 0.0
+                    self._drive_mode = 'stop'
 
         if self._stop_flag.is_set():
             self._shutdown()
@@ -194,6 +251,7 @@ class KeyboardTeleopNode(Node):
         with self._lock:
             target_v = self._target_v
             target_w = self._target_w
+            drive_mode = self._drive_mode
 
             # ★ 목표를 향해 이번 주기에 허용된 만큼만 다가간다 (가속도 제한)
             self._current_v = self._step_toward(
@@ -203,6 +261,19 @@ class KeyboardTeleopNode(Node):
 
             v = self._current_v
             w = self._current_w
+
+            # ★ heading hold: 직진/후진 중일 때만, target_w(항상 0)를
+            #   실시간 보정값으로 덮어쓴다. 회전(a/d) 중에는 사용자가
+            #   의도한 회전이니 건드리지 않는다.
+            if self.enable_heading_hold and drive_mode == 'straight' and self._odom_ready:
+                yaw_error = wrap_to_pi(self._straight_start_yaw - self.cur_yaw)
+                self._heading_error_integral += yaw_error * dt
+                # 적분 와인드업 방지 (오늘 Arduino PID에서 썼던 것과 같은 개념)
+                self._heading_error_integral = max(-1.0, min(1.0, self._heading_error_integral))
+                hold_w = (self.kp_heading_hold * yaw_error
+                          + self.ki_heading_hold * self._heading_error_integral)
+                hold_w = max(-self.max_angular, min(self.max_angular, hold_w))
+                w = hold_w
 
         msg = Twist()
         msg.linear.x = v

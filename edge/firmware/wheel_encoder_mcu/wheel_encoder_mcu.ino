@@ -69,6 +69,15 @@ volatile long enc_r_count = 0;
 
 // ---------------- 속도 제어 상태 ----------------
 long target_l_tps = 0;
+
+// ★ 기동 감쇠(startup damping): 정지 상태에서 새로 출발하는 순간,
+//   오른쪽 모터가 왼쪽보다 먼저/세게 반응하는 과도응답 차이가 실측으로
+//   확인됨 (teleop 출발 직후 왼쪽으로 꺾이는 원인). 출발 직후 짧은 시간
+//   동안만 오른쪽 PWM 출력에 계수를 곱해 그 차이를 미리 상쇄한다.
+unsigned long startup_time_ms = 0;      // 목표가 0에서 0이 아닌 값으로 바뀐 시각
+bool was_stopped = true;                // 직전까지 정지 상태였는지
+const unsigned long STARTUP_DAMP_DURATION_MS = 400;  // 이 시간 동안만 감쇠 적용
+const float STARTUP_DAMP_FACTOR_R = 0.85f;           // 오른쪽 출력을 85%로 제한
 long target_r_tps = 0;
 float integral_l = 0.0f, integral_r = 0.0f;
 long prev_err_l = 0, prev_err_r = 0;
@@ -151,6 +160,12 @@ void handleLine(const String& line) {
   long l = line.substring(2, comma1).toInt();
   long r = line.substring(comma1 + 1).toInt();
 
+  bool is_now_moving = (l != 0 || r != 0);
+  if (was_stopped && is_now_moving) {
+    startup_time_ms = millis();   // 정지->출발 전환 시점 기록
+  }
+  was_stopped = !is_now_moving;
+
   target_l_tps = l;
   target_r_tps = r;
   last_cmd_time = millis();
@@ -199,6 +214,13 @@ void controlLoop(float dt_s, long measured_l_tps, long measured_r_tps) {
                         dt_s, KP_L, KI_L, KD_L);
   int pwm_r = pidUpdate(target_r_tps, measured_r_tps, integral_r, prev_err_r,
                         dt_s, KP_R, KI_R, KD_R);
+
+  // ★ 기동 감쇠 적용: 출발 후 STARTUP_DAMP_DURATION_MS 이내라면
+  //   오른쪽 출력만 일시적으로 낮춘다 (좌회전 방향 편향 상쇄).
+  if (millis() - startup_time_ms < STARTUP_DAMP_DURATION_MS) {
+    pwm_r = (int)(pwm_r * STARTUP_DAMP_FACTOR_R);
+  }
+
   setMotorPWM(PIN_L_PWM, PIN_L_DIR, pwm_l);
   setMotorPWM(PIN_R_PWM, PIN_R_DIR, pwm_r);
 }
