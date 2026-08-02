@@ -2,23 +2,26 @@
 """
 websocket_client.py
 --------------------
-젯슨 -> 백엔드 서버 WebSocket 전송 노드. (스펙: 젯슨-서버 통신 스펙 v1.2)
-websockets 라이브러리 사용.
+젯슨 -> 백엔드 서버 WebSocket 전송 노드. (스펙: 젯슨-서버 통신 스펙 v1.3)
 
-구현 범위: ① 위치 핑, ② 위험 이벤트, ③ 조립 단계, ④ 배 위치(중계)
+[2026-07-17 스펙 v1.3 반영]
+- ① position에 yaw(로봇이 바라보는 방향, 라디안) 추가
+  -> /odometry/global의 orientation 쿼터니언에서 yaw 추출.
+- ② 위험 이벤트에 map_xy(객체의 map 절대 좌표) 추가
+  -> depth_xyz(카메라 기준)를 tf2로 map 프레임 변환 (change_point.py와 동일한
+     카메라 장착 오프셋 + REP-103 좌표축 변환 로직 사용).
+  -> TF(map->base_link) 조회 실패 시(EKF 미가동 등) 해당 이벤트 전송 보류.
+- depth_xyz, ekf_global은 디버깅용으로 유지.
+- ③ block_level, ④ ship_pose는 변경 없음.
 
-[2026-07-14] ⑤ 영상 스트리밍, ⑥ stream_boost 관련 코드 전부 제거함.
-영상 송출은 동료의 별도 시스템이 담당하며, 이 노드가 동시에 영상 채널을
-열면 서버 쪽과 충돌하는 것으로 확인되어 이 프로젝트에서는 다루지 않기로 함.
-
-EKF 토픽: ship_ugv_localization/launch/localization.launch.py 확인 결과
-  ekf_global 노드가 remappings=[('odometry/filtered', '/odometry/global')]로
-  nav_msgs/Odometry를 /odometry/global 에 발행 (world_frame=map).
+공통 규칙: person/helmet은 전송 안 함, conf 0.5 미만 버림, 같은 상황 연사 금지,
+timestamp는 서버가 붙이므로 생략.
 
 필요 패키지: pip install websockets --user
 """
 
 import json
+import math
 import queue
 import re
 import threading
@@ -27,8 +30,12 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.time import Time
 from std_msgs.msg import String
 from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PointStamped
+from tf2_ros import Buffer, TransformListener
+import tf2_geometry_msgs  # noqa: F401  (PointStamped 변환 등록용)
 
 try:
     from websockets.sync.client import connect as ws_connect
@@ -38,10 +45,9 @@ except ImportError:
     ConnectionClosed = Exception
 
 
-# ② 위험 이벤트: YOLO 클래스 이름 -> 백엔드 event_type 매핑
 DANGER_CLASS_MAP = {
     'fallen_person': 'fallen_person',
-    'person_fallen': 'fallen_person',   # 클래스명 변경 전 구모델 호환
+    'person_fallen': 'fallen_person',
     'fire': 'fire',
     'no_helmet': 'no_helmet',
     'ship_defect': 'ship_defect',
@@ -49,9 +55,14 @@ DANGER_CLASS_MAP = {
 
 
 def extract_level(class_name: str):
-    """클래스 이름에서 숫자 추출: 'level2', 'levle3', 'ship_defect_2' 모두 처리."""
     match = re.search(r'(\d+)', str(class_name))
     return int(match.group(1)) if match else None
+
+
+def yaw_from_quaternion(x, y, z, w):
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
 
 
 class WebSocketClient(Node):
@@ -69,6 +80,12 @@ class WebSocketClient(Node):
         self.declare_parameter('block_id', 'B1')
         self.declare_parameter('block_level_stability_s', 3.0)
 
+        self.declare_parameter('map_frame_id', 'map')
+        self.declare_parameter('base_frame_id', 'base_link')
+        self.declare_parameter('camera_offset_x', 0.15)
+        self.declare_parameter('camera_offset_y', 0.0)
+        self.declare_parameter('tf_timeout_s', 0.3)
+
         self.server_url = self.get_parameter('server_ws_url').value
         uvd_topic = self.get_parameter('uvd_topic').value
         ekf_topic = self.get_parameter('ekf_odom_topic').value
@@ -80,21 +97,29 @@ class WebSocketClient(Node):
         self.block_level_stability = Duration(
             seconds=self.get_parameter('block_level_stability_s').value)
 
+        self.map_frame = self.get_parameter('map_frame_id').value
+        self.base_frame = self.get_parameter('base_frame_id').value
+        self.cam_offset_x = self.get_parameter('camera_offset_x').value
+        self.cam_offset_y = self.get_parameter('camera_offset_y').value
+        self.tf_timeout = Duration(seconds=self.get_parameter('tf_timeout_s').value)
+
         if ws_connect is None:
             self.get_logger().error(
                 "websockets 미설치. 'pip install websockets --user' 후 재실행."
             )
 
-        # ---- ① 위치 핑용 상태 ----
         self.latest_ekf_global = None
+        self.latest_yaw = None
         self._ekf_lock = threading.Lock()
         self._ping_count = 0
 
-        # ---- ③ 조립 단계용 상태 ----
         self._level_candidate = None
         self._level_candidate_since = None
         self._level_confirmed = None
         self._level_lock = threading.Lock()
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.send_queue = queue.Queue()
 
@@ -109,39 +134,66 @@ class WebSocketClient(Node):
         self._ws_thread.start()
 
         self.get_logger().info(
-            f"websocket_client 시작: server={self.server_url}, "
-            f"ekf_topic={ekf_topic}, ship_pose_topic={ship_pose_topic}, "
-            f"ping={self.ping_interval}s, min_conf={self.min_confidence}, "
-            f"block_level_stability={self.block_level_stability.nanoseconds/1e9:.1f}s"
+            f"websocket_client 시작 (스펙 v1.3): server={self.server_url}, "
+            f"ekf_topic={ekf_topic}, ping={self.ping_interval}s, "
+            f"min_conf={self.min_confidence}"
         )
 
-    # ------------------------------------------------------------------
     def _ekf_cb(self, msg: Odometry):
+        q = msg.pose.pose.orientation
         with self._ekf_lock:
             self.latest_ekf_global = [
                 msg.pose.pose.position.x,
                 msg.pose.pose.position.y,
             ]
+            self.latest_yaw = yaw_from_quaternion(q.x, q.y, q.z, q.w)
 
-    def _get_ekf_global(self):
+    def _get_ekf_state(self):
         with self._ekf_lock:
-            return list(self.latest_ekf_global) if self.latest_ekf_global else None
+            ekf = list(self.latest_ekf_global) if self.latest_ekf_global else None
+            return ekf, self.latest_yaw
 
-    # ------------------------------------------------------------------
-    # ① 위치 핑 (0.5초 주기)
     def _position_ping_cb(self):
-        ekf_global = self._get_ekf_global()
-        if ekf_global is None:
+        ekf_global, yaw = self._get_ekf_state()
+        if ekf_global is None or yaw is None:
             return
 
-        self._enqueue({'event_type': 'position', 'ekf_global': ekf_global})
+        self._enqueue({
+            'event_type': 'position',
+            'ekf_global': ekf_global,
+            'yaw': yaw,
+        })
 
         self._ping_count += 1
         if self._ping_count % 10 == 0:
-            self.get_logger().info(f"[위치핑] ekf_global={ekf_global}")
+            self.get_logger().info(f"[위치핑] ekf_global={ekf_global} yaw={yaw:.3f}")
 
-    # ------------------------------------------------------------------
-    # /event_detection/uvd 콜백: ② 위험 이벤트 또는 ③ 조립 단계로 분기
+    def _camera_xyz_to_map_xy(self, depth_xyz):
+        x_cam, y_cam, z_cam = depth_xyz
+
+        local_x = z_cam + self.cam_offset_x
+        local_y = -x_cam + self.cam_offset_y
+
+        point_in_base = PointStamped()
+        point_in_base.header.frame_id = self.base_frame
+        point_in_base.header.stamp = self.get_clock().now().to_msg()
+        point_in_base.point.x = local_x
+        point_in_base.point.y = local_y
+        point_in_base.point.z = 0.0
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.map_frame, self.base_frame,
+                Time(),
+                timeout=self.tf_timeout)
+        except Exception as e:
+            self.get_logger().warn(
+                f"TF 조회 실패 ({self.map_frame}<-{self.base_frame}): {e}")
+            return None
+
+        point_in_map = tf2_geometry_msgs.do_transform_point(point_in_base, transform)
+        return [point_in_map.point.x, point_in_map.point.y]
+
     def _uvd_cb(self, msg: String):
         try:
             det = json.loads(msg.data)
@@ -161,8 +213,6 @@ class WebSocketClient(Node):
             self._handle_block_level(class_id, level)
             return
 
-    # ------------------------------------------------------------------
-    # ② 위험 이벤트 처리
     def _handle_danger_event(self, event_type, det):
         confidence = float(det.get('confidence', 0.0))
         if confidence < self.min_confidence:
@@ -174,23 +224,30 @@ class WebSocketClient(Node):
                 f"[{event_type}] depth_xyz 없음 - yolo_depth_publisher 최신 버전인지 확인")
             return
 
-        ekf_global = self._get_ekf_global()
+        ekf_global, _yaw = self._get_ekf_state()
         if ekf_global is None:
             self.get_logger().warn(
                 f"[{event_type}] ekf_global 없음(EKF 미가동) - 이벤트 전송 보류")
             return
 
+        map_xy = self._camera_xyz_to_map_xy(depth_xyz)
+        if map_xy is None:
+            self.get_logger().warn(
+                f"[{event_type}] map_xy 변환 실패(TF 미가용) - 이벤트 전송 보류")
+            return
+
         payload = {
             'event_type': event_type,
             'confidence': confidence,
+            'map_xy': map_xy,
             'depth_xyz': depth_xyz,
             'ekf_global': ekf_global,
         }
         self._enqueue(payload)
-        self.get_logger().info(f"[위험이벤트 큐] {event_type} conf={confidence:.2f}")
+        self.get_logger().info(
+            f"[위험이벤트 큐] {event_type} conf={confidence:.2f} "
+            f"map_xy=({map_xy[0]:.2f},{map_xy[1]:.2f})")
 
-    # ------------------------------------------------------------------
-    # ③ 조립 단계 처리 (안정화 필터 포함)
     def _handle_block_level(self, class_id, level):
         now = self.get_clock().now()
 
@@ -219,8 +276,6 @@ class WebSocketClient(Node):
         self._enqueue(payload)
         self.get_logger().info(f"[조립단계 확정] level={level} -> 전송")
 
-    # ------------------------------------------------------------------
-    # ④ 배 위치 (측량 결과 중계 - 측량 방법 자체는 아직 미정, TODO)
     def _ship_pose_cb(self, msg: String):
         try:
             data = json.loads(msg.data)
@@ -240,13 +295,10 @@ class WebSocketClient(Node):
         self._enqueue(payload)
         self.get_logger().info(f"[배위치] block_id={block_id} map_xy={map_xy} yaw={yaw:.3f}")
 
-    # ------------------------------------------------------------------
     def _enqueue(self, payload: dict):
         self.send_queue.put(payload)
 
-    # ------------------------------------------------------------------
     def _ws_worker(self):
-        """전송 전담 스레드: 연결 유지 + 큐 소비. 실패 시 자동 재접속."""
         while not self._stop_event.is_set():
             ws = None
             try:
@@ -254,7 +306,6 @@ class WebSocketClient(Node):
                 ws = ws_connect(self.server_url, open_timeout=5)
                 self.get_logger().info("서버 연결 성공")
 
-                # 재접속 시 현재 확정된 조립 단계를 한 번 다시 통보
                 with self._level_lock:
                     current_level = self._level_confirmed
                 if current_level is not None:
