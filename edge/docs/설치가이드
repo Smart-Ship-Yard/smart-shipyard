@@ -1,0 +1,305 @@
+# Smart Shipyard UGV — 엣지(edge) 설치 및 운영 가이드
+
+최종 갱신: 2026-08-03 (이주현)
+
+이 문서는 `edge/` 아래 로컬라이제이션·모션제어·SLAM 스택을 새 Jetson에
+설치하거나, 재부팅/하드웨어 재배치 후 다시 켤 때 참고하는 문서입니다.
+오늘 실기 브링업 과정에서 실제로 겪은 문제와 그 원인을 그대로 남겨서,
+같은 문제를 다시 겪지 않도록 하는 게 목적입니다.
+
+---
+
+## 1. 하드웨어 구성
+
+| 장치 | 모델 | 연결 방식 | 비고 |
+|---|---|---|---|
+| 메인 컴퓨터 | Jetson Orin Nano | - | Ubuntu 22.04, ROS2 Humble, JetPack 6 |
+| IMU | Hiwonder IM10A | USB (CH340 클론칩) | 축 180도 뒤집힘 장착, 소프트웨어 보정 |
+| LiDAR | RPLIDAR A1M8 | USB | |
+| UWB | DWM1001-DEV ×5 (앵커4+태그1) | USB (허브 경유) | 앵커는 매일 재배치 |
+| 모터/엔코더 | JGB37-520 ×2 (1320 CPR) | Arduino Mega 경유 | 감속기 있음, 실측 CPR=330 (아래 4장 참고) |
+| 모터드라이버 | Cytron MDD10A | PWM+DIR 모드 | MODE 핀 점퍼 확인 필요 |
+| 카메라 | Orbbec Astra+ | USB | |
+
+---
+
+## 2. 시리얼 장치 고정 (udev)
+
+### 왜 필요한가
+
+IMU와 Arduino Mega가 둘 다 CH340 계열 칩(VID:PID `1a86:7523`)을 써서
+VID/PID로 구분이 불가능하고, 리눅스 기본 이름(`/dev/ttyCH341USB0`,
+`ttyACM0` 등)은 "몇 번째로 인식됐는가"로 정해져서 부팅/재연결 순서에
+따라 서로 뒤바뀔 수 있다. 실제로 `witmotion_ros`가 Mega를 IMU로 착각해
+설정 패킷을 쏘고, `wheel_odom_bridge`가 포트를 못 여는 사고가 있었다.
+
+### 해결 — 물리적 USB 포트 경로(KERNELS)로 고정
+
+```bash
+edge/scripts/99-robot-serial.rules       # 규칙 파일 (git 관리)
+edge/scripts/install_udev_rules.sh       # 설치 스크립트
+```
+
+새 Jetson 세팅 시 또는 규칙이 안 먹힐 때:
+```bash
+cd ~/smart-shipyard/edge/scripts
+./install_udev_rules.sh
+```
+
+### 현재 고정된 매핑 (2026-08 기준, 포트를 바꾸면 재확인 필요)
+
+| 심볼릭 링크 | 실제 장치 | KERNELS 값 | 물리 포트 |
+|---|---|---|---|
+| `/dev/imu` | IMU (IM10A) | `1-2.1.3` | Jetson USB-A 포트 |
+| `/dev/wheel_mcu` | Arduino Mega | `1-2.4` | Jetson USB-A 포트 |
+| `/dev/lidar` | RPLIDAR A1M8 | `1-2.1.1` | Jetson USB-A 포트 |
+| `/dev/uwb_tag` | UWB 태그 | `1-2.1.2` | **USB 허브 경유** |
+
+★ **`uwb_tag`는 허브를 거쳐 연결되어 있다.** 이 허브를 다른 허브로
+교체하면 물리 경로 자체가 바뀌므로 `KERNELS` 값을 반드시 재확인할 것.
+
+### 포트가 바뀌었을 때 재확인 방법
+
+```bash
+ls /dev/ttyCH341USB* /dev/ttyACM*                          # 지금 뭐가 잡히는지
+udevadm info -a -n /dev/ttyCH341USB0 | grep "KERNELS==" | head -5
+```
+`cat /dev/ttyCH341USB0` (baud는 IMU 9600, Mega 115200)로 실제 어느
+장치인지 내용 보고 구분한 뒤, `99-robot-serial.rules`의 해당 줄만 수정.
+
+---
+
+## 3. 알려진 하드웨어 특성 (겪었던 함정들)
+
+### 3-1. CH341(클론) 드라이버의 `in_waiting` 버그
+
+이 드라이버는 `in_waiting`(내부적으로 `TIOCINQ` ioctl)이 **항상 0을
+반환**하는 문제가 있다. `wheel_odom_bridge`, `uwb_dwm1001_driver` 둘 다
+이 값에 의존하지 않고 짧은 타임아웃(`timeout=0.01~0.2`)으로 바로
+`read()`를 시도하는 방식으로 우회되어 있다. **새로 시리얼 읽기 코드를
+짤 때 `in_waiting`을 신뢰하지 말 것.**
+
+### 3-2. Arduino 자동 리셋(DTR)
+
+`pyserial`로 포트를 열면 DTR 신호가 토글되며 Arduino가 자동 리셋된다.
+부트로더 → 사용자 스케치 실행까지 약 2~3초 걸리는데, 이 시간 안에
+통신을 시도하면 조용히 실패한다. `wheel_odom_bridge`는 연결 시각을
+기록해두고 `reset_grace_period_s`(기본 3.0초) 동안은 통신을 건너뛰는
+논블로킹 방식으로 처리한다 (`time.sleep()`으로 막으면 안 됨 — 그러면
+콜백 하나가 executor 전체를 멈춰버림).
+
+### 3-3. 여러 프로세스가 같은 시리얼 포트를 열려고 하면 상태가 꼬임
+
+`avrdude`(펌웨어 업로드), `screen`, `cat`, ROS2 노드가 번갈아 같은
+포트를 열고 닫으면 CH341 드라이버 내부 상태가 이상해져서 데이터가 아예
+안 들어오는 경우가 있었다. **증상이 이상하면 먼저 `ps aux | grep tty해당포트`로
+좀비 프로세스가 있는지 확인하고, 없으면 USB를 물리적으로 뽑았다 꽂는 게
+가장 확실한 해결책.**
+
+### 3-4. Arduino 펌웨어 업로드 시 반드시 포트 점유 노드부터 끌 것
+
+`localization.launch.py`가 `/dev/wheel_mcu`를 이미 열고 있으면
+`arduino-cli upload`가 `Error: timeout`을 반복한다. 순서:
+```bash
+# 1) launch 종료 (Ctrl+C)
+arduino-cli compile --fqbn arduino:avr:mega ~/smart-shipyard/edge/firmware/wheel_encoder_mcu
+arduino-cli upload -p /dev/wheel_mcu --fqbn arduino:avr:mega ~/smart-shipyard/edge/firmware/wheel_encoder_mcu
+# 2) launch 재실행
+```
+
+---
+
+## 4. 오도메트리 캘리브레이션 (엔코더/모터)
+
+### 최종 확정값
+
+```python
+# ship_ugv_localization/launch/localization.launch.py, wheel_odom_node 파라미터
+'ticks_per_rev': 330,
+'wheel_radius_m': 0.0308,
+'track_width_m': 0.2295,
+'right_trim': 0.98,
+```
+
+### 왜 CPR이 스펙(1320)과 다른가 — 중요, 재현 시 반드시 이 순서로 검증할 것
+
+초기값(`ticks_per_rev=1320`, 모터 라벨 스펙값)으로는 **직진 거리가 명령의
+약 3.7~4배로 나오는 심각한 오차**가 있었다. `track_width_m`을 아무리
+조정해도 회전은 맞출 수 있었지만 직진은 절대 안 맞았다 — 이건
+`track_width`가 회전 계산에만 쓰이고 직진 거리 계산(`wheel_radius`,
+`ticks_per_rev`)에는 관여하지 않기 때문. 결국 **UWB로 실측한 이동거리와
+명령 거리를 비교**해서 `ticks_per_rev`가 실제로는 1320이 아니라 330
+(= 1320/4)이어야 한다는 걸 역산으로 확인했다. 감속기 배율 표기 방식
+차이로 추정되나 정확한 원인은 미확정 — **모터를 교체하거나 새로 사면
+반드시 이 방식(UWB 기준 실측 이동거리 대조)으로 재검증할 것.**
+
+### 재검증 절차
+
+1. `ros2 topic pub --once /motion/move_distance ... "{data: 0.5}"` 실행
+2. **줄자로 실제 이동거리 실측** (motion_controller 자체 판단 로그는
+   신뢰하지 말 것 — 오차가 있으면 이 판단 자체가 왜곡되어 있음)
+3. `새_ticks_per_rev = 현재값 × (명령거리 / 실측거리)`로 역산
+4. 90도, 360도 회전도 각각 명령 vs 실측 비교, `track_width_m` 미세조정
+
+### 좌우 모터 편향 — 3중 보정 구조
+
+한쪽으로 휘는 문제를 다음 3단계로 해결했다. 순서대로 원인이 다르니
+증상 위치(출발 순간 / 정상 주행 중 / 정지 직전)로 어느 걸 조정할지
+판단할 것.
+
+| 증상 위치 | 원인 | 해결 위치 |
+|---|---|---|
+| 정상 주행 중 계속 한쪽으로 | 좌우 모터 정상상태 힘 차이 | `wheel_odom_bridge`의 `right_trim` |
+| 출발/정지 순간에만 잠깐 | 좌우 모터 가속·감속 반응속도 차이 | Arduino `KP_L`/`KP_R` 분리, 기동감쇠(`STARTUP_DAMP_*`) |
+| teleop으로 오래 직진 시 누적되어 크게 휨 | heading_hold 없는 오픈루프 | `keyboard_teleop_node`에 PI 방식 heading_hold 추가 |
+
+`motion_controller_node`는 원래 heading_hold(P만)가 있었고,
+`keyboard_teleop_node`는 나중에 I항까지 추가해서 이식함 (P만으로는
+지속적인 편향에 정상상태 오차가 남아 계속 틀어진 채로 고정되는 문제가
+있었음).
+
+---
+
+## 5. UWB
+
+### 5-1. 앵커 배치 원칙
+
+- 4개가 한 직선상에 놓이면 삼변측량이 불안정해짐 — 사각형으로 벌릴 것
+- 태그가 앵커로 만든 사각형 **안쪽**에 있을 때 정확도 최고
+- 앵커는 가능한 높게(천장 근처), 태그와의 가시선을 사람/구조물이
+  자주 가리지 않게
+- 앵커 간 거리가 너무 가까우면(1m 내외) auto-positioning 정확도가
+  떨어짐 — 최소 3m 이상 권장
+- initiator는 공식적으로 "장애물 없이 모든 앵커와 봐야 한다"는 규칙은
+  없지만, 실무적으로 비교적 중앙에 두는 게 안전
+
+### 5-2. 태그 필수 설정 (DRTLS Manager 앱)
+
+| 항목 | 값 | 이유 |
+|---|---|---|
+| Location Engine | **활성화** | 꺼져 있으면 `POS` 좌표 자체가 안 나옴 |
+| Stationary Detection | **비활성화** | 켜져 있으면 로봇이 정지 시 위치 업데이트가 멈춤 |
+
+### 5-3. `uwb_ros2_publisher.py`에서 잡았던 버그 2건
+
+1. **버퍼링 부재**: `splitlines()`로 즉시 잘라버려서, 시리얼 조각이
+   중간에 끊겨 오면(긴 `DIST...POS...` 한 줄이 read() 여러 번에 걸쳐
+   옴) 영원히 완성된 줄로 합쳐지지 않았다. `\n` 기준 버퍼 누적 방식으로
+   수정.
+2. **정규식 포맷 불일치**: 코드는 `POS,x,-1.23,y,4.56,...` 라벨 포맷을
+   가정했는데 실제 펌웨어 출력은 `POS,0.55,1.19,0.34,68`(라벨 없음)
+   이었다. `LEC_POS_RE`를 실측 포맷에 맞게 수정.
+3. **`if line.startswith('DIST'): ...; return`** — 실제로는 한 줄에
+   `DIST`와 `POS`가 같이 들어있는데 `return`으로 `POS` 파싱을 건너뛰고
+   있었음. `return` 제거.
+
+### 5-4. UWB 캘리브레이션(`uwb_map_calibration`) — 종료조건 버그
+
+원래 "5초 고정 시간" 종료 조건이었는데, 로봇 최고속도(0.15m/s)로는
+5초 안에 최소 요구 이동거리(1.0m)를 채울 수 없는 **구조적 모순**이
+있었다. "시간이 아니라 실제 이동거리(1.0m)가 채워지면 종료, 단
+안전장치로 최대 30초 타임아웃"으로 수정함 (`calibration_node.py`의
+`_check_collection_done` 참고).
+
+### 5-5. 캘리브레이션 실행 절차
+
+```bash
+# localization.launch.py, motion_control.launch.py 둘 다 켜져 있어야 함
+ros2 service call /uwb_map_calibration/calibrate std_srvs/srv/Trigger
+# 응답 온 직후 바로 (로봇 정면 방향, 최소 1.5m 이상 빈 공간 확보하고):
+ros2 topic pub --once /motion/move_distance std_msgs/msg/Float64 "{data: 1.5}"
+
+ros2 run tf2_ros tf2_echo map uwb_frame   # 항등값(0,0,0)이 아닌지 확인
+```
+결과는 `/tmp/uwb_calibration_results/calib_NNN.json`에 자동 저장됨.
+**앵커를 재배치할 때마다 반드시 다시 실행.**
+
+---
+
+## 6. LiDAR
+
+### 6-1. 각도 필터 — 후방 180도 제거
+
+`laser_filters`의 `LaserScanAngularBoundsFilterInPlace`는 지정한 각도
+구간 **안쪽**만 지우는 단순한 로직이라 wrap-around(±180도 경계를
+넘는 범위)를 지원하지 않는다. 후방 180도(+90~+180도와 -180~-90도로
+두 조각남)를 지우려면 필터 두 개로 나눠야 한다. 상세: `config/laser_filter.yaml`.
+
+### 6-2. `slam_toolbox` 관련 최소/최대 거리 경고
+
+```
+minimum laser range setting (0.0 m) exceeds the capabilities of the used Lidar (0.2 m)
+```
+`slam_toolbox_mapping.yaml`에 `min_laser_range: 0.2`, `max_laser_range: 12.0`을
+명시해서 해결.
+
+---
+
+## 7. 좌표계 구조 (중요 — 헷갈리기 쉬움)
+
+```
+map            UWB 앵커 기준 절대 좌표계 (uwb_map_calibration이 매번 uwb_frame과 정합)
+ ├─ odom       로봇 켜진 시점 원점, EKF가 계속 갱신 (ekf_local/ekf_global)
+ │   └─ base_link
+ │        ├─ imu
+ │        └─ laser
+ ├─ uwb_frame  그날그날의 앵커 배치가 만드는 좌표계 (원점/축 임의)
+ └─ slam_map   그날의 SLAM 매핑이 시작한 지점 원점 (slam_map_alignment가 map과 정합)
+```
+
+**TF의 최종 권위자는 항상 EKF 하나뿐** (`map→odom`은 `ekf_global`,
+`odom→base_link`는 `ekf_local`)이라는 원칙을 지킬 것. `slam_toolbox`는
+`publish_tf: false`로 반드시 꺼둬야 하고, `slam_map_alignment`이 계산한
+`map↔slam_map`만 정적 TF로 발행한다.
+
+### 7-1. 지도(.pgm) 재사용 시 반드시 알아야 할 것
+
+`map_saver_cli`로 저장하는 지도는 **`slam_map` 좌표계 기준**이며,
+`map↔uwb_frame`, `map↔slam_map` 정합값은 **지도 파일 안에 저장되지
+않는다.** 즉:
+- 지형(벽 모양)이 그대로면 지도 파일은 재사용 가능
+- 하지만 UWB 앵커가 재배치되면 `~/calibrate`, `~/align`을 **반드시
+  다시** 실행해야 함 — 지도를 재사용해도 이 두 단계는 생략 불가
+
+지도+정합값 저장 위치: `edge/docs/maps/`
+
+---
+
+## 8. 실행 순서 (새 세션 시작 시)
+
+```bash
+# 0. 새 터미널마다
+cd ~/smart-shipyard/edge/ros2_ws && source install/setup.bash
+
+# 1. 하드웨어 확인
+ls -l /dev/imu /dev/wheel_mcu /dev/lidar /dev/uwb_tag
+
+# 2. (배치 바뀌었다면) 앵커 재설정 - DRTLS Manager 앱
+
+# 3. 전체 스택
+ros2 launch ship_ugv_localization localization.launch.py
+
+# 4. UWB 캘리브레이션 (앵커 재배치 시 매번 필수, 위 5-5 참고)
+ros2 launch ship_ugv_motion_control motion_control.launch.py
+ros2 service call /uwb_map_calibration/calibrate std_srvs/srv/Trigger
+ros2 topic pub --once /motion/move_distance std_msgs/msg/Float64 "{data: 1.5}"
+
+# 5. (매핑 새로 할 경우만) SLAM
+ros2 launch ship_ugv_localization mapping.launch.py
+ros2 run ship_ugv_motion_control keyboard_teleop_node   # motion_controller와 동시 실행 금지
+ros2 service call /slam_map_alignment/align std_srvs/srv/Trigger
+```
+
+---
+
+## 9. 자주 겪는 문제 빠른 진단표
+
+| 증상 | 유력 원인 | 확인 명령 |
+|---|---|---|
+| `map`<-`uwb_frame` TF 조회 실패 | `~/calibrate` 아직 안 함 | `ros2 run tf2_ros tf2_echo map uwb_frame` |
+| `map`<-`slam_map` TF 조회 실패 | `~/align` 아직 안 함, 또는 대응점 부족 | 로봇을 더 움직인 뒤 `~/align` 재시도 |
+| UWB 캘리브레이션 "이동거리 부족" | 5초 만에 1.0m 못 채움 (구버전 버그, 5-4 참고) | `calibration_node.py`가 거리기반 버전인지 확인 |
+| 시리얼 데이터 갑자기 끊김 | CH341 상태 꼬임 (3-3 참고) | `ps aux \| grep tty포트`, USB 재연결 |
+| Arduino 업로드 timeout | launch가 포트 점유 중 (3-4 참고) | launch 먼저 종료 |
+| 회전/직진 배수로 어긋남 | `ticks_per_rev`/`track_width` 재검증 필요 (4장 참고) | UWB 실측 대조 |
+| 로봇 한쪽으로 휨 | 휘는 시점(출발/주행중/정지)으로 원인 구분 (4장 표 참고) | |

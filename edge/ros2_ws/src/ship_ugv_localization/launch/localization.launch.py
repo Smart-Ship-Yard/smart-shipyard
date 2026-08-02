@@ -29,7 +29,7 @@ def generate_launch_description():
         name='uwb_dwm1001_driver',
         output='screen',
         parameters=[{
-            'serial_port': '/dev/ttyACM0',
+            'serial_port': '/dev/uwb_tag',   
             'baud_rate': 115200,
             'uwb_frame_id': 'uwb_frame',
         }],
