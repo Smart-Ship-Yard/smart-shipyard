@@ -53,6 +53,9 @@ def yaw_to_quaternion(yaw: float) -> Quaternion:
     q.w = math.cos(yaw / 2.0)
     return q
 
+def wrap_to_pi(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
+
 
 class WheelOdomBridge(Node):
 
@@ -84,6 +87,16 @@ class WheelOdomBridge(Node):
         self.declare_parameter('left_trim', 1.0)
         self.declare_parameter('right_trim', 1.0)
 
+        # ★ heading_hold: /cmd_vel 발행자가 누구든(motion_controller,
+        #   keyboard_teleop, 나중의 Nav2 등) 순수 직진/후진(w≈0) 명령을
+        #   보내면, 여기서 자체 yaw(self.yaw)를 보고 좌우 편향을 실시간
+        #   보정한다. 발행자 쪽에는 이 로직을 넣지 않는다 (한 곳에서만
+        #   관리하기 위함 - 2026-08 리팩토링, 이전엔 노드마다 중복 구현했었음).
+        self.declare_parameter('enable_heading_hold', True)
+        self.declare_parameter('kp_heading_hold', 1.0)
+        self.declare_parameter('ki_heading_hold', 0.5)
+        self.declare_parameter('heading_hold_w_threshold', 0.02)  # 이 이하면 "순수 직진 의도"로 간주
+
         self.declare_parameter('cmd_vel_timeout_s', 0.5)   # ROS 레벨 세이프티(중복 방어)
         # 포트를 열면 DTR 토글로 Arduino가 자동 리셋된다. 부트로더 -> 사용자 스케치
         # 실행까지 걸리는 시간 동안은 통신을 시도해도 응답이 없으므로 건너뛴다.
@@ -103,6 +116,16 @@ class WheelOdomBridge(Node):
         self.ticks_per_rev = self.get_parameter('ticks_per_rev').value
         self.left_trim = self.get_parameter('left_trim').value
         self.right_trim = self.get_parameter('right_trim').value
+
+        self.enable_heading_hold = self.get_parameter('enable_heading_hold').value
+        self.kp_heading_hold = self.get_parameter('kp_heading_hold').value
+        self.ki_heading_hold = self.get_parameter('ki_heading_hold').value
+        self.heading_hold_w_threshold = self.get_parameter('heading_hold_w_threshold').value
+
+        self._drive_mode = 'stop'            # 'stop' | 'straight' | 'other'
+        self._straight_start_yaw = 0.0
+        self._heading_error_integral = 0.0
+        self._last_heading_hold_time = None  # 직진 보정 dt 계산용
 
         self.cmd_vel_timeout = self.get_parameter('cmd_vel_timeout_s').value
         self.cmd_resend_interval = self.get_parameter('cmd_resend_interval_s').value
@@ -194,6 +217,38 @@ class WheelOdomBridge(Node):
     def _cmd_vel_cb(self, msg: Twist):
         v = msg.linear.x
         w = msg.angular.z
+
+        # ★ heading_hold: /cmd_vel 발행자가 w≈0(순수 직진/후진 의도)을 보내면
+        #   여기서 실시간으로 자체 yaw(self.yaw, 이 노드가 오도메트리 계산하며
+        #   이미 갖고 있음)를 보고 좌우 편향을 보정한다. motion_controller나
+        #   keyboard_teleop처럼 /cmd_vel을 보내는 쪽에는 이 로직을 넣지 않는다
+        #   - 발행자가 누구든 여기 한 곳만 거치면 자동으로 적용되게 하기 위함.
+        is_straight_intent = abs(w) < self.heading_hold_w_threshold and abs(v) > 1e-3
+
+        if self.enable_heading_hold and is_straight_intent:
+            if self._drive_mode != 'straight':
+                # 새로 직진을 시작하는 순간 -> 지금 방향을 기준선으로 새로 잡음
+                self._straight_start_yaw = self.yaw
+                self._heading_error_integral = 0.0
+                self._last_heading_hold_time = None
+                self._drive_mode = 'straight'
+
+            now = time.monotonic()
+            if self._last_heading_hold_time is None:
+                dt = 0.02  # 이번이 첫 호출이면 20ms로 근사
+            else:
+                dt = now - self._last_heading_hold_time
+                dt = max(0.001, min(0.2, dt))  # 비정상적으로 크거나 작은 dt 방지
+            self._last_heading_hold_time = now
+
+            yaw_error = wrap_to_pi(self._straight_start_yaw - self.yaw)
+            self._heading_error_integral += yaw_error * dt
+            self._heading_error_integral = max(-1.0, min(1.0, self._heading_error_integral))  # 와인드업 방지
+
+            w = (self.kp_heading_hold * yaw_error
+                 + self.ki_heading_hold * self._heading_error_integral)
+        else:
+            self._drive_mode = 'rotate' if abs(w) >= self.heading_hold_w_threshold else 'stop'
 
         if self.track_width <= 0.0 or self.wheel_radius <= 0.0:
             # 실측값 없으면 안전하게 정지 명령만 유지 (경고는 __init__에서 이미 출력함)

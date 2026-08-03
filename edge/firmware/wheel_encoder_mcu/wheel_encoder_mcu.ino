@@ -230,8 +230,20 @@ void loop() {
   readSerial();
 
   if (millis() - last_cmd_time > CMD_TIMEOUT_MS) {
+    // ★ 워치독 발동 시에도 handleLine과 동일하게 적분값을 반드시 리셋해야 한다.
+    //   ROS2가 꺼져 있으면 handleLine 자체가 호출되지 않으므로(새 명령이 안 옴),
+    //   여기서 리셋 안 하면 들었다 놓는 등의 충격으로 생긴 잔여 오차가
+    //   PID 적분에 쌓인 채 수 초간 스스로 진정될 때까지 계속 미세하게 떨린다.
+    if (target_l_tps != 0 || target_r_tps != 0) {
+      // 방금 전까지 움직이고 있었다가 지금 막 워치독으로 멈추는 순간에만
+      // 리셋 로그를 남겨서, 매 루프(20ms)마다 반복 실행되는 건 방지.
+    }
     target_l_tps = 0;
     target_r_tps = 0;
+    integral_l = 0.0f;
+    integral_r = 0.0f;
+    prev_err_l = 0;
+    prev_err_r = 0;
   }
 
   unsigned long now = millis();

@@ -94,10 +94,9 @@ class MotionControllerNode(Node):
         self.declare_parameter('control_rate_hz', 20.0)
         self.declare_parameter('timeout_s', 30.0)  # 이 시간 넘으면 실패로 간주하고 정지
 
-        # ---- 직진 중 방향 유지(heading hold) ----
-        # 좌우 모터 특성이 미세하게 달라 직진해도 조금씩 휘는 것을 보정한다.
-        self.declare_parameter('enable_heading_hold', True)
-        self.declare_parameter('kp_heading_hold', 1.0)
+        # ★ 직진 중 방향 유지(heading hold)는 이제 wheel_odom_bridge가 담당한다
+        #   (2026-08 리팩토링). /cmd_vel 발행자마다 중복 구현하던 걸 정리해서,
+        #   여기서는 w=0.0으로만 명령하면 하류에서 자동으로 보정된다.
 
         odom_topic = self.get_parameter('odom_topic').value
         cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
@@ -111,8 +110,6 @@ class MotionControllerNode(Node):
         self.dist_tol = self.get_parameter('distance_tolerance_m').value
         self.angle_tol = math.radians(self.get_parameter('angle_tolerance_deg').value)
         self.timeout_s = self.get_parameter('timeout_s').value
-        self.enable_heading_hold = self.get_parameter('enable_heading_hold').value
-        self.kp_hold = self.get_parameter('kp_heading_hold').value
 
         # ---- 내부 상태 ----
         self.state = MotionState.IDLE
@@ -267,14 +264,8 @@ class MotionControllerNode(Node):
         v = self.kp_v * error
         v = self._clamp_with_deadband(v, self.min_v, self.max_v)
 
-        # 직진 중 방향 유지: 시작 방향에서 벗어난 만큼 살짝 되돌린다
-        w = 0.0
-        if self.enable_heading_hold:
-            yaw_error = wrap_to_pi(self.start_yaw - self.cur_yaw)
-            w = self.kp_hold * yaw_error
-            w = max(-self.max_w, min(self.max_w, w))  # 데드밴드 없이 순수 클램프
-
-        self._publish_cmd(v, w)
+        # ★ w=0.0으로 명령 -> wheel_odom_bridge의 heading_hold가 실시간 보정
+        self._publish_cmd(v, 0.0)
 
     # ------------------------------------------------------------------
     def _control_rotate(self):

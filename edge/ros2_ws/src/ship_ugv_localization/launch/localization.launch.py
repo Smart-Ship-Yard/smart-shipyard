@@ -118,7 +118,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'serial_port': '/dev/wheel_mcu',
-            'track_width_m': 0.2295,
+            'track_width_m': 0.22568,
             'wheel_radius_m': 0.0308,
             'ticks_per_rev': 330,   # 1320 -> 330으로 변경 (JGB37-520 실제 CPR 재검증)
             'right_trim': 0.98,   # 왼쪽으로 휘니 오른쪽을 살짝 줄여서 시작
