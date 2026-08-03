@@ -23,7 +23,6 @@ setup(
         'console_scripts': [
             'motion_controller_node = ship_ugv_motion_control.motion_controller_node:main',
             'square_test_node = ship_ugv_motion_control.square_test_node:main',
-            'fake_rotation_odom_publisher = ship_ugv_motion_control.fake_rotation_odom_publisher:main',
             'keyboard_teleop_node = ship_ugv_motion_control.keyboard_teleop_node:main',
         ],
     },

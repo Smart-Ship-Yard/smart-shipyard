@@ -27,4 +27,3 @@ SUBSYSTEM=="tty", KERNELS=="1-2.1.1", SYMLINK+="lidar"
 # ★ UWB 태그는 USB 허브를 거쳐 연결됨. 이 허브를 다른 허브로 교체하면
 #   물리 경로가 통째로 바뀌므로 KERNELS 값을 반드시 재확인해야 한다.
 #   (2026-08 시점 실측: 허브 경유, 값 1-2.1.2)
-# SUBSYSTEM=="tty", KERNELS=="1-x.y", SYMLINK+="uwb_tag"

@@ -26,9 +26,11 @@ Arduino Mega(Cytron MDD10A 모터드라이버 x1(2채널) + JGB37-520 엔코더 
   map<->slam_map과 동일한 설계 원칙).
 
 ★ track_width_m, wheel_radius_m 기본값은 0.0(placeholder)이며, 실제 값은
-  localization.launch.py에서 실측치로 주입한다 (2026-07 실측: 트랙폭 0.236m,
-  바퀴 반지름 0.0325m). 파라미터가 0.0인 채로 실행되면 경고를 내고
-  오도메트리를 발행하지 않는다(잘못된 값을 EKF에 주입하지 않기 위함).
+  localization.launch.py에서 실측치로 주입한다 (2026-08 최종 확정: 트랙폭
+  0.22568m, 바퀴 반지름 0.0308m, ticks_per_rev 330 - UWB 실측 기반 역산,
+  자세한 과정은 edge/docs/ju_ws_설치가이드_v3.md 4장 참고). 파라미터가
+  0.0인 채로 실행되면 경고를 내고 오도메트리를 발행하지 않는다
+  (잘못된 값을 EKF에 주입하지 않기 위함).
 """
 
 import math
@@ -63,12 +65,11 @@ class WheelOdomBridge(Node):
         super().__init__('wheel_odom_bridge')
 
         # ---- 파라미터 ----
-        self.declare_parameter('serial_port', '/dev/ttyACM1')
-        # 참고: Arduino Mega(순정, ATmega16U2/8U2 USB)는 보통 /dev/ttyACM*로 잡힘.
-        # 실제 보드 연결 후 `ls /dev/ttyACM*`로 확인 후 맞는 값으로 override할 것.
-        # UWB 태그도 J-Link 가상 시리얼이라 /dev/ttyACM*를 쓰므로, 둘 다 꽂았을 때
-        # 어느 게 어느 번호로 잡히는지 반드시 확인 (예: UWB=ttyACM0, Mega=ttyACM1
-        # 처럼 매번 순서가 바뀔 수 있음 - VID/PID 기반 udev 규칙으로 고정 권장).
+        self.declare_parameter('serial_port', '/dev/wheel_mcu')
+        # /dev/wheel_mcu는 udev 규칙(edge/scripts/99-robot-serial.rules)으로
+        # 고정된 심볼릭 링크. localization.launch.py가 이 값을 override해서
+        # 넘겨준다. 규칙이 아직 안 걸려있다면 `ls /dev/ttyACM*`로 실제 포트를
+        # 확인해서 launch 파라미터를 그 값으로 override할 것.
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('odom_topic', '/wheel/odom')
