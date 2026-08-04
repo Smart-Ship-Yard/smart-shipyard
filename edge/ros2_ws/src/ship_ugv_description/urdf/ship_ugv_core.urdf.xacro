@@ -1,0 +1,159 @@
+<?xml version="1.0"?>
+<!--
+  ship_ugv_core.urdf.xacro
+  ==========================
+  실물/시뮬 공용 물리 서술. base_link, 바퀴, IMU/LiDAR 프레임까지만 담는다.
+  Gazebo 플러그인·센서 노이즈 등 시뮬 전용 내용은 이 파일에 넣지 않고
+  별도 xacro(예: ship_ugv_gazebo.xacro)에서 <xacro:include>로 얹는다.
+
+  ★ base_link 원점 정의 (ship_ugv_localization/launch/localization.launch.py의
+    static_transform_publisher 실측 주석과 동일 기준) ★
+    - x, y: 두 바퀴 축의 중점
+    - z   : 지면(바닥)
+
+  실측 출처: edge/ros2_ws/src/ship_ugv_localization/launch/localization.launch.py
+             (2026-07-29 실측), edge/docs/설치가이드.md 1장,
+             차체/바퀴 캘리퍼 실측 (2026-08-04)
+
+  ★★ NOTE: track_width/wheel_radius가 wheel_odom_node 파라미터와 다름 (의도적) ★★
+    - 여기 값은 URDF 시각화/충돌체용 "기하학적 실측값"이고, localization.launch.py의
+      wheel_odom_node 파라미터(wheel_radius_m=0.0308, track_width_m=0.22568)는 실주행
+      오도메트리용 "유효값"이라 슬립/눌림 등을 보정해 다를 수 있음(예: right_trim=0.98
+      존재로 보아 이미 어느 정도 튜닝된 값일 가능성 있음).
+    - 캘리퍼 실측(2026-08-04): 바퀴 안쪽틈 0.21+두께 0.02635≈0.236m, 바깥쪽거리
+      0.259-두께 0.02635≈0.2327m로 두 방법이 서로 근접(축중심간격 실측 ≈0.233~0.236m).
+      wheel_odom_node 쪽 값을 그대로 둘지 재보정할지는 슬램 담당자와 상의 후 결정할 것 —
+      이 파일 값만 바꿔서는 실물 오도메트리에 영향 없음.
+-->
+<robot name="ship_ugv" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ================= 실측 확정값 ================= -->
+  <!-- URDF 시각화/충돌체 전용 기하학적 실측값 (wheel_odom_node 파라미터와는 별개, 위 NOTE 참고) -->
+  <xacro:property name="track_width" value="0.2345"/>   <!-- 실측(캘리퍼, 축중심간격 평균) -->
+  <xacro:property name="wheel_radius" value="0.0335"/>    <!-- 실측(캘리퍼, 지름 6.7cm/2), m -->
+
+  <!-- 출처: base_link_to_imu_tf / base_link_to_laser_tf (localization.launch.py) -->
+  <xacro:property name="imu_offset_xyz" value="0 0 0.055"/>
+  <xacro:property name="laser_offset_xyz" value="0.195 0 0.2"/>
+  <xacro:property name="laser_offset_rpy" value="3.14159 0 0"/>  <!-- 180도 뒤집혀 장착 -->
+
+  <!-- ================= 실측(캘리퍼) 확정값 ================= -->
+  <xacro:property name="chassis_length" value="0.40"/>   <!-- 실측: 차체 앞뒤 길이 -->
+  <xacro:property name="chassis_width" value="0.178"/>   <!-- 실측: 차체 좌우 폭 -->
+  <xacro:property name="chassis_height" value="0.316"/>  <!-- 실측: 프레임 최하단~최상단 -->
+  <xacro:property name="chassis_z_center" value="0.233"/> <!-- 실측: 지상고 0.075 + 높이/2 0.158 -->
+
+  <!-- 아령으로 대략 잰 추정치 (정밀 저울 아님) -->
+  <xacro:property name="chassis_mass" value="3.5"/>  <!-- 실측(추정), kg -->
+  <xacro:property name="wheel_mass" value="0.036"/>   <!-- 실측(모터 제외 휠만), kg -->
+  <xacro:property name="wheel_width" value="0.02635"/> <!-- 실측(캘리퍼), m -->
+
+  <!-- 센서 링크는 물리적으로 무시 가능한 수준이지만, 0으로 두면 일부
+       물리엔진이 경고/불안정을 일으켜 아주 작은 값을 넣는다 -->
+  <xacro:property name="sensor_mass" value="0.05"/>
+
+  <!-- ================= 공용 관성 매크로 ================= -->
+  <xacro:macro name="box_inertial" params="mass x y z">
+    <inertial>
+      <mass value="${mass}"/>
+      <inertia
+        ixx="${mass/12.0*(y*y+z*z)}" ixy="0" ixz="0"
+        iyy="${mass/12.0*(x*x+z*z)}" iyz="0"
+        izz="${mass/12.0*(x*x+y*y)}"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="cylinder_inertial" params="mass r h">
+    <inertial>
+      <mass value="${mass}"/>
+      <inertia
+        ixx="${mass/12.0*(3*r*r+h*h)}" ixy="0" ixz="0"
+        iyy="${mass/12.0*(3*r*r+h*h)}" iyz="0"
+        izz="${mass/2.0*r*r}"/>
+    </inertial>
+  </xacro:macro>
+
+  <!-- ================= base_link ================= -->
+  <!-- 물리적 실체 없는 기준 프레임. 실제 차체는 chassis_link로 분리
+       (base_link를 바퀴축 중점/지면 기준으로 유지하기 위함) -->
+  <link name="base_link"/>
+
+  <!-- ================= 차체(섀시) ================= -->
+  <joint name="base_link_to_chassis" type="fixed">
+    <parent link="base_link"/>
+    <child link="chassis_link"/>
+    <origin xyz="0 0 ${chassis_z_center}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="chassis_link">
+    <visual>
+      <geometry>
+        <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
+      </geometry>
+    </collision>
+    <xacro:box_inertial mass="${chassis_mass}" x="${chassis_length}" y="${chassis_width}" z="${chassis_height}"/>
+  </link>
+
+  <!-- ================= 바퀴 (좌/우 공용 매크로) ================= -->
+  <xacro:macro name="wheel" params="prefix reflect">
+    <joint name="base_link_to_${prefix}_wheel" type="continuous">
+      <parent link="base_link"/>
+      <child link="${prefix}_wheel_link"/>
+      <origin xyz="0 ${reflect * track_width / 2.0} ${wheel_radius}" rpy="-1.5708 0 0"/>
+      <axis xyz="0 0 1"/>
+    </joint>
+
+    <link name="${prefix}_wheel_link">
+      <visual>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+      </visual>
+      <collision>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+      </collision>
+      <xacro:cylinder_inertial mass="${wheel_mass}" r="${wheel_radius}" h="${wheel_width}"/>
+    </link>
+  </xacro:macro>
+
+  <xacro:wheel prefix="left" reflect="1"/>
+  <xacro:wheel prefix="right" reflect="-1"/>
+
+  <!-- ================= IMU ================= -->
+  <!-- 실측(2026-07-29): base_link 원점 기준 상방 0.055m, x/y 중앙 -->
+  <joint name="base_link_to_imu" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="${imu_offset_xyz}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="imu_link">
+    <xacro:box_inertial mass="${sensor_mass}" x="0.02" y="0.02" z="0.01"/>
+  </link>
+
+  <!-- ================= LiDAR ================= -->
+  <!-- 실측(2026-07-29): base_link 원점(바퀴축 중점,지면) 기준
+       전방 0.195m, 상방 0.2m, 180도 뒤집혀 장착(roll=pi) -->
+  <joint name="base_link_to_laser" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser"/>
+    <origin xyz="${laser_offset_xyz}" rpy="${laser_offset_rpy}"/>
+  </joint>
+
+  <link name="laser">
+    <visual>
+      <geometry>
+        <cylinder radius="0.03" length="0.04"/>
+      </geometry>
+    </visual>
+    <xacro:cylinder_inertial mass="${sensor_mass}" r="0.03" h="0.04"/>
+  </link>
+
+</robot>
