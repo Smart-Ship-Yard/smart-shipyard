@@ -6,14 +6,13 @@
   Gazebo 플러그인·센서 노이즈 등 시뮬 전용 내용은 이 파일에 넣지 않고
   별도 xacro(예: ship_ugv_gazebo.xacro)에서 <xacro:include>로 얹는다.
 
-  ★ base_link 원점 정의 (ship_ugv_localization/launch/localization.launch.py의
-    static_transform_publisher 실측 주석과 동일 기준) ★
+  ★ base_link 원점 정의 ★
     - x, y: 두 바퀴 축의 중점
     - z   : 지면(바닥)
 
-  실측 출처: edge/ros2_ws/src/ship_ugv_localization/launch/localization.launch.py
-             (2026-07-29 실측), edge/docs/설치가이드.md 1장,
-             차체/바퀴 캘리퍼 실측 (2026-08-04)
+  실측 출처: edge/docs/설치가이드.md 1장, 차체/바퀴 캘리퍼 실측 (2026-08-04),
+             센서 오프셋은 현장 실측 메모(2026-07-29) 기반
+             (localization.launch.py에는 아직 미반영)
 
   ★★ NOTE: track_width/wheel_radius가 wheel_odom_node 파라미터와 다름 (의도적) ★★
     - 여기 값은 URDF 시각화/충돌체용 "기하학적 실측값"이고, localization.launch.py의
