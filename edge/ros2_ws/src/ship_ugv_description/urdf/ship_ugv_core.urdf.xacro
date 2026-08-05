@@ -43,10 +43,25 @@
   <xacro:property name="chassis_height" value="0.316"/>  <!-- 실측: 프레임 최하단~최상단 -->
   <xacro:property name="chassis_z_center" value="0.233"/> <!-- 실측: 지상고 0.075 + 높이/2 0.158 -->
 
+  <!-- 뒷바퀴 축(base_link 원점)은 차체 길이 중앙이 아니라 뒤쪽으로 치우쳐 있음 -->
+  <xacro:property name="wheel_axle_to_rear_face" value="0.038"/> <!-- 실측: 뒷바퀴 축 중심~차체 프레임 최후단면, 축이 후단면보다 앞에 위치 -->
+  <xacro:property name="chassis_offset_x" value="${chassis_length/2.0 - wheel_axle_to_rear_face}"/>
+    <!-- base_link(바퀴축) 기준 차체 중심 x. 후단면(-wheel_axle_to_rear_face)에서 chassis_length/2 만큼 앞 -->
+
   <!-- 아령으로 대략 잰 추정치 (정밀 저울 아님) -->
   <xacro:property name="chassis_mass" value="3.5"/>  <!-- 실측(추정), kg -->
   <xacro:property name="wheel_mass" value="0.036"/>   <!-- 실측(모터 제외 휠만), kg -->
   <xacro:property name="wheel_width" value="0.02635"/> <!-- 실측(캘리퍼), m -->
+
+  <!-- 캐스터휠(전방 비구동 지지휠) 실측(캘리퍼, 2026-08-05) -->
+  <!-- 시뮬 단순화: 실제 스위블+포크 구조 대신 저마찰 구(sphere)로 근사(표준 관행).
+       그래서 스위블 조인트 자체 높이(4.3cm=7.8-3.5)나 육각 샤프트 길이(3.5cm)는
+       URDF에는 반영하지 않고, 구가 지면(z=0)에 접하도록 반지름만큼만 띄운다. -->
+  <xacro:property name="caster_radius" value="0.0125"/> <!-- 실측(캘리퍼, 지름 2.5cm/2), m -->
+  <xacro:property name="caster_offset_x" value="${chassis_offset_x + chassis_length/2.0 - 0.014}"/>
+    <!-- base_link 기준 차체 앞면(chassis_offset_x + chassis_length/2)에서
+         캐스터 스위블(z축 회전조인트) 중심까지 실측 1.4cm 안쪽 -->
+  <!-- y=0: 차체 좌우 끝에서 스위블 중심까지 양쪽 다 8.6cm로 동일 실측(중심선 정렬 확인) -->
 
   <!-- 센서 링크는 물리적으로 무시 가능한 수준이지만, 0으로 두면 일부
        물리엔진이 경고/불안정을 일으켜 아주 작은 값을 넣는다 -->
@@ -73,6 +88,16 @@
     </inertial>
   </xacro:macro>
 
+  <xacro:macro name="sphere_inertial" params="mass r">
+    <inertial>
+      <mass value="${mass}"/>
+      <inertia
+        ixx="${2.0/5.0*mass*r*r}" ixy="0" ixz="0"
+        iyy="${2.0/5.0*mass*r*r}" iyz="0"
+        izz="${2.0/5.0*mass*r*r}"/>
+    </inertial>
+  </xacro:macro>
+
   <!-- ================= base_link ================= -->
   <!-- 물리적 실체 없는 기준 프레임. 실제 차체는 chassis_link로 분리
        (base_link를 바퀴축 중점/지면 기준으로 유지하기 위함) -->
@@ -82,7 +107,7 @@
   <joint name="base_link_to_chassis" type="fixed">
     <parent link="base_link"/>
     <child link="chassis_link"/>
-    <origin xyz="0 0 ${chassis_z_center}" rpy="0 0 0"/>
+    <origin xyz="${chassis_offset_x} 0 ${chassis_z_center}" rpy="0 0 0"/>
   </joint>
 
   <link name="chassis_link">
@@ -125,6 +150,29 @@
 
   <xacro:wheel prefix="left" reflect="1"/>
   <xacro:wheel prefix="right" reflect="-1"/>
+
+  <!-- ================= 캐스터휠 (전방 지지, 비구동) ================= -->
+  <!-- fixed 조인트 + 구(sphere)로 근사(조향 조인트 없이도 모든 방향 회전 가능해
+       캐스터 거동 흉내). 마찰 계수 등 Gazebo 전용 튜닝은 별도 xacro에서 처리 예정. -->
+  <joint name="base_link_to_caster" type="fixed">
+    <parent link="base_link"/>
+    <child link="caster_link"/>
+    <origin xyz="${caster_offset_x} 0 ${caster_radius}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="caster_link">
+    <visual>
+      <geometry>
+        <sphere radius="${caster_radius}"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <sphere radius="${caster_radius}"/>
+      </geometry>
+    </collision>
+    <xacro:sphere_inertial mass="${sensor_mass}" r="${caster_radius}"/>
+  </link>
 
   <!-- ================= IMU ================= -->
   <!-- 실측(2026-07-29): base_link 원점 기준 상방 0.055m, x/y 중앙 -->
