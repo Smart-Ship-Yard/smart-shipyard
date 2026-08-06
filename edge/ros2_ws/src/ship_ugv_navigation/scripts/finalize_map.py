@@ -52,6 +52,42 @@ def newest(pattern):
     return max(files, key=os.path.getmtime) if files else None
 
 
+# 정합을 호출한 뒤 맵을 저장하기까지 걸리는 시간의 허용 범위(초).
+# 맵을 먼저 저장하고 정합을 다시 호출하는 순서도 있을 수 있어 여유를 둔다.
+SAVE_TOLERANCE_S = 120
+
+
+def pick_align(align_dir, pgm_mtime):
+    """맵에 대응하는 정합 기록을 고른다.
+
+    핵심: "가장 최신"이 아니라 **"맵 저장 시점 이전의 것 중 가장 최신"**을 고른다.
+
+    왜 그냥 최신을 쓰면 안 되나 —
+        14:00  align_001 생성 (A방)
+        14:05  map_v3.pgm 저장
+        14:10  align_002 생성 (B방)
+        14:15  map_v4.pgm 저장
+        14:20  finalize_map.py shipyard_map_v3
+    이때 "최신"은 align_002(B방)이지만 v3에 필요한 것은 align_001(A방)이다.
+    시간 차이가 5분뿐이라 차이 기반 검사로는 절대 잡히지 않는다.
+    맵보다 나중에 만들어진 정합 기록은 그 맵의 것일 수 없다는 순서 규칙으로 판별한다.
+
+    반환: (고른 파일 또는 None, 전체 후보 목록[시각순])
+    """
+    files = sorted(glob.glob(os.path.join(align_dir, 'align_*.json')),
+                   key=os.path.getmtime)
+    if not files:
+        return None, []
+    before = [f for f in files if os.path.getmtime(f) <= pgm_mtime + SAVE_TOLERANCE_S]
+    return (before[-1] if before else None), files
+
+
+def fmt_time(path):
+    import datetime
+    return datetime.datetime.fromtimestamp(
+        os.path.getmtime(path)).strftime('%m-%d %H:%M:%S')
+
+
 def step(n, title):
     print(f'\n[{n}/4] {title}')
     print('-' * 60)
@@ -66,6 +102,8 @@ def main():
     ap.add_argument('--align-dir', default='/tmp/slam_map_alignment_results')
     ap.add_argument('--calib-dir', default='/tmp/uwb_calibration_results')
     ap.add_argument('--skip-check', action='store_true')
+    ap.add_argument('--force', action='store_true',
+                    help='정합 기록과 맵의 시각 차이 검사를 무시하고 진행')
     a = ap.parse_args()
 
     name = a.map_name.replace('.yaml', '').replace('.pgm', '')
@@ -91,16 +129,68 @@ def main():
     step(1, '정합·캘리브레이션 기록 보존')
     os.makedirs(records, exist_ok=True)
 
-    align_src = newest(os.path.join(a.align_dir, 'align_*.json'))
+    pgm_mtime = os.path.getmtime(pgm_path)
+    align_src, all_aligns = pick_align(a.align_dir, pgm_mtime)
     calib_src = newest(os.path.join(a.calib_dir, 'calib_*.json'))
 
-    if align_src is None:
+    if not all_aligns:
         print(f'❌ 정합 기록을 못 찾았다: {a.align_dir}/align_*.json')
         print('   align 서비스를 호출했는지 확인할 것:')
         print('   ros2 service call /slam_map_alignment/align std_srvs/srv/Trigger')
         print()
         print('   이미 레포에 기록이 있다면 --align-dir 로 그 폴더를 지정해도 된다.')
         return 1
+
+    def show_candidates():
+        print(f'  맵 저장 시각        {fmt_time(pgm_path)}  ({name}.pgm)')
+        print('  정합 기록 목록:')
+        for f in all_aligns:
+            mark = '  <-- 선택' if f == align_src else ''
+            rel = '이전' if os.path.getmtime(f) <= pgm_mtime + SAVE_TOLERANCE_S else '이후'
+            print(f'    {fmt_time(f)}  [{rel}]  {os.path.basename(f)}{mark}')
+
+    # 맵보다 나중에 만들어진 정합 기록만 있다면 어느 것이 맞는지 알 수 없다.
+    if align_src is None and not a.force:
+        show_candidates()
+        print()
+        print('  ⛔ 중단: 맵 저장보다 나중에 만들어진 정합 기록밖에 없다.')
+        print('     이 맵의 정합 기록이 아닐 가능성이 높다.')
+        print('     (맵을 저장한 뒤에 align을 다시 호출했다면 정상일 수 있다)')
+        print()
+        print('  아무 파일도 고치지 않았다. 아래 중 하나를 선택할 것:')
+        print(f'    1) 맞다고 확신하면:  python3 scripts/finalize_map.py {name} --force')
+        print(f'    2) 값을 직접 입력:   python3 scripts/bake_map_origin.py '
+              f'maps/{name}.yaml --tf <x> <y> <yaw>')
+        return 1
+
+    if align_src is None:          # --force 인 경우 최신 것으로 진행
+        align_src = all_aligns[-1]
+
+    # 고른 기록이 맵보다 한참 오래됐으면 다른 세션의 것일 수 있다.
+    # 잘못된 변환이 적용된 맵은 겉보기에 멀쩡해서 Nav2를 돌려봐야 알게 되므로
+    # 경고만 하지 않고 중단한다 (아직 아무 파일도 고치지 않은 시점).
+    gap_min = (pgm_mtime - os.path.getmtime(align_src)) / 60.0
+    if gap_min > 30 and not a.force:
+        show_candidates()
+        print()
+        print(f'  ⛔ 중단: 고른 정합 기록이 맵 저장보다 {gap_min:.0f}분 앞선다.')
+        print('     다른 매핑 세션의 기록일 가능성이 있다.')
+        print('     (정상 절차라면 align 직후 맵을 저장하므로 몇 분 이내여야 한다)')
+        print()
+        print('  아무 파일도 고치지 않았다. 아래 중 하나를 선택할 것:')
+        print(f'    1) 맞다고 확신하면:  python3 scripts/finalize_map.py {name} --force')
+        print(f'    2) 값을 직접 입력:   python3 scripts/bake_map_origin.py '
+              f'maps/{name}.yaml --tf <x> <y> <yaw>')
+        print()
+        print('  판단 근거: 아래 값이 매핑 때 본 tf2_echo map slam_map 과 같은지 확인')
+        print('  ' + '-' * 56)
+        for line in open(align_src).read().splitlines():
+            print('  ' + line)
+        return 1
+
+    if len(all_aligns) > 1:
+        show_candidates()
+        print()
 
     align_dst = os.path.join(records, f'align_{name}.json')
     shutil.copy2(align_src, align_dst)
