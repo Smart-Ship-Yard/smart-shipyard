@@ -1,0 +1,10 @@
+{
+  "timestamp": 1785951454.6869526,
+  "travel_distance_m": 1.1596551211459378,
+  "uwb_heading_rad": 1.0067126057452396,
+  "theta_uwb_to_map_rad": -1.0067126057452396,
+  "published_tf_theta_rad": -1.0067126057452396,
+  "published_tf_tx": -0.45979187283983797,
+  "published_tf_ty": 0.14694023843193618,
+  "num_samples": 42
+}
