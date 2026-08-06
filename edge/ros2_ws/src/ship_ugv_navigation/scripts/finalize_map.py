@@ -100,6 +100,8 @@ def main():
                     help='맵 이름 (확장자 없이). 예: shipyard_map_v3')
     ap.add_argument('--maps-dir', default=os.path.join(PKG_ROOT, 'maps'))
     ap.add_argument('--align-dir', default='/tmp/slam_map_alignment_results')
+    ap.add_argument('--align-file',
+                    help='쓸 정합 기록을 직접 지정 (자동 선택을 건너뜀)')
     ap.add_argument('--calib-dir', default='/tmp/uwb_calibration_results')
     ap.add_argument('--skip-check', action='store_true')
     ap.add_argument('--force', action='store_true',
@@ -130,7 +132,14 @@ def main():
     os.makedirs(records, exist_ok=True)
 
     pgm_mtime = os.path.getmtime(pgm_path)
-    align_src, all_aligns = pick_align(a.align_dir, pgm_mtime)
+    if a.align_file:
+        if not os.path.exists(a.align_file):
+            print(f'❌ 지정한 정합 기록이 없다: {a.align_file}')
+            return 1
+        align_src, all_aligns = a.align_file, [a.align_file]
+        print(f'  정합 기록을 직접 지정함: {a.align_file}')
+    else:
+        align_src, all_aligns = pick_align(a.align_dir, pgm_mtime)
     calib_src = newest(os.path.join(a.calib_dir, 'calib_*.json'))
 
     if not all_aligns:
@@ -190,6 +199,20 @@ def main():
 
     if len(all_aligns) > 1:
         show_candidates()
+        print()
+
+    # 더 최신 기록을 건너뛰고 고른 경우 — 두 가지 상황이 mtime상 구별되지 않는다.
+    #   (정상) 옆방 맵을 뒤늦게 마무리:      이 맵 이후의 정합은 다른 세션 것이 맞다
+    #   (오류) 맵을 저장한 뒤 align을 호출:  건너뛴 그 최신 기록이 정답이다
+    # 자동 판별이 불가능하므로 사용자에게 확인을 요청한다.
+    if align_src != all_aligns[-1]:
+        print(f'  ℹ️ 더 최신 정합 기록({os.path.basename(all_aligns[-1])})이 있지만')
+        print('     이 맵 저장보다 나중이라 제외했다.')
+        print('     ⚠️ 맵을 저장한 "뒤에" align을 호출했다면 제외한 그쪽이 정답이다.')
+        print('        그런 경우 아래로 다시 할 것:')
+        print(f'        cp maps/{name}.yaml.orig maps/{name}.yaml   # 이미 보정했다면')
+        print(f'        python3 scripts/finalize_map.py {name} '
+              f'--align-file {all_aligns[-1]}')
         print()
 
     align_dst = os.path.join(records, f'align_{name}.json')
