@@ -505,24 +505,108 @@ AMCL을 쓰면 구조가 달라져 이식이 어긋난다.
 edge/ros2_ws/src/
 ├── ship_ugv_description/urdf/
 │   ├── ship_ugv_core.urdf.xacro      # ← 절대 미수정 (슬램 실측값)
-│   └── ship_ugv_gazebo.xacro         # 신규: <gazebo> 태그, diff_drive, 센서 플러그인
+│   └── ship_ugv_gazebo.xacro         # ✅ 완료: <gazebo> 태그, diff_drive, 센서 플러그인
 └── ship_ugv_navigation/              # 신규 패키지 (ament_python)
     ├── config/nav2_params.yaml       # ★ 진짜 산출물
-    ├── maps/                         # docs/maps에서 이동 완료
-    ├── worlds/jg_room.world
+    ├── maps/                         # ✅ 완료 (shipyard_map_v2 보정 완료)
+    ├── worlds/demo_room.world        # ✅ 완료
+    ├── scripts/                      # ✅ 완료 (매핑 후처리 3종 + 월드 생성기)
     ├── launch/
     │   ├── sim_bringup.launch.py     # Gazebo + 스폰 + 가짜 로컬라이제이션
     │   └── navigation.launch.py      # map_server + Nav2 (시뮬/실물 공용, use_sim_time 인자)
     ├── ship_ugv_navigation/
-    │   └── patrol_mission_node.py    # ★ 순찰 + (2단계)이벤트 정지/재개 상태머신
+    │   ├── patrol_mission_node.py    # ★ 순찰 순회 (Nav2 클라이언트)
+    │   └── event_gate_node.py        # ★ 이벤트 판정 -> /event/active 발행
     └── rviz/nav2.rviz
 ```
 
 `navigation.launch.py`를 **시뮬/실물 공용**으로 만드는 것이 핵심.
 `use_sim_time`과 `scan_topic`만 인자로 빼면 젯슨에서 인자만 바꿔 그대로 실행된다.
 
-**젯슨으로 보낼 것:** `nav2_params.yaml`, `navigation.launch.py`, `patrol_mission_node.py`
+**젯슨으로 보낼 것:** `nav2_params.yaml`, `navigation.launch.py`,
+`patrol_mission_node.py`, `event_gate_node.py`
 **젯슨에 안 보낼 것:** world 파일, `ship_ugv_gazebo.xacro`, `sim_bringup.launch.py`
+
+---
+
+## 7-1. 작업 단계 (진행 상황)
+
+| Step | 산출물 | 상태 |
+|---|---|---|
+| 1 | `ship_ugv_gazebo.xacro` — 시뮬 전용 물리/센서 | ✅ 완료 |
+| 2 | 월드 + 맵 + 매핑 후처리 스크립트 3종 | ✅ 완료 |
+| **3** | **`sim_bringup.launch.py`** — Gazebo 기동 + 로봇 스폰 + TF 트리 | ← 다음 |
+| 4 | `nav2_params.yaml` — footprint·속도·코스트맵·planner·controller | |
+| 5 | `navigation.launch.py` — map_server + Nav2 (시뮬/실물 공용) | |
+| **6** | **`patrol_mission_node.py`** — 원형 순찰 무한 순회 | |
+| **7** | **`event_gate_node.py`** — 이벤트 감지 시 정지 / 해결 시 재개 | |
+| 8 | 실물 이식 + 튜닝 | |
+
+### Step 6: `patrol_mission_node.py` — 왜 필요한가
+
+**Nav2는 "실행하면 돌아다니는 프로그램"이 아니다.** "여기로 가"라고 지시하면
+거기까지 가고 멈추는 엔진이며, 순찰·반복·웨이포인트 순회 개념이 없다.
+목표를 하나씩 계속 주는 주체가 반드시 따로 있어야 한다.
+
+```
+patrol_mission_node  ──goToPose()──>  Nav2 스택  ──/cmd_vel──>  wheel_odom_bridge
+   (운전자)                            (자동차)
+```
+
+- 원 위의 웨이포인트 N개(12개 권장)를 순서대로 `goToPose()`
+- 마지막까지 가면 처음으로 되돌아가 무한 순회
+- `/event/active` 를 구독해 `cancelTask()` / 재개
+- 구현: `nav2_simple_commander`의 `BasicNavigator`
+  (`goToPose` / `isTaskComplete` / `cancelTask`)
+
+주요 파라미터 (검사 스크립트가 출력하는 값을 그대로 사용):
+```yaml
+center_x: 3.457      # check_patrol_space.py 출력
+center_y: 0.543
+radius:   0.30
+num_waypoints: 12    # 12개면 경로가 중심에서 0.97R 이상 떨어져 배를 안 스침
+direction: cw        # 시계방향 = 카메라(오른쪽 90도)가 배를 향함
+```
+
+### Step 7: `event_gate_node.py` — 이벤트 정지/재개
+
+**서버를 경유하지 않고 젯슨 내부에서 완결한다** (2026-08-07 팀 결정).
+`websocket_client.py`(비전 담당자 파일)는 **수정하지 않는다.**
+같은 토픽을 별도 노드가 구독하는 방식이라 결합이 없다.
+
+```
+/event_detection/uvd  (욜로 감지 결과, JSON String)
+        │
+        ├──> websocket_client.py   ──> 서버      (기존, 미수정)
+        └──> event_gate_node.py    ──> /event/active (std_msgs/Bool)
+                                            └──> patrol_mission_node
+```
+
+```yaml
+event_gate_node:
+  trigger_classes: [fallen_person, fire, no_helmet]   # ship_defect는 선택
+  min_confidence: 0.5
+  detect_hold_s: 1.0    # 1초 연속 감지 -> 정지 (안전은 빨라야 함)
+  clear_hold_s:  7.0    # 7초 연속 미감지 -> 재개
+```
+
+**히스테리시스(감지/해제 기준을 다르게 둠)를 쓰는 이유:** 잘못된 "해결" 판정은
+잘못된 "감지"보다 훨씬 나쁘다. 화재가 진행 중인데 로봇이 자리를 뜨면
+관제실이 현장을 못 본다. 반면 오탐으로 잠깐 멈추는 것은 손해가 적다.
+
+**`clear_hold_s`가 최소 정지 시간 역할도 겸한다.** 감지 직후 소품을 치워도
+그때부터 7초를 세므로 최소 7초는 정지 상태가 유지된다. 별도 파라미터 불필요.
+
+**값 확정은 리허설에서:** 소품을 정리하고 카메라 프레임 밖으로 나가기까지
+스톱워치로 재고 +3초. 너무 짧으면(사람이 아직 옆에 있는데 출발) 고장처럼
+보이므로, 애매하면 긴 쪽을 택한다.
+
+⚠️ **참고 — 비전 쪽 "3초"는 위험 이벤트용이 아니다.** 코드 확인 결과:
+- `fallback_confirm_frames: 3` = 3**프레임** ≈ 0.3초 (추론 주기 0.1초)
+- `block_level_stability_s: 3.0` = 3**초**, **조립단계 전용**
+- `_handle_danger_event()` = **시간 조건 없음.** conf 0.5 넘으면 즉시 전송
+
+따라서 위험 이벤트의 시간 안정화는 `event_gate_node`가 자체적으로 해야 한다.
 
 ---
 
