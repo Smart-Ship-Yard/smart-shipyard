@@ -201,20 +201,6 @@ def main():
         show_candidates()
         print()
 
-    # 더 최신 기록을 건너뛰고 고른 경우 — 두 가지 상황이 mtime상 구별되지 않는다.
-    #   (정상) 옆방 맵을 뒤늦게 마무리:      이 맵 이후의 정합은 다른 세션 것이 맞다
-    #   (오류) 맵을 저장한 뒤 align을 호출:  건너뛴 그 최신 기록이 정답이다
-    # 자동 판별이 불가능하므로 사용자에게 확인을 요청한다.
-    if align_src != all_aligns[-1]:
-        print(f'  ℹ️ 더 최신 정합 기록({os.path.basename(all_aligns[-1])})이 있지만')
-        print('     이 맵 저장보다 나중이라 제외했다.')
-        print('     ⚠️ 맵을 저장한 "뒤에" align을 호출했다면 제외한 그쪽이 정답이다.')
-        print('        그런 경우 아래로 다시 할 것:')
-        print(f'        cp maps/{name}.yaml.orig maps/{name}.yaml   # 이미 보정했다면')
-        print(f'        python3 scripts/finalize_map.py {name} '
-              f'--align-file {all_aligns[-1]}')
-        print()
-
     align_dst = os.path.join(records, f'align_{name}.json')
     shutil.copy2(align_src, align_dst)
     print(f'  정합    {align_src}\n       -> {align_dst}')
