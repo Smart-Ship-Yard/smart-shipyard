@@ -94,18 +94,21 @@ data_files=[
 
 빠뜨리면 **빌드는 성공하는데 실행할 때 "파일 없음"** 이 난다. ROS2 초보 함정 1위.
 
-### 1-4. 이벤트 정지/재개는 2단계로 미룸
+### 1-4. 이벤트 정지/재개는 순찰 완성 후에 붙인다 (Step 6 → Step 7)
 
-**1단계(현재):** 웨이포인트 순찰 + 무한 반복 주행까지만.
-**2단계(나중):** 이벤트 감지 시 정지 / 해결 시 재개.
+**Step 6까지:** 웨이포인트 순찰 + 무한 반복 주행.
+**Step 7:** 이벤트 감지 시 정지 / 관제 확인 시 재개.
 
-**근거:** 비전 담당자의 웹소켓 작업 미완료. 확인 결과 `websocket_client.py`에
-**수신(recv) 코드가 아예 없어** 현재는 `stream_boost`조차 받지 못한다.
-지금 만들어도 테스트할 방법이 없다.
-"경로 돌기"가 되면 "멈추기"는 쉽게 붙지만, 반대는 성립하지 않는다.
+**근거:** "경로 돌기"가 되면 "멈추기"는 쉽게 붙지만 반대는 성립하지 않는다.
+또한 재개 신호가 프론트·백엔드·비전 세 팀에 걸쳐 있어 순찰 완성과 병렬로
+진행하는 편이 일정상 유리하다.
 
-**단, 1단계 순찰 노드에 `/nav/command` 토픽 구독은 미리 뚫어둔다.** 나중에 웹소켓이
-완성되면 연결만 하면 되게.
+**Step 6 순찰 노드는 `/event/active` (Bool) 구독을 미리 뚫어둔다.**
+그 값을 누가 만드는지는 순찰 노드가 알 필요가 없으므로, Step 7이 늦어져도
+Step 6은 독립적으로 완성·테스트할 수 있다.
+
+> ⚠️ 이전 판단(`websocket_client.py`에 수신 코드가 없어 2단계로 미룸)은
+> 설계 변경으로 해소됐다. 상세는 **4장**과 **Step 7** 참조.
 
 ---
 
@@ -392,21 +395,28 @@ ROS 표준 맵들이 0.196을 쓰는 이유가 정확히 이것이다.
 서버→젯슨 메시지는 `stream_boost` 하나뿐이고, 젯슨 쪽 `websocket_client.py`에는
 수신 코드(`ws.recv()`) 자체가 없다.
 
-**방침: `/ws/nav` 엔드포인트를 신설한다.** `websocket_client.py`(비전 담당자 파일)를
-수정하지 않기 위한 선택이며, 백엔드는 Nav2 담당 본인이 소유하므로 전 구간을
-혼자 처리할 수 있다.
+**방침: 기존 `/ws/jetson` 중계 경로를 재사용한다. 새 엔드포인트를 만들지 않는다.**
+프론트→젯슨 중계 코드는 [backend/main.py:318](../../backend/main.py#L318)에
+이미 동작 중이므로 백엔드 수정은 상수 2줄이면 끝난다.
 
 | 구간 | 할 일 | 담당 |
 |---|---|---|
-| 프론트 | 이벤트 팝업에 "확인" 버튼 → `/ws/frontend`로 ack 전송 | 프론트 담당 |
-| 백엔드 | `/ws/nav` 엔드포인트 신설, 프론트 ack를 중계 | **본인** |
-| 젯슨 | `event_gate_node`가 `/ws/nav`에 접속해 수신 | **본인** |
+| 프론트 | 이벤트 팝업에 "확인" 버튼 → 기존 `/ws/frontend` 소켓으로 ack 전송 | 프론트 담당 |
+| 백엔드 | `JETSON_BOUND_TYPES`에 `event_ack` 추가 (상수 2줄) | **본인** |
+| 비전 | `websocket_client.py`에 수신 루프 → `/server/inbound`로 발행 (~10줄) | 비전 담당 |
+| 젯슨 | `event_gate_node`가 `/server/inbound` 구독 | **본인** |
 
 ```json
 {"event_type": "event_ack"}
 ```
 
-`/ws/jetson`은 지금처럼 **송신 전용으로 유지**한다. 비전 담당자 작업은 없다.
+**프론트엔드도 새 엔드포인트가 불필요하다.** `/ws/frontend`는 이미 양방향이며
+`webrtc_signal`이 그 경로로 다니고 있다.
+
+> 초기에는 `/ws/nav` 엔드포인트 신설을 검토했으나, 프론트→젯슨 중계 경로가 이미
+> 존재해 백엔드 작업량이 오히려 적고(엔드포인트 수십 줄 → 상수 2줄),
+> 단일 게이트웨이가 정석 아키텍처이므로 철회했다.
+> 상세 근거는 **Step 7**의 "확인(ack) 신호 경로" 참조.
 `docs/interface.md`에 서버→Nav2 메시지로 기재할 것.
 
 ---
@@ -427,8 +437,9 @@ ROS 표준 맵들이 0.196을 쓰는 이유가 정확히 이것이다.
 [YOLO 감지] ──/event_detection/uvd──> [event_gate_node]  ← 즉시 정지 (로컬, 지연 0)
                     │                        │
                     └─> websocket_client ──> 백엔드 ──> 프론트 (알림 팝업)
-                                              │                    │
-[event_gate_node] <────/ws/nav────────────────┘  <── 관리자 "확인" 클릭
+                            │                  │                    │
+                            │  /server/inbound │   event_ack        │
+[event_gate_node] <─────────┘ <────────────────┘ <── 관리자 "확인" 클릭
      └─> /event/active = false ──> 주행 재개
 ```
 
@@ -694,7 +705,7 @@ controller가 경로를 수정한다. 우리가 코드를 짤 부분이 아니�
 [정지]  yolo_depth_publisher ──/event_detection/uvd──> event_gate_node
                                 (엣지 트리거, 객체당 1번)      │
                                                               ├─> /event/active = true
-[재개]  프론트 "확인" 클릭 ──> 백엔드 ──/ws/nav──> event_gate_node
+[재개]  프론트 "확인" ──> 백엔드 ──> websocket_client ──/server/inbound──> event_gate_node
                                                               └─> /event/active = false
                                                                         │
                                                               patrol_mission_node
@@ -717,9 +728,10 @@ event_gate_node:
   trigger_classes: [fire, fallen_person, no_helmet]   # ship_defect 제외 확정
   min_confidence: 0.5
 
-  ack_ws_url: ws://192.168.0.5:8000/ws/nav   # 백엔드 확인 신호 수신
+  inbound_topic: /server/inbound   # websocket_client가 서버 수신분을 발행하는 토픽
+  ack_event_type: event_ack        # 이 event_type이 오면 재개
   ack_cooldown_s: 20.0        # 확인 후 재감지 무시 (그 자리를 벗어날 시간)
-  reconnect_interval_s: 5.0
+
 
   fallback_auto_resume_s: 0   # 0=비활성. 백엔드 미연결 시연용 자동 재개 시간
 ```
@@ -746,27 +758,50 @@ event_gate_node:
 `detect_hold_s` / `clear_hold_s` / `signal_timeout_s` / `on_signal_loss` 는
 모두 불필요해져 제거한다.
 
-#### 백엔드 작업 (Nav2 담당이 직접 수행 — 백엔드도 본인 담당)
+#### 확인(ack) 신호 경로 — 팀 분담 (2026-08-07 확정)
 
-**`/ws/nav` 엔드포인트를 신설한다.** `websocket_client.py`(비전 담당자 파일)를
-수정하지 않기 위한 선택이다. `/ws/jetson`은 지금처럼 송신 전용으로 둔다.
+**기존 프론트→젯슨 중계 경로를 그대로 재사용한다.** 새 엔드포인트를 만들지 않는다.
+[backend/main.py:318](../../backend/main.py#L318)에 중계 코드가 이미 동작 중이다.
 
-| 구간 | 할 일 |
-|---|---|
-| 프론트 | 이벤트 팝업에 "확인" 버튼 → `/ws/frontend`로 ack 메시지 전송 |
-| 백엔드 | `/ws/nav` 엔드포인트 신설, 프론트 ack를 이쪽으로 중계 |
-| 젯슨 | `event_gate_node`가 `/ws/nav`에 접속해 수신 |
-
-메시지 형식(제안):
-```json
-{"event_type": "event_ack"}
+```
+프론트 "확인" 클릭
+   │  {"event_type": "event_ack"}   (기존 /ws/frontend 소켓)
+   ▼
+백엔드  JETSON_BOUND_TYPES 에 포함되면 젯슨으로 그대로 배달 (기존 코드)
+   │
+   ▼
+websocket_client.py  수신 -> /server/inbound (std_msgs/String) 로 발행
+   │
+   ▼
+event_gate_node  event_ack 필터 -> /event/active = false -> 순찰 재개
 ```
 
-`docs/interface.md`에 서버→Nav2 메시지로 추가 기재할 것.
+| 담당 | 할 일 | 분량 |
+|---|---|---|
+| 프론트 (고명재) | 이벤트 팝업에 "확인" 버튼 → 기존 소켓으로 `event_ack` 전송 | 버튼 1개 |
+| 비전 (이주현) | `websocket_client.py`에 수신 루프 추가 → 받은 메시지를 `/server/inbound`로 그대로 발행 | ~10줄 |
+| **본인** | 백엔드 상수 2줄 + `event_gate_node` 구현 | 2줄 + 노드 |
 
-**폴백:** 백엔드 연동이 늦어지면 `fallback_auto_resume_s`를 켜서
-"N초 후 자동 재개"로 시연할 수 있다. 우리 노드만으로 동작하므로 의존성이 없다.
-수동 재개도 언제든 가능하다:
+백엔드 수정분 (전부):
+```python
+EVENT_ACK = "event_ack"
+JETSON_BOUND_TYPES = {STREAM_BOOST, WEBRTC_SIGNAL, EVENT_ACK}
+```
+
+**프론트엔드는 새 엔드포인트가 필요 없다.** `/ws/frontend`는 이미 양방향이며
+`webrtc_signal`이 그 경로로 다니고 있다.
+
+**비전 담당자에게는 우리 이벤트 도메인을 몰라도 되게 일반적으로 요청한다:**
+받은 메시지를 해석하지 말고 `/server/inbound`로 그대로 발행만 하면 된다.
+서버→젯슨 메시지가 나중에 늘어나도 이 통로 하나로 전부 처리된다.
+
+**왜 `/ws/nav` 신설이 아니라 이 방식인가**
+- 백엔드 작업량이 더 적다 (엔드포인트 신설 수십 줄 → 상수 2줄)
+- 단일 게이트웨이가 정석 아키텍처다. 연결 관리(재접속·인증)가 한 곳에 모인다
+- 소켓이 늘지 않는다
+
+**의존성 관리:** 담당자 일정이 늦어져도 Step 7은 막히지 않는다.
+`fallback_auto_resume_s`와 수동 재개로 개발·시연이 가능하다.
 ```bash
 ros2 topic pub --once /event/ack std_msgs/msg/Empty "{}"
 ```
