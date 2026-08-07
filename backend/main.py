@@ -87,9 +87,22 @@ STREAM_BOOST = "stream_boost"    # action: "start"(부스트) / "stop"(원복)
 # (예: {"event_type": "webrtc_signal", "payload": {...}})
 WEBRTC_SIGNAL = "webrtc_signal"
 
+# 위험 이벤트 확인(ack) — 관제자가 팝업의 "확인" 버튼을 눌렀을 때 프론트가 보낸다.
+# 젯슨의 Nav2가 이 신호를 받으면 정지해 있던 자율주행을 재개한다.
+#
+# ★ "해결"이 아니라 "확인"이다.
+#   화재 진화에는 오래 걸리는데 그동안 로봇이 묶여 있으면 다른 문제 상황을
+#   즉각 발견할 수 없다. 관제자가 "봤다"고 알려주면 로봇은 순찰을 계속한다.
+#   따라서 프론트 버튼 라벨도 "처리 완료"가 아니라 "확인"으로 한다.
+#
+# 서버는 내용을 판단하지 않고 그대로 배달만 하므로, 프론트가 어떤 이벤트를
+# 확인했는지 등 부가 필드를 넣어 보내도 젯슨까지 그대로 전달된다.
+# (예: {"event_type": "event_ack"})
+EVENT_ACK = "event_ack"
+
 # 프론트→서버→젯슨 방향으로 '그대로 전달'하는 메시지 종류 모음.
 # (젯슨→프론트 방향은 기존 브로드캐스트가 모든 메시지를 전달하므로 목록 불필요)
-JETSON_BOUND_TYPES = {STREAM_BOOST, WEBRTC_SIGNAL}
+JETSON_BOUND_TYPES = {STREAM_BOOST, WEBRTC_SIGNAL, EVENT_ACK}
 
 # 이벤트 timestamp 기록용 한국 표준시.
 # 시간대 정보 없는(naive) 시각은 환경마다 해석이 달라지므로 +09:00을 명시한다.
