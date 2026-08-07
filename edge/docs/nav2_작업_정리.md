@@ -603,8 +603,59 @@ edge/ros2_ws/src/
 | 4 | `nav2_params.yaml` — footprint·속도·코스트맵·planner·controller | |
 | 5 | `navigation.launch.py` — map_server + Nav2 (시뮬/실물 공용) | |
 | **6** | **`patrol_mission_node.py`** — 원형 순찰 무한 순회 | |
-| **7** | **`event_gate_node.py`** — 이벤트 감지 시 정지 / 해결 시 재개 | |
+| **7** | **`event_gate_node.py`** — 이벤트 감지 시 정지 / 관제 확인 시 재개 | |
 | 8 | 실물 이식 + 튜닝 | |
+
+### 7-2. 노드 인터페이스 요약 (Step 6·7 구현 기준)
+
+두 노드가 주고받는 것 전부. **이 표대로만 만들면 다른 팀 작업과 자동으로 맞물린다.**
+
+**`event_gate_node.py`** (Step 7)
+
+| 방향 | 토픽 | 타입 | 내용 |
+|---|---|---|---|
+| 구독 | `/event_detection/uvd` | `std_msgs/String` | 욜로 감지 결과(JSON). 위험 클래스면 정지 |
+| 구독 | `/server/inbound` | `std_msgs/String` | 서버 수신분(JSON). `event_ack`면 재개 |
+| 구독 | `/event/ack` | `std_msgs/Empty` | 수동 재개(시연 폴백·디버깅용) |
+| 발행 | `/event/active` | `std_msgs/Bool` | true=정지, false=주행 |
+
+**`patrol_mission_node.py`** (Step 6)
+
+| 방향 | 대상 | 타입 | 내용 |
+|---|---|---|---|
+| 구독 | `/event/active` | `std_msgs/Bool` | true면 `cancelTask()`, false면 순찰 재개 |
+| 액션 | `navigate_to_pose` | Nav2 | `BasicNavigator.goToPose()` 로 호출 |
+| 발행 | `/cmd_vel` | `geometry_msgs/Twist` | 정지 시 0속도 (Nav2와 별개로 확실히 멈추기) |
+| 발행 | `/patrol/status` | `std_msgs/String` | 현재 상태·웨이포인트 번호 (디버깅/발표용) |
+
+**경계 원칙:** `patrol_mission_node`는 `/event/active`가 **어디서 왔는지 모른다.**
+욜로든 관제 버튼이든 수동 명령이든 상관없이 true/false만 본다.
+그래서 Step 6은 Step 7 없이도 완성·테스트할 수 있다.
+
+### 7-3. Step 7 동작 확인 방법
+
+**Step 6까지 끝나면, 팀원 작업을 기다리지 않고도 단계별로 확인할 수 있다.**
+
+| 단계 | 확인 방법 | 필요한 것 |
+|---|---|---|
+| ① 정지/재개 로직 | `ros2 topic pub /event/active std_msgs/msg/Bool "{data: true}"` → 로봇 정지 확인, `false` → 재개 확인 | **우리만** |
+| ② 이벤트 감지 → 정지 | `/event_detection/uvd`에 가짜 감지 JSON을 pub → 정지 확인 | **우리만** |
+| ③ 수동 재개 | `ros2 topic pub --once /event/ack std_msgs/msg/Empty "{}"` → 재개 확인 | **우리만** |
+| ④ 서버 경로 재개 | `/server/inbound`에 `{"event_type":"event_ack"}` pub → 재개 확인 | **우리만** |
+| ⑤ 전체 연동 | 실제 이벤트 감지 → 팝업 → "확인" 클릭 → 재개 | 프론트 + 젯슨 작업 완료 필요 |
+
+**①~④는 팀원 작업과 무관하게 전부 검증 가능하다.** 그들의 작업이 끝나면 ⑤로
+한 번만 이어보면 되고, 이때 문제가 생겨도 어느 구간인지 즉시 좁혀진다.
+
+**준비 상태 (2026-08-07):**
+
+| 구간 | 상태 |
+|---|---|
+| 백엔드 중계 (`event_ack`) | ✅ 완료 (커밋 `b275609`) |
+| `docs/interface.md` ⑧ 스펙 | ✅ 완료 (v1.4) |
+| 프론트 "확인" 버튼 | ⏳ 요청 전달됨 |
+| 젯슨 수신 루프 | ⏳ 요청 전달됨 |
+| `event_gate_node` / `patrol_mission_node` | ⏳ Step 6·7에서 작성 |
 
 ### Step 6: `patrol_mission_node.py` — 왜 필요한가
 
