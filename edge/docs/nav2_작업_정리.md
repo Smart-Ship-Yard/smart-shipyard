@@ -525,6 +525,26 @@ deactivate        # 또는 새 터미널에서 venv 없이 시작
 > 나중에 누군가 `vy`를 켜려 한다면 이 값을 먼저 0이 아닌 작은 값으로 바꿔야 한다
 > (분산 0 = "무한히 확실"이라 필터가 불안정해진다).
 
+#### /clock 발행률 10 -> 100 Hz (Step 3에서 발견·수정)
+
+`gazebo_ros_init`의 `/clock` 기본 발행률이 **10 Hz**인데, 이 값이
+**`use_sim_time`을 쓰는 모든 노드의 타이머 해상도**를 결정한다. 그래서
+`ekf_local.yaml`이 `frequency: 50.0`으로 설정돼 있어도 실제로는 10 Hz로만 돌았다.
+
+| 토픽 | 수정 전 | 수정 후 |
+|---|---|---|
+| `/clock` | 10 Hz | **100 Hz** |
+| `/odometry/local` (ekf_local) | 10 Hz | **50 Hz** (설정값대로) |
+| `/odometry/global` | 10 Hz | **50 Hz** |
+| `/tf` | 44 Hz | **58 Hz** |
+
+Nav2 컨트롤러는 보통 20 Hz로 도는데 시계가 10 Hz면 제어 주기가 깨지므로
+**Step 4 착수 전에 반드시 잡아야 하는 문제**였다.
+
+조치: `config/gazebo_params.yaml` 신설 후 `gzserver.launch.py`의
+`params_file` 인자로 전달. **실물에는 해당 없다** — 시스템 시계를 쓰므로
+`/clock` 자체가 없다.
+
 #### Step 3 TF 정확도 — 수정 전후 (실측)
 
 | 상황 | 수정 전 | 수정 후 |
@@ -962,6 +982,8 @@ Nav2가 필요로 하는 것을 전부 이 launch가 제공하기 때문이다.
 | **`fake_global_localization`** | ⚠️ 실물에서 켜면 `ekf_global`과 `map→odom` **이중 발행 → TF 트리 붕괴** |
 | `ship_ugv_gazebo.xacro` | 시뮬 물리·플러그인 서술 (`ship_ugv_core.urdf.xacro`는 공용) |
 | `worlds/*.world` | 시뮬 환경 |
+| `config/gazebo_params.yaml` | `/clock` 발행률 설정. 실물엔 `/clock` 자체가 없다 |
+| `rviz/sim.rviz` | 시뮬 확인용 RViz 설정 (실물용은 별도로 만들 예정) |
 
 ### 10-3. 실물에서만 추가로 필요한 것
 
