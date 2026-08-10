@@ -142,7 +142,40 @@ def generate_launch_description():
         output='screen',
         parameters=[
             os.path.join(loc_share, 'config', 'ekf_local.yaml'),
-            {'use_sim_time': True},
+            {
+                'use_sim_time': True,
+
+                # ★★ 임시 오버라이드 — 슬램 담당자 확인 후 제거할 것 ★★
+                #
+                # ekf_local.yaml 원본은 odom0_config의 vy가 false다. 그런데
+                # 차동구동 로봇은 옆으로 이동할 수 없으므로(비홀로노믹 제약)
+                # vy는 항상 0이며, 이를 필터에 알려주지 않으면 프로세스 노이즈가
+                # vy 상태를 흔들고 그것이 계속 적분되어 odom 프레임이 옆으로
+                # 무한정 흘러간다. robot_localization의 대표적인 함정이다.
+                #
+                # 실측 (2026-08-07, 이 시뮬):
+                #   입력 /wheel/odom      vy = 0.0        (정상)
+                #   출력 /odometry/local  vy = -0.043 m/s (정지 상태인데도)
+                #   결과 odom->base_link 의 y가 3 m까지 밀림
+                #   증상 RViz에서 로봇 모델과 라이다 스캔이 멀찍이 떨어져 보이고
+                #        스캔이 로봇을 따라 돎 (map->odom이 급변하기 때문)
+                #
+                # ⚠️ 이것은 시뮬만의 문제가 아니라 실물에도 동일하게 존재한다.
+                #    근본 해결은 ekf_local.yaml 자체를 고치는 것이며 슬램 담당자에게
+                #    확인 요청해 둔 상태다. 원본이 수정되면 이 오버라이드를 지운다.
+                #    (여기서 덮어쓰는 이유: 슬램 담당자 파일 불가침 원칙 유지)
+                #
+                #              x      y      z
+                #              roll   pitch  yaw
+                #              vx     vy     vz
+                #              vroll  vpitch vyaw
+                #              ax     ay     az
+                'odom0_config': [False, False, False,
+                                 False, False, False,
+                                 True,  True,  False,   # ← vy를 True로
+                                 False, False, True,
+                                 False, False, False],
+            },
         ],
         remappings=[('odometry/filtered', '/odometry/local')],
     )

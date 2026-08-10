@@ -87,7 +87,20 @@ class FakeGlobalLocalization(Node):
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('publish_rate_hz', 30.0)
+        self.declare_parameter('publish_rate_hz', 50.0)
+        # ★ TF 유효 시간 여유 (AMCL의 transform_tolerance와 같은 개념)
+        #   TF 스탬프를 "지금"으로 찍으면, RViz나 코스트맵이 "스캔이 찍힌 시각"
+        #   기준으로 map->odom을 찾을 때 미세한 시간 틈에서 조회가 실패한다.
+        #   그 결과 화면이 깜빡이고 코스트맵이 끊긴다.
+        #   스탬프를 조금 미래로 찍어 그 틈을 덮는다. 표준 관행이다.
+        #
+        #   ★ 값의 트레이드오프 (2026-08-07 실측)
+        #     크게 잡으면 조회 실패는 줄지만, 그만큼 "오래된 map->odom"이
+        #     현재값으로 쓰여 오차가 된다. 회전 중에는 이 영향이 특히 크다.
+        #       0.1초 + 회전 0.5 rad/s -> 각도오차 약 2.9도, 위치오차 40~57 mm
+        #       0.03초                 -> 각도오차 약 0.9도, 위치오차 15 mm 내외
+        #     50 Hz로 발행하므로(주기 20 ms) 0.03초면 조회 실패 없이 충분하다.
+        self.declare_parameter('transform_tolerance_s', 0.03)
         # Gazebo world 원점과 map 원점이 어긋나 있을 때 보정한다.
         # 맵을 world와 같은 소스(make_demo_world.py)에서 생성했다면 0으로 둔다.
         self.declare_parameter('map_offset_x', 0.0)
@@ -97,6 +110,8 @@ class FakeGlobalLocalization(Node):
         self.map_frame = self.get_parameter('map_frame').value
         self.odom_frame = self.get_parameter('odom_frame').value
         self.base_frame = self.get_parameter('base_frame').value
+        self.tf_tolerance = Duration(
+            seconds=self.get_parameter('transform_tolerance_s').value)
         self.map_offset = (
             self.get_parameter('map_offset_x').value,
             self.get_parameter('map_offset_y').value,
@@ -104,6 +119,7 @@ class FakeGlobalLocalization(Node):
         )
 
         self.truth = None          # (x, y, yaw) — map 기준 base_link 참값
+        self.truth_stamp = None    # 그 참값이 언제 측정된 것인지 (시각 일치용)
         self.truth_twist = None
         self._warned = False
 
@@ -133,25 +149,54 @@ class FakeGlobalLocalization(Node):
         # world -> map 오프셋 적용 (기본값 0이면 그대로)
         self.truth = compose(self.map_offset, raw)
         self.truth_twist = msg.twist.twist
+        # ★ 참값이 "언제의" 값인지 반드시 함께 보관한다.
+        #   아래 _tick()에서 같은 시각의 odom->base_link와 합성해야 한다.
+        self.truth_stamp = Time.from_msg(msg.header.stamp)
 
     # ------------------------------------------------------------------
     def _tick(self):
-        if self.truth is None:
+        if self.truth is None or self.truth_stamp is None:
             return
 
         # ekf_local이 발행한 odom->base_link 조회
+        #
+        # ★★ 반드시 "참값과 같은 시각"의 값을 써야 한다 (2026-08-07 실측으로 수정)
+        #   map->odom = 참값 ⊗ (odom->base)⁻¹ 인데, 두 값의 시각이 다르면
+        #   그 사이 로봇이 움직인 만큼이 그대로 오차가 된다.
+        #   특히 이 시뮬은 엔코더 기반 오도메트리라 odom 프레임이 빠르게
+        #   드리프트하는데(실측: 실제 1.4 m 이동 시 odom은 8.8 m), 그 상태에서
+        #   시각이 수십 ms만 어긋나도 수십 cm 오차가 난다.
+        #   증상: 로봇이 움직일 때 RViz에서 라이다 스캔이 로봇을 따라 돌고
+        #        벽이 제자리에 고정되지 않는다.
+        #   AMCL을 비롯한 표준 로컬라이제이션 노드가 모두 이 방식을 쓴다.
+        #
+        # ★ timeout을 0으로 두는 이유
+        #   여기는 타이머 콜백 안이고 기본 실행기는 단일 스레드다. 블로킹으로
+        #   기다리면 그동안 TransformListener의 /tf 수신 콜백이 실행되지 못해
+        #   기다릴수록 오히려 버퍼가 갱신되지 않는다. (0.1초 대기 시 조회
+        #   성공률이 80 %까지 떨어져 RViz가 깜빡였다 — 2026-08-07 실측)
         try:
             tf = self.tf_buffer.lookup_transform(
-                self.odom_frame, self.base_frame, Time(),
-                timeout=Duration(seconds=0.1))
+                self.odom_frame, self.base_frame, self.truth_stamp,
+                timeout=Duration(seconds=0.0))
+            stamp_used = self.truth_stamp
         except Exception:
-            if not self._warned:
-                self.get_logger().warn(
-                    f"'{self.odom_frame}'->'{self.base_frame}' TF 대기 중. "
-                    'ekf_local이 떠 있고 /wheel/odom · /imu/data가 흐르는지 확인.'
-                )
-                self._warned = True
-            return
+            # 참값 시각의 TF가 아직 버퍼에 없으면(도착 순서 역전 등) 최신값으로
+            # 대체한다. 이 경우 위 시각 불일치 오차가 생기지만 화면이 끊기는
+            # 것보다는 낫다.
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.odom_frame, self.base_frame, Time(),
+                    timeout=Duration(seconds=0.0))
+                stamp_used = self.get_clock().now()
+            except Exception:
+                if not self._warned:
+                    self.get_logger().warn(
+                        f"'{self.odom_frame}'->'{self.base_frame}' TF 대기 중. "
+                        'ekf_local이 떠 있고 /wheel/odom · /imu/data가 흐르는지 확인.'
+                    )
+                    self._warned = True
+                return
         if self._warned:
             self.get_logger().info('odom->base_link TF 확보. 정상 동작 시작.')
             self._warned = False
@@ -162,10 +207,15 @@ class FakeGlobalLocalization(Node):
         # map->odom = map->base_link(참값) ⊗ (odom->base_link)⁻¹
         mx, my, mth = compose(self.truth, invert(odom_to_base))
 
-        stamp = self.get_clock().now().to_msg()
+        # ★ 스탬프는 "합성에 쓴 시각" 기준이어야 한다. 여기에 tolerance를 더해
+        #   조금 미래까지 유효하게 만든다(위 transform_tolerance_s 주석 참고).
+        #   "지금"으로 찍으면 실제로는 과거 데이터인데 현재값인 척하게 되어
+        #   위와 같은 시각 불일치 오차가 다시 생긴다.
+        stamp = stamp_used.to_msg()
+        tf_stamp = (stamp_used + self.tf_tolerance).to_msg()
 
         out = TransformStamped()
-        out.header.stamp = stamp
+        out.header.stamp = tf_stamp
         out.header.frame_id = self.map_frame
         out.child_frame_id = self.odom_frame
         out.transform.translation.x = mx
