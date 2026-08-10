@@ -96,6 +96,11 @@ def generate_launch_description():
             'world': LaunchConfiguration('world'),
             # ROS 연동 플러그인. 없으면 spawn_entity 서비스가 안 뜬다.
             'init': 'true', 'factory': 'true', 'force_system': 'false',
+            # ★ /clock 발행률을 100 Hz로 올린다.
+            #   기본 10 Hz면 use_sim_time을 쓰는 모든 노드의 타이머가 10 Hz로
+            #   잘려 ekf_local(50 Hz 설정)이 실제로 10 Hz로만 돈다(실측).
+            #   상세 이유는 config/gazebo_params.yaml 주석 참고.
+            'params_file': os.path.join(nav_share, 'config', 'gazebo_params.yaml'),
         }.items(),
     )
 
