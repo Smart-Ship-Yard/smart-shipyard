@@ -54,26 +54,43 @@
   <gazebo reference="left_wheel_link">
     <mu1>1.0</mu1>
     <mu2>1.0</mu2>
-    <kp>1000000.0</kp>
-    <kd>100.0</kd>
+    <kp>100000.0</kp>     <!-- 캐스터와 같은 이유로 완화 (2026-08-07) -->
+    <kd>1000.0</kd>
     <material>Gazebo/Black</material>
   </gazebo>
   <gazebo reference="right_wheel_link">
     <mu1>1.0</mu1>
     <mu2>1.0</mu2>
-    <kp>1000000.0</kp>
-    <kd>100.0</kd>
+    <kp>100000.0</kp>     <!-- 캐스터와 같은 이유로 완화 (2026-08-07) -->
+    <kd>1000.0</kd>
     <material>Gazebo/Black</material>
   </gazebo>
 
   <!-- 캐스터: core에서 스위블 조인트 없이 "고정된 구"로 근사했으므로,
-       마찰을 0으로 두어야 모든 방향으로 미끄러지며 실제 캐스터처럼 거동한다.
-       마찰을 주면 구가 바닥에 붙어 회전을 방해한다(로봇이 제자리에서 못 돎). -->
+       마찰을 아주 낮게 두어 모든 방향으로 미끄러지며 실제 캐스터처럼 거동하게 한다.
+       마찰이 크면 구가 바닥에 붙어 제자리 회전을 방해한다.
+
+       ★ 마찰을 0이 아니라 0.05로 둔 이유 (2026-08-07 실측으로 수정)
+         (1) 실물 캐스터는 **고무 바퀴**다. 완전 무마찰은 실물과 더 먼 근사다.
+             실물은 스위블로 방향을 틀어 굴러가므로 "끌리는 저항"이 작을 뿐,
+             접지면 자체는 고무라 마찰이 0일 수 없다.
+         (2) 무마찰(0.0)로 두었더니 정지 상태에서도 로봇이 좌우로 흔들리고
+             (참값 angular.x ≈ 0.024 rad/s) 그 진동이 초당 3 mm씩 옆으로 밀어냈다.
+             무게중심 0.233 m가 트랙 폭 0.2345 m와 맞먹는 뒤뚱한 형상이라,
+             접촉점 하나가 완전 무마찰이면 진동이 감쇠되지 않는다.
+
+         0.05는 제자리 회전을 방해하지 않는다: 캐스터 접지 하중 약 19 N에
+         마찰력 0.95 N, 회전축에서 0.248 m -> 저항 토크 0.24 N·m.
+         바퀴가 낼 수 있는 회전 토크(약 14 N·m)의 2 % 수준이다.
+
+       ★ kp를 1e6 -> 1e5로 낮춘 이유
+         접촉이 너무 딱딱하면 미세하게 튕기며(linear.z 진동) 흔들림을 키운다.
+         무르게 하고 kd(감쇠)를 올려 접촉을 안정화한다. -->
   <gazebo reference="caster_link">
-    <mu1>0.0</mu1>
-    <mu2>0.0</mu2>
-    <kp>1000000.0</kp>
-    <kd>100.0</kd>
+    <mu1>0.05</mu1>
+    <mu2>0.05</mu2>
+    <kp>100000.0</kp>
+    <kd>1000.0</kd>
     <material>Gazebo/Grey</material>
   </gazebo>
 
@@ -144,6 +161,31 @@
       <update_rate>30</update_rate>
       <joint_name>base_link_to_left_wheel</joint_name>
       <joint_name>base_link_to_right_wheel</joint_name>
+    </plugin>
+  </gazebo>
+
+  <!-- ================================================================
+       참값(ground truth) 위치 발행 — 실물의 UWB 자리를 대신한다
+       ================================================================
+       실물은 UWB로 절대 위치를 얻어 ekf_global이 map->odom을 발행한다.
+       시뮬에는 UWB가 없으므로 Gazebo가 알고 있는 참 위치를 꺼내 쓴다.
+       이 값을 ship_ugv_navigation의 fake_global_localization 노드가 받아
+       map->odom TF로 변환한다 (실물 ekf_global과 같은 역할·같은 계산식).
+
+       ★ 여기서 TF를 직접 쏘지 않는다.
+         frame_name을 odom으로 두면 ekf_local과 이중 발행이 된다.
+         오도메트리 메시지로만 내보내고 TF 변환은 fake_global_localization이
+         담당한다 — TF 권위자 단일화 원칙.
+  -->
+  <gazebo>
+    <plugin name="ground_truth_p3d" filename="libgazebo_ros_p3d.so">
+      <ros>
+        <remapping>odom:=odometry/ground_truth</remapping>
+      </ros>
+      <body_name>base_link</body_name>
+      <frame_name>world</frame_name>        <!-- Gazebo world 절대 좌표 -->
+      <update_rate>50.0</update_rate>
+      <gaussian_noise>0.0</gaussian_noise>  <!-- 참값이므로 노이즈 없음 -->
     </plugin>
   </gazebo>
 
