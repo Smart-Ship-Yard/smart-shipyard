@@ -1,0 +1,131 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /TF1/Frames1
+      SplitterRatio: 0.5
+    Tree Height: 700
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 0.5
+      Plane Cell Count: 20
+      Color: 160; 160; 164
+      Line Style:
+        Value: Lines
+      Reference Frame: <Fixed Frame>
+
+    # 로봇 3D 모델. robot_state_publisher가 발행하는 URDF를 그린다.
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Enabled: true
+      Description Topic:
+        Value: /robot_description
+        Depth: 5
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Visual Enabled: true
+      Collision Enabled: false
+      Alpha: 1
+
+    # TF 트리. map -> odom -> base_link -> 센서 프레임까지 확인용.
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Names: true
+      Show Axes: true
+      Show Arrows: false
+      Marker Scale: 0.3
+      Update Interval: 0
+
+    # 라이다. 시뮬은 /scan (360도), 실물은 /scan_filtered (후방 180도 제거).
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Enabled: true
+      Topic:
+        Value: /scan
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+      Size (m): 0.03
+      Style: Points
+      Color: 255; 60; 60
+      Color Transformer: FlatColor
+      Decay Time: 0
+
+    # 절대 위치 (실물 ekf_global / 시뮬 fake_global_localization).
+    - Class: rviz_default_plugins/Odometry
+      Name: Odometry(global)
+      Enabled: false
+      Topic:
+        Value: /odometry/global
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Keep: 100
+      Shape:
+        Value: Arrow
+        Color: 60; 200; 60
+        Alpha: 1
+        Shaft Length: 0.15
+        Shaft Radius: 0.02
+        Head Length: 0.06
+        Head Radius: 0.04
+
+    # Step 5에서 map_server가 뜨면 여기에 지도가 그려진다.
+    - Class: rviz_default_plugins/Map
+      Name: Map
+      Enabled: true
+      Topic:
+        Value: /map
+        Depth: 5
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Alpha: 0.7
+      Color Scheme: map
+
+  # ★ map 으로 두면 fake_global_localization(또는 실물 ekf_global)이
+  #   map->odom TF를 발행해야 화면이 그려진다. TF가 끊기면 화면이 빈다.
+  #   그럴 때는 odom 으로 바꿔 확인하면 로컬 오도메트리만으로도 볼 수 있다.
+  Global Options:
+    Fixed Frame: map
+    Background Color: 48; 48; 48
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic:
+        Value: /initialpose
+    - Class: rviz_default_plugins/SetGoal
+      Topic:
+        Value: /goal_pose
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 4.5
+      Pitch: 0.9
+      Yaw: 2.5
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Target Frame: <Fixed Frame>
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1400
+  Displays:
+    collapsed: false
+  Views:
+    collapsed: false

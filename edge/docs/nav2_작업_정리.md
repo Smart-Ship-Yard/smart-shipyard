@@ -868,15 +868,54 @@ Nav2가 필요로 하는 것을 전부 이 launch가 제공하기 때문이다.
 > `map_saver_cli`와 `finalize_map.py`는 한 번 실행하고 끝나는 일회성 명령이라
 > 끄고 켤 대상이 아니다. 계속 떠 있는 것은 위 세 launch뿐이다.
 
-**시뮬 전용이라 실물에서 실행하지 않는 것**
+## 10. 실물 이식 대응표 (Step이 끝날 때마다 갱신)
+
+시뮬에서 만든 것 중 **무엇을 빼고 무엇으로 대체하는지**를 한곳에 모은다.
+`전체_실행_명령어_요약본`에는 짧은 "실행하지 말 것" 목록만 두고 상세는 여기서 관리한다
+(같은 표를 두 곳에 복사하면 반드시 어긋나기 때문).
+
+### 10-1. 같은 자리를 차지하는 것 — 소스만 교체된다
+
+| 기능 | 시뮬 | 실물 | 토픽 |
+|---|---|---|---|
+| `/cmd_vel` 소비 + 바퀴 구동 | gazebo `diff_drive` 플러그인 | `wheel_odom_bridge` (PR #14) | `/cmd_vel` |
+| 휠 오도메트리 | 동 플러그인 | 동 노드 (아두이노 엔코더) | `/wheel/odom` |
+| IMU | gazebo `imu` 플러그인 | `witmotion_ros` | `/imu/data` |
+| 라이다 | gazebo `ray` 플러그인 | `rplidar_ros` + `laser_filters` | 시뮬 `/scan` · 실물 `/scan_filtered` |
+| 절대 위치 → `map→odom` | `fake_global_localization` (Gazebo 참값) | `ekf_global` (UWB 융합) | TF |
+| 로컬 오도메트리 → `odom→base_link` | `ekf_local` | `ekf_local` **← 동일** | TF |
+| `base_link` 하위 TF | `robot_state_publisher` (URDF) | `static_transform_publisher` ×2 | TF |
+
+**토픽명을 일부러 실물과 똑같이 맞춰뒀다.** 그래야 "센서 소스만 교체" 이식이 성립한다.
+
+### 10-2. 실물에서 실행하지 않는 것
 
 | 대상 | 이유 |
 |---|---|
 | `sim_bringup.launch.py` | Gazebo·스폰·시뮬 센서. 실물엔 진짜 하드웨어가 있다 |
-| `fake_global_localization` | `map→odom`을 발행. 실물에서 켜면 `ekf_global`과 이중 발행 |
-| `ship_ugv_gazebo.xacro` | 시뮬 물리/플러그인 서술 |
+| **`fake_global_localization`** | ⚠️ 실물에서 켜면 `ekf_global`과 `map→odom` **이중 발행 → TF 트리 붕괴** |
+| `ship_ugv_gazebo.xacro` | 시뮬 물리·플러그인 서술 (`ship_ugv_core.urdf.xacro`는 공용) |
 | `worlds/*.world` | 시뮬 환경 |
 
-`patrol_mission_node`와 `event_gate_node`는 **시뮬·실물 공용**이다.
+### 10-3. 실물에서만 추가로 필요한 것
+
+| 항목 | 상태 |
+|---|---|
+| **PR #14 머지** | ⚠️ `wheel_odom_bridge`가 없으면 `/cmd_vel`을 받을 노드가 없어 **로봇이 안 움직인다** |
+| UWB 앵커 설치 + 캘리브레이션 | 매 세션 수행 (이슈 2) |
+| 맵 `origin` 보정 | `finalize_map.py`가 자동 처리 |
+
+### 10-4. 시뮬·실물 공용 (그대로 이식)
+
+`nav2_params.yaml` · `navigation.launch.py` · `patrol_mission_node.py` ·
+`event_gate_node.py` · `ekf_local` · `ship_ugv_core.urdf.xacro`
+
+### 10-5. 아직 해소되지 않은 차이
+
+| 차이 | 대응 |
+|---|---|
+| 라이다 토픽·화각 (시뮬 `/scan` 360° / 실물 `/scan_filtered` 후방 180° 제거) | **Step 5**에서 `scan_topic`을 launch 인자로 분리 |
+| 시뮬 정지 시 1.6 mm/s 측면 드리프트 | 주행 속도의 1 %. 실물엔 없는 현상이라 무시 |
+| 시뮬 절대위치는 참값(오차 0) / 실물 UWB는 ±15 cm | **Step 8**에서 실물 튜닝 시 `inflation_radius` 재확인 |
 
 ---
