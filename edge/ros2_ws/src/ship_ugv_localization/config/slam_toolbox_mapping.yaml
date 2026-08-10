@@ -1,0 +1,92 @@
+# slam_toolbox_mapping.yaml
+# --------------------------------------------------------------
+# slam_toolbox 매핑 모드 설정.
+#
+# ★★ 이 프로젝트의 핵심 원칙 (반드시 유지할 것) ★★
+#   1) map_frame을 'map'이 아니라 'slam_map'으로 리네이밍한다.
+#      이유: 'map'은 이미 UWB 앵커 기준 절대 좌표계로 uwb_map_calibration이
+#      정의하고 있다. slam_toolbox가 그 이름을 그대로 쓰면, "SLAM이 매핑을
+#      시작한 위치"와 "UWB 기준 절대 위치"라는 서로 다른 두 좌표계가 같은
+#      이름표를 달게 되어 완전히 모순된 상황이 된다.
+#   2) publish_tf: false 로 반드시 꺼둔다.
+#      이유: 이 프로젝트는 "TF의 최종 권위자는 항상 EKF 하나뿐"이라는 원칙을
+#      쓴다 (map->odom은 ekf_global, odom->base_link는 ekf_local이 발행).
+#      slam_toolbox가 자체적으로 TF를 발행하게 두면, 한 프레임(예: odom)이
+#      부모를 두 개(ekf_global의 map, slam_toolbox의 slam_map) 갖게 되어
+#      TF 트리 규칙을 위반한다. slam_toolbox는 오직 /slam_toolbox/pose
+#      토픽으로 "위치 측정값 하나"만 내놓고, 그 값을 slam_map_alignment가
+#      map<->slam_map 관계로 정리해 TF로 발행한다.
+
+slam_toolbox:
+  ros__parameters:
+
+    # ---- 모드 ----
+    mode: mapping
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    # ---- 프레임 (★ 위 원칙 그대로 반영) ----
+    odom_frame: odom
+    map_frame: slam_map          # 'map'이 아님 - 프로젝트 규칙
+    base_frame: base_link
+    scan_topic: /scan_filtered   # 후방 180도/노이즈 제거된 필터링 스캔 사용
+    # ★ slam_toolbox에는 'publish_tf' 파라미터가 없다 (2026-07-29 실기 확인,
+    #   ros2 param list에 없음). TF 발행을 끄려면 transform_publish_period를
+    #   0.0으로 설정해야 한다. EKF가 유일한 TF 권위자여야 하므로 반드시 0.0.
+    transform_publish_period: 0.0
+
+    # ---- 라이다 실제 스펙 명시 (경고 해결 + 스캔 매칭 안정화) ----
+    min_laser_range: 0.2      # RPLIDAR A1M8 실제 최소 감지 거리
+    max_laser_range: 12.0     # RPLIDAR A1M8 실제 최대 감지 거리
+
+    # ---- 매핑 동작 ----
+    use_scan_matching: true
+    use_scan_barycenter: true
+    minimum_travel_distance: 0.2      # 이만큼 이동해야 새 스캔을 그래프에 추가
+    minimum_travel_heading: 0.17      # 라디안(약 10도), 위와 OR 조건
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+    loop_search_maximum_distance: 3.0
+    do_loop_closing: true
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    # ---- 상관 파라미터 (스캔 매칭 탐색 범위/해상도) ----
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+
+    # ---- 루프 클로저 탐색 파라미터 ----
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # ---- 그 외 ----
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
+
+    # ---- 맵 발행 주기 ----
+    resolution: 0.05                  # 5cm/셀
+    map_update_interval: 2.0          # 2초마다 /map 갱신
+    transform_timeout: 0.3
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+    enable_interactive_mode: false
+
+    # ---- 위치 발행 (slam_map_alignment가 구독하는 대상) ----
+    # slam_toolbox는 기본적으로 'pose' 토픽(상대경로)으로 발행하며,
+    # 이를 launch 파일에서 '/slam_toolbox/pose'로 remap한다.

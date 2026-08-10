@@ -37,9 +37,13 @@ class ChangePointDetector(Node):
         self.declare_parameter('output_topic', '/event_detection/map_point')
         self.declare_parameter('map_frame_id', 'map')
         self.declare_parameter('base_frame_id', 'base_link')
-        self.declare_parameter('camera_offset_x', 0.15)
-        self.declare_parameter('camera_offset_y', 0.0)
-        self.declare_parameter('camera_offset_z', 0.20)
+        self.declare_parameter('camera_offset_x', 0.13)
+        self.declare_parameter('camera_offset_y', 0.09)
+        self.declare_parameter('camera_offset_z', 0.1)
+        # ★ 카메라 장착 회전각 (실측: 로봇 정면 기준 오른쪽을 보도록 장착됨).
+        #   yaw=0이면 카메라 정면=로봇 정면. 오른쪽을 보면 로봇 기준
+        #   시계방향으로 돌아간 것이므로 REP-103 규약상 음수 각도.
+        self.declare_parameter('camera_yaw_deg', -90.0)
         self.declare_parameter('camera_hfov_deg', 74.0)  # Astra+ RGB FOV
         self.declare_parameter('image_width', 640)
         self.declare_parameter('depth_is_radial', False)
@@ -56,6 +60,7 @@ class ChangePointDetector(Node):
             self.get_parameter('camera_offset_y').value,
             self.get_parameter('camera_offset_z').value,
         )
+        self.cam_yaw = math.radians(self.get_parameter('camera_yaw_deg').value)
         self.hfov = math.radians(self.get_parameter('camera_hfov_deg').value)
         self.image_width = self.get_parameter('image_width').value
         self.depth_is_radial = self.get_parameter('depth_is_radial').value
@@ -132,8 +137,18 @@ class ChangePointDetector(Node):
             x_cam = depth * math.tan(angle)
 
         # --- 2) 카메라 좌표계 -> base_link 좌표계 ---
-        local_x = z_cam + self.cam_offset[0]
-        local_y = -x_cam + self.cam_offset[1]
+        # 카메라가 로봇 정면과 다른 방향(cam_yaw)을 보도록 장착된 경우를 위해
+        # 2D 회전을 먼저 적용한 뒤 오프셋을 더한다.
+        # 카메라 기준 "전방"은 z_cam, "좌측"은 -x_cam (OpenCV: x=우측이므로 좌측=-x_cam)
+        cam_local_x = z_cam
+        cam_local_y = -x_cam
+        cos_yaw = math.cos(self.cam_yaw)
+        sin_yaw = math.sin(self.cam_yaw)
+        rotated_x = cam_local_x * cos_yaw - cam_local_y * sin_yaw
+        rotated_y = cam_local_x * sin_yaw + cam_local_y * cos_yaw
+
+        local_x = rotated_x + self.cam_offset[0]
+        local_y = rotated_y + self.cam_offset[1]
         local_z = self.cam_offset[2]
 
         # --- 3) base_link -> map 변환 (TF 조회) ---

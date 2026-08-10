@@ -13,6 +13,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/weights', glob('weights/*.pt')),
+        ('share/' + package_name + '/config', ['ship_ugv_perception/custom_tracker.yaml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

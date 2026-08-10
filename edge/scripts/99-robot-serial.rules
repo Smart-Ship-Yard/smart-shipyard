@@ -1,0 +1,29 @@
+# smart-shipyard UGV 시리얼 장치 고정 이름 규칙
+# --------------------------------------------------
+# 문제: IMU(Hiwonder IM10A)와 Arduino Mega가 둘 다 CH340 칩(VID:PID = 1a86:7523)을
+#       쓰기 때문에 VID/PID로는 구분이 불가능하다. 게다가 리눅스 기본 이름
+#       (/dev/ttyCH341USB0, 1...)은 "몇 번째로 인식됐는가"로 정해지므로 부팅/재연결
+#       순서에 따라 서로 뒤바뀔 수 있다. 실제로 witmotion_ros가 Mega를 IMU로 착각해
+#       설정 패킷을 쏘고, wheel_odom_bridge가 포트를 못 여는 사고가 발생했다.
+#
+# 해결: "어느 물리적 USB 포트에 꽂혔는가"(KERNELS)로 구분해 고정 심볼릭 링크를 만든다.
+#
+# ★★ 중요: KERNELS 값은 물리 포트에 묶여 있다. 아래 값은 2026-07-28 배선 기준이며,
+#    다른 포트에 꽂으면 동작하지 않는다. 반드시 아래 배선 규칙을 지킬 것.
+#
+#    [2026-07-28 변경] IMU를 원래 USB-C 포트에서 USB-A 포트로 옮김.
+#    IMU (IM10A)      -> Jetson USB-A 포트   (KERNELS=="1-2.1.3")
+#    Arduino Mega     -> Jetson USB-A 포트   (KERNELS=="1-2.4", 변경 없음)
+#
+# 포트를 바꿔야 한다면 새 값을 이렇게 확인한 뒤 아래 줄을 수정할 것:
+#    udevadm info -a -n /dev/ttyCH341USB0 | grep "KERNELS==" | head -5
+#    (맨 위에서 두 번째쯤 나오는 "1-x.y" 형태의 값을 사용)
+
+SUBSYSTEM=="tty", KERNELS=="1-2.1.3", SYMLINK+="imu"
+SUBSYSTEM=="tty", KERNELS=="1-2.4",   SYMLINK+="wheel_mcu"
+SUBSYSTEM=="tty", KERNELS=="1-2.1.2",  SYMLINK+="uwb_tag"
+SUBSYSTEM=="tty", KERNELS=="1-2.1.1", SYMLINK+="lidar"
+
+# ★ UWB 태그는 USB 허브를 거쳐 연결됨. 이 허브를 다른 허브로 교체하면
+#   물리 경로가 통째로 바뀌므로 KERNELS 값을 반드시 재확인해야 한다.
+#   (2026-08 시점 실측: 허브 경유, 값 1-2.1.2)

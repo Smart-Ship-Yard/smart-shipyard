@@ -37,7 +37,8 @@ ekf_local:
                   false, false, false,    # roll, pitch, yaw  <- 절대 orientation 미사용
                   false, false, false,    # vx, vy, vz
                   false, false, true,     # vroll, vpitch, vyaw
-                  true,  true,  false]    # ax, ay, az  (ax, ay만)
+                  false, false, false]    # ax, ay, az - 가속도 적분 발산(bias 누적) 방지로 비활성화
+                                          # 엔코더(vx)가 이미 선속도를 제공하므로 IMU는 자이로(vyaw)만 사용
     imu0_differential: false
     imu0_relative: false
     imu0_remove_gravitational_acceleration: true

@@ -21,6 +21,7 @@ def generate_launch_description():
     localization_share = get_package_share_directory('ship_ugv_localization')
     ekf_local_yaml = os.path.join(localization_share, 'config', 'ekf_local.yaml')
     ekf_global_yaml = os.path.join(localization_share, 'config', 'ekf_global.yaml')
+    laser_filter_yaml = os.path.join(localization_share, 'config', 'laser_filter.yaml')
 
     uwb_driver_node = Node(
         package='uwb_dwm1001_driver',
@@ -28,7 +29,7 @@ def generate_launch_description():
         name='uwb_dwm1001_driver',
         output='screen',
         parameters=[{
-            'serial_port': '/dev/ttyACM0',
+            'serial_port': '/dev/uwb_tag',   
             'baud_rate': 115200,
             'uwb_frame_id': 'uwb_frame',
         }],
@@ -93,32 +94,77 @@ def generate_launch_description():
     )
 
     imu_static_tf_node = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='base_link_to_imu_tf',
-        output='screen',
-        # 인자: x y z yaw pitch roll parent_frame child_frame
-        # imu_axis_correction_node가 축(y,z 부호) 보정을 이미 끝냈으므로 항등 변환.
-        # 실측 오프셋(camera_offset처럼 base_link 기준 위치)이 나오면 x y z만 갱신할 것.
-        arguments=['0', '0', '0', '0', '0', '0', 'base_link', 'imu'],
+    package='tf2_ros',
+    executable='static_transform_publisher',
+    name='base_link_to_imu_tf',
+    output='screen',
+    # 실측(2026-07-29): base_link 원점 기준 상방 0.055m (x,y는 중앙)
+    arguments=['0', '0', '0.055', '0', '0', '0', 'base_link', 'imu'],
     )
     
     laser_static_tf_node = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='base_link_to_laser_tf',
+    package='tf2_ros',
+    executable='static_transform_publisher',
+    name='base_link_to_laser_tf',
+    output='screen',
+    # 실측(2026-07-29): base_link 원점(바퀴축 중점,지면) 기준 전방 0.195m, 상방 0.2m
+    arguments=['0.195', '0', '0.2', '3.14159', '0', '0', 'base_link', 'laser'],
+    )
+    
+    wheel_odom_node = Node(
+        package='wheel_odom_bridge',
+        executable='wheel_odom_node',
+        name='wheel_odom_bridge',
         output='screen',
-        arguments=['0', '0', '0', '0', '0', '0', 'base_link', 'laser'],  # 실측 오프셋 나오면 x y z 갱신
+        parameters=[{
+            'serial_port': '/dev/wheel_mcu',
+            'track_width_m': 0.22568,
+            'wheel_radius_m': 0.0308,
+            'ticks_per_rev': 330,   # 1320 -> 330으로 변경 (JGB37-520 실제 CPR 재검증)
+            'right_trim': 0.98,   # 왼쪽으로 휘니 오른쪽을 살짝 줄여서 시작
+        }],
+    )
+
+    rplidar_node = Node(
+        package='rplidar_ros',
+        executable='rplidar_node',
+        name='rplidar_node',
+        output='screen',
+        parameters=[{
+            'channel_type': 'serial',
+            'serial_port': '/dev/lidar',       # udev 고정 심볼릭 링크 사용
+            'serial_baudrate': 115200,
+            'frame_id': 'laser',                # base_link_to_laser_tf와 일치
+            'inverted': False,
+            'angle_compensate': True,
+            'scan_mode': 'Sensitivity',
+        }],
+    )
+
+    laser_filter_node = Node(
+        package='laser_filters',
+        executable='scan_to_scan_filter_chain',
+        name='laser_filter_chain',
+        output='screen',
+        parameters=[laser_filter_yaml],
+        remappings=[
+            ('scan', '/scan'),            # RPLIDAR 원본 입력
+            ('scan_filtered', '/scan_filtered'),  # 필터링된 출력
+        ],
     )
 
     return LaunchDescription([
         uwb_driver_node,
         uwb_calibration_node,
         imu_static_tf_node,
-	imu_driver_node,
-	imu_axis_correction_node, 
+        imu_driver_node,
+        imu_axis_correction_node,
+        wheel_odom_node,
         heading_filter_node,
         ekf_local_node,
         ekf_global_node,
         change_point_node,
+        laser_static_tf_node,
+        rplidar_node,
+        laser_filter_node,
     ])

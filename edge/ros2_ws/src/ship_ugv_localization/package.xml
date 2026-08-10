@@ -14,6 +14,9 @@
   <exec_depend>uwb_map_calibration</exec_depend>
   <exec_depend>heading_complementary_filter</exec_depend>
   <exec_depend>ship_ugv_perception</exec_depend>
+  <exec_depend>rplidar_ros</exec_depend>
+  <exec_depend>laser_filters</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ship_ugv_motion_control</name>
+  <version>0.1.0</version>
+  <description>
+    /odometry/local(엔코더+IMU 융합)을 피드백으로 사용해 지정한 거리만큼 직진하거나
+    지정한 각도만큼 제자리 회전하는 모션 컨트롤러. 출력은 /cmd_vel이며
+    wheel_odom_bridge가 이를 받아 Arduino로 전달한다.
+  </description>
+  <maintainer email="you@example.com">jh</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

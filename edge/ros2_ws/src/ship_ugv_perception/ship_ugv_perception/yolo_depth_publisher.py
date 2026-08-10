@@ -5,24 +5,29 @@ yolo_depth_publisher.py
 Astra+ 카메라로 Color+Depth를 받아 YOLO로 객체를 검출하고,
 검출된 각 객체의 (u, v, depth, depth_xyz)를 /event_detection/uvd 토픽에 발행한다.
 
-[2026-07-14 영상 지연 개선]
-- 원본 프레임을 YOLO 추론 전에 즉시 /camera/color/compressed_raw 로 발행
-  (박스 없음, 추론 시간과 무관하게 항상 빠름). 프론트엔드가 지연 없는
-  영상이 필요하면 이 토픽을 구독.
-- 박스+텍스트가 그려진 프레임은 기존처럼 /camera/color/compressed 로
-  발행 (추론이 끝난 뒤라 약간의 지연 있음, 검출 정보를 보고 싶을 때 사용).
-- 두 토픽 모두 QoS를 BEST_EFFORT + depth=1 로 설정해, 구독 측 처리가
-  느려도 오래된 프레임이 큐에 쌓이지 않고 최신 프레임만 전달되도록 함
-  (이게 "버퍼링으로 인한 지연 누적"의 주된 해결책).
+[2026-07-14 지연 문제 근본 해결]
+기존에는 카메라 캡처 -> 원본 발행 -> YOLO 추론 -> 주석 발행이 전부 하나의
+콜백(타이머) 안에서 순차 실행되어, "원본을 먼저 발행"하더라도 다음 프레임을
+가져오는 시점 자체가 YOLO 추론 속도에 종속되어 있었음 (추론이 느리면 전체
+루프가 느려져서 원본 영상도 결과적으로 버벅임).
+
+이번 수정: 카메라 캡처 전담 스레드를 분리함.
+- 캡처 스레드: 카메라 최대 속도로 계속 프레임을 읽어 원본을 즉시 발행하고,
+  최신 프레임을 락으로 보호된 공유 변수에 저장.
+- ROS2 타이머(메인 스레드): 공유 변수에서 최신 프레임을 꺼내 YOLO 추론 +
+  주석 영상 발행 + 이벤트 발행을 수행. 이 처리가 느려도 캡처/원본발행 속도에
+  전혀 영향 주지 않음.
 """
 
 import json
 import math
 import re
+import threading
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from ament_index_python.packages import get_package_share_directory
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from std_msgs.msg import String
 from sensor_msgs.msg import CompressedImage
@@ -38,11 +43,9 @@ def frame_to_bgr_image(frame):
 
 
 def is_level_class(class_name: str) -> bool:
-    """숫자가 포함된 클래스면 조립 단계(level류)로 간주."""
     return re.search(r'(\d+)', str(class_name)) is not None
 
 
-# ★ 버퍼링 방지용 QoS: 최신 프레임 하나만 유지, 느린 구독자 때문에 밀리지 않음
 LOW_LATENCY_QOS = QoSProfile(
     reliability=QoSReliabilityPolicy.BEST_EFFORT,
     history=QoSHistoryPolicy.KEEP_LAST,
@@ -55,23 +58,25 @@ class YoloDepthPublisher(Node):
     def __init__(self):
         super().__init__('yolo_depth_publisher')
 
-        self.declare_parameter(
-            'weights_path',
-            '/home/ship_yard/smart-shipyard/edge/ros2_ws/src/ship_ugv_perception/weights/best.pt'
-        )
+        share_dir = get_package_share_directory('ship_ugv_perception')
+        default_weights = os.path.join(share_dir, 'weights', 'best.pt')
+        default_tracker_config = os.path.join(share_dir, 'config', 'custom_tracker.yaml')
+
+        self.declare_parameter('weights_path', default_weights)
         self.declare_parameter('detection_topic', '/event_detection/uvd')
         self.declare_parameter('confidence_threshold', 0.2)
         self.declare_parameter('debug_log', True)
         self.declare_parameter('fallback_confirm_frames', 3)
         self.declare_parameter('fallback_match_dist_px', 60.0)
-        self.declare_parameter(
-            'tracker_config',
-            '/home/ship_yard/smart-shipyard/edge/ros2_ws/src/ship_ugv_perception/ship_ugv_perception/custom_tracker.yaml'
-        )
-        # ★ 영상 관련 (원본 즉시 발행 + 박스 그려진 버전 둘 다 유지)
+        self.declare_parameter('tracker_config', default_tracker_config)
         self.declare_parameter('raw_image_topic', '/camera/color/compressed_raw')
         self.declare_parameter('annotated_image_topic', '/camera/color/compressed')
-        self.declare_parameter('raw_image_jpeg_quality', 70)
+        self.declare_parameter('raw_image_jpeg_quality', 60)
+        # ★ YOLO 처리 주기 (카메라 fps와 분리됨, 이 값만큼만 추론 시도)
+        self.declare_parameter('inference_interval_s', 0.1)
+        # bbox 내 유효 depth 픽셀 비율이 이 값 미만이면 해당 검출 폐기
+        # (작은 소품은 배경 depth가 섞여 median이 오염되는 실패 모드 방지)
+        self.declare_parameter('min_valid_ratio', 0.2)
 
         weights_path = self.get_parameter('weights_path').value
         topic = self.get_parameter('detection_topic').value
@@ -83,12 +88,12 @@ class YoloDepthPublisher(Node):
         raw_image_topic = self.get_parameter('raw_image_topic').value
         annotated_image_topic = self.get_parameter('annotated_image_topic').value
         self.raw_jpeg_quality = self.get_parameter('raw_image_jpeg_quality').value
+        inference_interval = self.get_parameter('inference_interval_s').value
+        self.min_valid_ratio = self.get_parameter('min_valid_ratio').value
 
         self.model = YOLO(weights_path)
         self.get_logger().info(f"모델 클래스 목록: {self.model.names}")
         self.pub = self.create_publisher(String, topic, 10)
-
-        # ★ 두 영상 토픽 모두 BEST_EFFORT + depth=1 QoS 적용
         self.raw_image_pub = self.create_publisher(
             CompressedImage, raw_image_topic, LOW_LATENCY_QOS)
         self.annotated_image_pub = self.create_publisher(
@@ -97,6 +102,11 @@ class YoloDepthPublisher(Node):
         self.reported_tids = set()
         self.reported_fallbacks = []
         self.fallback_candidates = []
+
+        # ★ 캡처 스레드와 공유할 최신 프레임 상태
+        self._latest_color = None
+        self._latest_depth = None
+        self._frame_lock = threading.Lock()
 
         self.pipeline = Pipeline()
         config = Config()
@@ -119,10 +129,17 @@ class YoloDepthPublisher(Node):
 
         self.get_logger().info(
             f"YOLO+Depth publisher 시작, weights={weights_path}, "
-            f"raw_topic={raw_image_topic}, annotated_topic={annotated_image_topic}"
+            f"raw_topic={raw_image_topic}(캡처 스레드, 항상 빠름), "
+            f"annotated_topic={annotated_image_topic}(YOLO 처리 주기 종속)"
         )
 
-        self.timer = self.create_timer(0.1, self._process_frame)
+        # ★ 캡처 전담 스레드 시작 (카메라 최대 속도로 계속 실행)
+        self._capture_stop = threading.Event()
+        self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._capture_thread.start()
+
+        # ★ YOLO 처리는 이 타이머로만, 캡처 속도와 무관
+        self.timer = self.create_timer(inference_interval, self._process_frame)
 
     def _match_nearby(self, records, class_name, u, v):
         for r in records:
@@ -132,11 +149,9 @@ class YoloDepthPublisher(Node):
                 return r
         return None
 
-    def _encode_and_publish(self, publisher, image):
-        ok, encoded = cv2.imencode(
-            '.jpg', image,
-            [cv2.IMWRITE_JPEG_QUALITY, self.raw_jpeg_quality]
-        )
+    def _encode_and_publish(self, publisher, image, quality=None):
+        q = quality if quality is not None else self.raw_jpeg_quality
+        ok, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, q])
         if not ok:
             return
         msg = CompressedImage()
@@ -150,32 +165,55 @@ class YoloDepthPublisher(Node):
         p2 = (int(x2), int(y2))
         color = (0, 255, 0)
         cv2.rectangle(image, p1, p2, color, 2)
-
-        if z_m is not None:
-            label = f"{class_name} {conf:.2f} {z_m:.2f}m"
-        else:
-            label = f"{class_name} {conf:.2f}"
-
+        label = f"{class_name} {conf:.2f} {z_m:.2f}m" if z_m is not None else f"{class_name} {conf:.2f}"
         text_pos = (p1[0], max(0, p1[1] - 8))
-        cv2.putText(image, label, text_pos,
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        cv2.putText(image, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
+    # ------------------------------------------------------------------
+    # ★ 캡처 전담 스레드: YOLO와 완전히 독립적으로, 카메라 최대 속도로 실행
+    def _capture_loop(self):
+        while not self._capture_stop.is_set():
+            try:
+                frames = self.pipeline.wait_for_frames(100)
+                if frames is None:
+                    continue
+
+                color_frame = frames.get_color_frame()
+                depth_frame = frames.get_depth_frame()
+                if color_frame is None or depth_frame is None:
+                    continue
+
+                color_image = frame_to_bgr_image(color_frame)
+                if color_image is None:
+                    # MJPG가 아닌 포맷으로 스트림이 잡히면 imdecode가 None을 반환함.
+                    # 이 스레드는 데몬 스레드라 여기서 예외가 나면 노드는 안 죽고
+                    # 캡처만 조용히 영원히 멈추는 "좀비 상태"가 되므로 반드시 방어.
+                    continue
+
+                depth_data = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
+                depth_image = depth_data.reshape((depth_frame.get_height(), depth_frame.get_width()))
+
+                # ★ 원본을 즉시 발행 (YOLO 대기 없음, 이게 핵심)
+                self._encode_and_publish(self.raw_image_pub, color_image)
+
+                # ★ YOLO 처리 스레드(타이머)가 쓸 수 있게 최신 프레임 저장
+                with self._frame_lock:
+                    self._latest_color = color_image
+                    self._latest_depth = depth_image
+            except Exception as e:
+                self.get_logger().error(f"캡처 스레드 예외 (계속 재시도): {e}")
+    def _get_latest_frame(self):
+        with self._frame_lock:
+            if self._latest_color is None or self._latest_depth is None:
+                return None, None
+            return self._latest_color.copy(), self._latest_depth.copy()
+
+    # ------------------------------------------------------------------
+    # YOLO 처리 (캡처 스레드가 채워둔 최신 프레임을 가져다 씀, 카메라 속도와 무관)
     def _process_frame(self):
-        frames = self.pipeline.wait_for_frames(100)
-        if frames is None:
+        color_image, depth_image = self._get_latest_frame()
+        if color_image is None:
             return
-
-        color_frame = frames.get_color_frame()
-        depth_frame = frames.get_depth_frame()
-        if color_frame is None or depth_frame is None:
-            return
-
-        color_image = frame_to_bgr_image(color_frame)
-        depth_data = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
-        depth_image = depth_data.reshape((depth_frame.get_height(), depth_frame.get_width()))
-
-        # ★ 추론 전에 즉시 원본부터 발행 (지연 최소화, 항상 빠름)
-        self._encode_and_publish(self.raw_image_pub, color_image)
 
         results = self.model.track(
             color_image,
@@ -201,9 +239,6 @@ class YoloDepthPublisher(Node):
             class_name = self.model.names[cls]
 
             if conf < self.conf_threshold:
-                if self.debug_log:
-                    self.get_logger().info(
-                        f"[디버그] conf 미달 스킵: class={class_name} conf={conf:.2f}")
                 continue
 
             u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
@@ -217,20 +252,13 @@ class YoloDepthPublisher(Node):
 
             elif box.id is not None:
                 track_id = int(box.id[0])
-
                 if track_id in self.reported_tids:
                     self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
                     continue
-
                 if self._match_nearby(self.reported_fallbacks, class_name, u, v):
                     self.reported_tids.add(track_id)
                     self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
-                    if self.debug_log:
-                        self.get_logger().info(
-                            f"[디버그] tid={track_id} 부여됐으나 이미 fallback으로 "
-                            f"발행된 위치({u},{v}) -> 중복 스킵")
                     continue
-
                 self.reported_tids.add(track_id)
                 publish_ok = True
                 key_info = f"tid={track_id}"
@@ -239,31 +267,18 @@ class YoloDepthPublisher(Node):
                 if self._match_nearby(self.reported_fallbacks, class_name, u, v):
                     self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
                     continue
-
                 cand = self._match_nearby(self.fallback_candidates, class_name, u, v)
                 if cand is None:
-                    self.fallback_candidates.append(
-                        {'class': class_name, 'u': u, 'v': v, 'count': 1})
+                    self.fallback_candidates.append({'class': class_name, 'u': u, 'v': v, 'count': 1})
                     self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
-                    if self.debug_log:
-                        self.get_logger().info(
-                            f"[디버그] fallback 후보 신규: class={class_name} conf={conf:.2f} ({u},{v})")
                     continue
-
                 cand['count'] += 1
                 cand['u'], cand['v'] = u, v
-                if self.debug_log:
-                    self.get_logger().info(
-                        f"[디버그] fallback 카운트: class={class_name} conf={conf:.2f} "
-                        f"count={cand['count']}/{self.fallback_confirm_frames}")
-
                 if cand['count'] < self.fallback_confirm_frames:
                     self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
                     continue
-
                 self.fallback_candidates.remove(cand)
-                self.reported_fallbacks.append(
-                    {'class': class_name, 'u': u, 'v': v})
+                self.reported_fallbacks.append({'class': class_name, 'u': u, 'v': v})
                 publish_ok = True
                 key_info = f"fallback({u},{v})"
 
@@ -277,10 +292,14 @@ class YoloDepthPublisher(Node):
             x_max = min(depth_image.shape[1], u + box_w // 4)
             depth_roi = depth_image[y_min:y_max, x_min:x_max]
             valid_depths = depth_roi[depth_roi > 0]
+            valid_ratio = len(valid_depths) / depth_roi.size if depth_roi.size > 0 else 0.0
 
-            if len(valid_depths) == 0:
+            if valid_ratio < self.min_valid_ratio:
                 if self.debug_log:
-                    self.get_logger().info(f"[디버그] depth 무효로 발행 실패: {class_name}")
+                    self.get_logger().debug(
+                        f"[{class_name}] 유효 depth 비율 {valid_ratio:.2f} < "
+                        f"{self.min_valid_ratio} - 검출 폐기"
+                    )
                 self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
                 continue
 
@@ -292,25 +311,22 @@ class YoloDepthPublisher(Node):
 
             if self.debug_log:
                 self.get_logger().info(
-                    f"[발행] class={class_name} {key_info} conf={conf:.2f} "
-                    f"xyz=({X:.3f},{Y:.3f},{z_m:.3f})m"
+                    f"[발행] class={class_name} {key_info} conf={conf:.2f} xyz=({X:.3f},{Y:.3f},{z_m:.3f})m"
                 )
 
             msg = String()
             msg.data = json.dumps({
-                'u': u,
-                'v': v,
-                'depth': z_m,
+                'u': u, 'v': v, 'depth': z_m,
                 'depth_xyz': [X, Y, z_m],
-                'class_id': class_name,
-                'confidence': conf,
+                'class_id': class_name, 'confidence': conf,
             })
             self.pub.publish(msg)
 
-        # ★ 박스가 그려진 최종 프레임 발행
         self._encode_and_publish(self.annotated_image_pub, display_image)
 
     def destroy_node(self):
+        self._capture_stop.set()
+        self._capture_thread.join(timeout=2.0)
         self.pipeline.stop()
         super().destroy_node()
 
