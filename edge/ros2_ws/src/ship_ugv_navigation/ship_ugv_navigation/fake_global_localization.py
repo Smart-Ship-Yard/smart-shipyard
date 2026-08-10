@@ -87,7 +87,8 @@ class FakeGlobalLocalization(Node):
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('publish_rate_hz', 50.0)
+        # (발행 주기 파라미터는 없앴다 — 참값 메시지 1건당 1건을 발행하므로
+        #  주기가 참값 주기에 자동으로 맞고, 별도 타이머는 스탬프 중복을 만든다)
         # ★ TF 유효 시간 여유 (AMCL의 transform_tolerance와 같은 개념)
         #   TF 스탬프를 "지금"으로 찍으면, RViz나 코스트맵이 "스캔이 찍힌 시각"
         #   기준으로 map->odom을 찾을 때 미세한 시간 틈에서 조회가 실패한다.
@@ -118,9 +119,8 @@ class FakeGlobalLocalization(Node):
             self.get_parameter('map_offset_yaw').value,
         )
 
-        self.truth = None          # (x, y, yaw) — map 기준 base_link 참값
-        self.truth_stamp = None    # 그 참값이 언제 측정된 것인지 (시각 일치용)
-        self.truth_twist = None
+        self._pending = None       # 한 건 늦춰 처리할 참값 (stamp, truth, twist)
+        self._last_stamp = None    # 발행한 마지막 스탬프 (단조증가 보장용)
         self._warned = False
 
         self.tf_buffer = Buffer()
@@ -133,9 +133,6 @@ class FakeGlobalLocalization(Node):
         self.global_pub = self.create_publisher(
             Odometry, self.get_parameter('global_odom_topic').value, 10)
 
-        rate = self.get_parameter('publish_rate_hz').value
-        self.create_timer(1.0 / rate, self._tick)
-
         self.get_logger().info(
             'fake_global_localization 시작 (시뮬 전용). '
             f'{self.map_frame}->{self.odom_frame} 발행. '
@@ -144,78 +141,84 @@ class FakeGlobalLocalization(Node):
 
     # ------------------------------------------------------------------
     def _truth_cb(self, msg: Odometry):
+        """참값 1건 -> TF 1건. 타이머를 쓰지 않는 이유는 아래 참고.
+
+        ★★ 타이머 발행에서 콜백 발행으로 바꾼 이유 (2026-08-07 실측) ★★
+          타이머(50 Hz)와 참값 도착(50 Hz)은 서로 동기되지 않는다. 그래서
+          타이머가 두 번 도는 사이 참값이 한 번만 오면 **같은 스탬프를 두 번**
+          발행하고, 예외 경로에서 now()를 쓰면 **스탬프가 거꾸로** 가기도 한다.
+          실측: map->odom 42건 중 중복 25건, 시간역행 5건.
+          tf2는 시간이 역행하면 캐시를 무효화하므로 RViz에
+            "timestamp on the message is earlier than all the data in
+             the transform cache"
+          가 뜨면서 로봇 모델과 라이다 스캔이 사라졌다 나타났다 한다.
+
+          참값 메시지 하나당 정확히 하나를 발행하면 스탬프가 항상 유일하고
+          단조증가한다. 발행 주기도 참값 주기(50 Hz)에 자동으로 맞는다.
+
+        ★ 한 건 늦춰서 처리하는 이유
+          참값이 시각 T로 도착한 순간, ekf_local이 아직 T의 odom->base_link를
+          발행하지 않았을 수 있다. 다음 메시지가 올 때(약 20 ms 뒤) 처리하면
+          그 사이에 도착해 있어 조회가 안정적으로 성공한다.
+        """
         p = msg.pose.pose
         raw = (p.position.x, p.position.y, yaw_of(p.orientation))
+        pending = self._pending
         # world -> map 오프셋 적용 (기본값 0이면 그대로)
-        self.truth = compose(self.map_offset, raw)
-        self.truth_twist = msg.twist.twist
-        # ★ 참값이 "언제의" 값인지 반드시 함께 보관한다.
-        #   아래 _tick()에서 같은 시각의 odom->base_link와 합성해야 한다.
-        self.truth_stamp = Time.from_msg(msg.header.stamp)
+        self._pending = (Time.from_msg(msg.header.stamp),
+                         compose(self.map_offset, raw),
+                         msg.twist.twist)
+        if pending is not None:
+            self._publish(*pending)
 
     # ------------------------------------------------------------------
-    def _tick(self):
-        if self.truth is None or self.truth_stamp is None:
-            return
-
-        # ekf_local이 발행한 odom->base_link 조회
+    def _publish(self, stamp, truth, twist):
+        # ekf_local이 발행한 odom->base_link를 "참값과 같은 시각"으로 조회한다.
         #
-        # ★★ 반드시 "참값과 같은 시각"의 값을 써야 한다 (2026-08-07 실측으로 수정)
+        # ★ 같은 시각이어야 하는 이유
         #   map->odom = 참값 ⊗ (odom->base)⁻¹ 인데, 두 값의 시각이 다르면
-        #   그 사이 로봇이 움직인 만큼이 그대로 오차가 된다.
-        #   특히 이 시뮬은 엔코더 기반 오도메트리라 odom 프레임이 빠르게
-        #   드리프트하는데(실측: 실제 1.4 m 이동 시 odom은 8.8 m), 그 상태에서
-        #   시각이 수십 ms만 어긋나도 수십 cm 오차가 난다.
-        #   증상: 로봇이 움직일 때 RViz에서 라이다 스캔이 로봇을 따라 돌고
-        #        벽이 제자리에 고정되지 않는다.
-        #   AMCL을 비롯한 표준 로컬라이제이션 노드가 모두 이 방식을 쓴다.
+        #   그 사이 로봇이 움직인 만큼이 그대로 오차가 된다. 엔코더 오도메트리는
+        #   빠르게 드리프트하므로 수십 ms 차이도 수십 cm 오차가 된다.
+        #   AMCL 등 표준 로컬라이제이션 노드가 모두 이 방식을 쓴다.
         #
         # ★ timeout을 0으로 두는 이유
-        #   여기는 타이머 콜백 안이고 기본 실행기는 단일 스레드다. 블로킹으로
-        #   기다리면 그동안 TransformListener의 /tf 수신 콜백이 실행되지 못해
-        #   기다릴수록 오히려 버퍼가 갱신되지 않는다. (0.1초 대기 시 조회
-        #   성공률이 80 %까지 떨어져 RViz가 깜빡였다 — 2026-08-07 실측)
+        #   콜백 안에서 블로킹으로 기다리면, 단일 스레드 실행기라 그동안
+        #   TransformListener의 /tf 수신 콜백이 실행되지 못한다. 기다릴수록
+        #   오히려 버퍼가 갱신되지 않아 조회 성공률이 떨어진다(실측 80 %).
         try:
             tf = self.tf_buffer.lookup_transform(
-                self.odom_frame, self.base_frame, self.truth_stamp,
+                self.odom_frame, self.base_frame, stamp,
                 timeout=Duration(seconds=0.0))
-            stamp_used = self.truth_stamp
         except Exception:
-            # 참값 시각의 TF가 아직 버퍼에 없으면(도착 순서 역전 등) 최신값으로
-            # 대체한다. 이 경우 위 시각 불일치 오차가 생기지만 화면이 끊기는
-            # 것보다는 낫다.
-            try:
-                tf = self.tf_buffer.lookup_transform(
-                    self.odom_frame, self.base_frame, Time(),
-                    timeout=Duration(seconds=0.0))
-                stamp_used = self.get_clock().now()
-            except Exception:
-                if not self._warned:
-                    self.get_logger().warn(
-                        f"'{self.odom_frame}'->'{self.base_frame}' TF 대기 중. "
-                        'ekf_local이 떠 있고 /wheel/odom · /imu/data가 흐르는지 확인.'
-                    )
-                    self._warned = True
-                return
+            # 이번 건은 건너뛴다. 다음 참값에서 다시 시도하면 되고,
+            # 억지로 다른 시각의 값을 끌어다 쓰면 위 오차가 생긴다.
+            if not self._warned:
+                self.get_logger().warn(
+                    f"'{self.odom_frame}'->'{self.base_frame}' TF 대기 중. "
+                    'ekf_local이 떠 있고 /wheel/odom · /imu/data가 흐르는지 확인.'
+                )
+                self._warned = True
+            return
         if self._warned:
             self.get_logger().info('odom->base_link TF 확보. 정상 동작 시작.')
             self._warned = False
+
+        # 스탬프 단조증가 보장 (같거나 이전 시각이면 버린다).
+        # tf2는 시간이 역행하면 캐시를 무효화한다.
+        if self._last_stamp is not None and stamp <= self._last_stamp:
+            return
+        self._last_stamp = stamp
 
         t = tf.transform
         odom_to_base = (t.translation.x, t.translation.y, yaw_of(t.rotation))
 
         # map->odom = map->base_link(참값) ⊗ (odom->base_link)⁻¹
-        mx, my, mth = compose(self.truth, invert(odom_to_base))
+        mx, my, mth = compose(truth, invert(odom_to_base))
 
-        # ★ 스탬프는 "합성에 쓴 시각" 기준이어야 한다. 여기에 tolerance를 더해
-        #   조금 미래까지 유효하게 만든다(위 transform_tolerance_s 주석 참고).
-        #   "지금"으로 찍으면 실제로는 과거 데이터인데 현재값인 척하게 되어
-        #   위와 같은 시각 불일치 오차가 다시 생긴다.
-        stamp = stamp_used.to_msg()
-        tf_stamp = (stamp_used + self.tf_tolerance).to_msg()
-
+        # TF 스탬프에 tolerance를 더해 조금 미래까지 유효하게 만든다.
+        # (RViz·코스트맵이 스캔 시각으로 조회할 때 생기는 미세한 틈을 덮는다)
         out = TransformStamped()
-        out.header.stamp = tf_stamp
+        out.header.stamp = (stamp + self.tf_tolerance).to_msg()
         out.header.frame_id = self.map_frame
         out.child_frame_id = self.odom_frame
         out.transform.translation.x = mx
@@ -228,16 +231,15 @@ class FakeGlobalLocalization(Node):
         # 실물 ekf_global과 같은 토픽으로 절대 위치도 발행
         # (websocket_client가 위치 핑에 /odometry/global을 쓴다)
         odom = Odometry()
-        odom.header.stamp = stamp
+        odom.header.stamp = stamp.to_msg()
         odom.header.frame_id = self.map_frame
         odom.child_frame_id = self.base_frame
-        tx, ty, tth = self.truth
+        tx, ty, tth = truth
         odom.pose.pose.position.x = tx
         odom.pose.pose.position.y = ty
         odom.pose.pose.orientation.z = math.sin(tth / 2.0)
         odom.pose.pose.orientation.w = math.cos(tth / 2.0)
-        if self.truth_twist is not None:
-            odom.twist.twist = self.truth_twist
+        odom.twist.twist = twist
         self.global_pub.publish(odom)
 
 
