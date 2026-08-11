@@ -353,14 +353,18 @@ PR #14 `wheel_odom_node`의 실주행 보정값을 써야 실물과 거동이 �
 | 가속도 한계 | 복구 행동 on/off |
 | 컨트롤러 게인 | 순찰 중심·반지름 |
 
-**구현 방침: `nav2_params.yaml` 맨 위에 "장소 의존" 블록을 몰아넣고
-두 프리셋을 주석으로 병기한다.**
+**구현 완료 (Step 4).** `nav2_params.yaml` 을 A절(로봇이 결정) / B절(장소가 결정)
+로 나누고, 장소 의존 값에는 `↓↓ 장소 의존 ↓↓` 주석을 달아 표시했다.
+현장에서 바꾸는 것은 아래 3가지뿐이며, 절차는 **B절 ①②**에 단계별로 있다.
 
-```yaml
-# ===== 장소 의존 (여기만 바꾸면 됨) =====
-# 좁은 방(기숙사)   : inflation 0.10 / costmap 2x2 / spin off
-# 넓은 공간(시연장) : inflation 0.25 / costmap 5x5 / spin on
-```
+| 항목 | 좁은 방 | 넓은 공간(기본값) | 고치는 위치 |
+|---|---|---|---|
+| `inflation_radius` | 0.10 | **0.25** | local·global 코스트맵 둘 다 |
+| `local_costmap` 크기 | 2×2 | **5×5** | `width`, `height` |
+| 복구 행동 `spin` | 끔 | 켜는 것을 권장 | **4곳** (B절 ② 참고) |
+
+⚠️ spin은 `behavior_plugins`만 고쳐선 안 되고 **BT xml까지 4곳을 같이** 바꿔야
+한다. 이유는 7-1절 Step 4 완료 기록 참고.
 
 **기본값은 넓은 공간 기준으로 둔다.** 시연이 거기서 이뤄지기 때문이다.
 파일을 둘로 나누지 않는 이유는 **발표 당일 엉뚱한 파일을 로드하는 사고를 막기
@@ -434,12 +438,208 @@ edge/ros2_ws/src/
 | 1 | `ship_ugv_gazebo.xacro` — 시뮬 전용 물리/센서 | ✅ 완료 |
 | 2 | 월드 + 맵 + 매핑 후처리 스크립트 3종 | ✅ 완료 |
 | 3 | `sim_bringup.launch.py` — Gazebo 기동 + 로봇 스폰 + TF 트리 | ✅ 완료 |
-| **4** | **`nav2_params.yaml`** — footprint·속도·코스트맵·planner·controller | ← 다음 |
-| 5 | `navigation.launch.py` — map_server + Nav2 (시뮬/실물 공용) | |
-| **6** | **`patrol_mission_node.py`** — 원형 순찰 무한 순회 | |
+| 4 | `nav2_params.yaml` + `navigate_no_spin.xml` — footprint·속도·코스트맵·planner·controller·복구행동 | ✅ 완료 (2026-08-11) |
+| 5 | `navigation.launch.py` + `space_*.yaml` + `nav.rviz` — Nav2 기동, 장소 프리셋 | ✅ 완료 (2026-08-11) |
+| **6** | **`patrol_mission_node.py`** — 원형 순찰 무한 순회 | ← 다음 |
 | **7** | **`event_gate_node.py`** — 이벤트 감지 시 정지 / 관제 확인 시 재개 | |
 | 8 | 실물 이식 + 튜닝 | |
 | **9** | **문서 최종 정리** — 아래 목록 갱신 | ★ 각 Step 종료 시마다 부분 수행 |
+
+#### Step 5 완료 기록 (2026-08-11) — Nav2 기동 + 장소 프리셋
+
+**산출물**
+
+| 파일 | 내용 |
+|---|---|
+| `launch/navigation.launch.py` | Nav2 6개 노드 + lifecycle_manager, 값 주입, `space` 프리셋 |
+| `config/space_narrow.yaml` | 좁은 방 차이값만 (11줄) |
+| `config/space_wide.yaml` | 넓은 곳 차이값만 (11줄) |
+| `behavior_trees/navigate_with_spin.xml` | `no_spin` 과 `<Spin>` 한 줄 차이 |
+| `rviz/nav.rviz` | 코스트맵·경로·footprint·목표찍기 |
+| `scripts/stop_all.sh` | 좀비 프로세스 정리 (아래 9장 참고) |
+
+**설정 구조 — "공통 1 + 장소별 1"**
+
+시연 당일 YAML 을 열어 값을 고치는 것은 사고가 난다. 그렇다고 설정 전체를
+두 벌 복사하면 한쪽만 고치고 다른 쪽을 잊는다. 그래서 공통은 한 곳에 두고
+**다른 값 4개만** 따로 뺐다. 명령어의 `space` 단어 하나가 4개를 동시에 바꾼다.
+
+| 항목 | narrow | wide | 어디에 |
+|---|---|---|---|
+| `local_costmap` 크기 | 2×2 m | 5×5 m | `space_*.yaml` |
+| local `inflation_radius` | 0.10 | 0.25 | 〃 |
+| global `inflation_radius` | 0.10 | 0.25 | 〃 |
+| 복구 행동 `spin` | 미사용 | 사용 | `navigate_*.xml` |
+
+ROS 2 는 `--params-file` 을 여러 개 받으면 **나중 파일이 이긴다.** 실측으로
+확인했다: overlay 에 적은 값만 덮어써지고 나머지는 공통 파일 값이 유지된다.
+
+**spin 토글을 4곳 → 0곳으로 없앴다**
+
+Step 4 에서는 spin 을 끄려면 yaml 3곳 + xml 1곳을 **전부 같이** 고쳐야 했고,
+하나만 놓치면 Nav2 가 뜨지 않았다. Step 5 에서는 `behavior_plugins` 에 spin 을
+**항상 등록**해두고(아무도 안 부르면 액션 서버 하나가 놀 뿐이라 비용 0),
+실제 사용 여부는 BT xml 이 정하게 바꿨다. 이제 손으로 고칠 곳이 없다.
+
+**★ /cmd_vel 은 velocity_smoother 를 반드시 거친다**
+
+```
+controller_server --(/cmd_vel_nav)--> velocity_smoother --(/cmd_vel)--> 로봇
+```
+
+Nav2 기본은 controller 가 `/cmd_vel` 을 직접 쏜다. 그러면 `nav2_params.yaml` 의
+가속 제한이 **적용되지 않는다.** 실물 펌웨어에도 `wheel_odom_bridge` 에도
+클램프가 없으므로 속도·가속 제한을 걸 수 있는 곳이 여기뿐이다.
+launch 의 remapping 으로 중간에 끼워 넣었다.
+(복구 행동만은 `/cmd_vel` 직행 — Nav2 설계상 스스로 속도를 제어한다)
+
+**작업 중 잡은 문제 4개**
+
+| # | 문제 | 원인·조치 |
+|---|---|---|
+| 1 | Nav2 스택 전체가 안 뜸 | `plugin_lib_names` 를 15개로 줄인 탓. `bt_navigator` 는 트리를 **두 개**(navigate_to_pose + navigate_through_poses) 로드하는데 기본 트리가 쓰는 노드가 빠져 `Node not recognized: RemovePassedGoals` 로 죽었다. **Humble 기준 47개 전체로 복원.** 줄여서 얻는 것이 없다 |
+| 2 | 로봇이 설정의 1/3 속도로 기어감 | `use_cost_regulated_linear_velocity_scaling` 이 원인. 방이 작아 팽창 영역이 바닥 거의 전체를 덮어 감속이 **상시** 걸렸다. 끄니 주행 중 평균 0.050 → **0.116~0.130 m/s** |
+| 3 | RViz 노란 선이 안 나옴 | `/local_plan` 은 **DWB 전용** 토픽. RPP 는 `received_global_plan` / `lookahead_point` / `lookahead_collision_arc` 를 쓴다. 후자로 교체 |
+| 4 | 전방주시를 늘렸다가 되돌림 | 아래 참고 |
+
+**전방주시(lookahead) — 늘렸다가 되돌린 기록**
+
+RViz 에서 추종 목표점(주황)이 **차체 안쪽**에 찍히는 것이 발견됐다. 실측하면
+base_link 로부터 0.13~0.31 m 로, 차체 앞 끝 0.332 m 보다 안쪽이었다(표본 100%).
+"자기 몸 안의 점을 쫓는 건 잘못"이라 판단해 `min 0.25→0.45`, `time 2.0→3.0` 으로
+늘렸더니 **demo_room 에서 목표 2개 모두 실패**했다. 전방주시가 길어지자 중앙
+블록을 가로지르는 방향으로 조향해 충돌 검사에 계속 걸린 것이다.
+
+→ **되돌렸다.** 목표점이 차체 안에 있는 것은 **차동구동에서는 문제가 아니다.**
+제어점이 base_link 이고 제자리 회전이 되므로 곡률식(2y/L²)이 그대로 성립한다.
+그 규칙은 조향각이 제한된 자동차형 로봇에 해당하는 이야기였다.
+좁은 실내에서는 짧은 전방주시가 맞다. **다시 늘리지 말 것.**
+
+**검증 결과 (2026-08-11, 사용자 직접 확인 + 계측)**
+
+| 항목 | 결과 |
+|---|---|
+| lifecycle 6개 노드 | 전부 `active`, ERROR 0건 (narrow·wide 둘 다) |
+| 파라미터 겹치기 | narrow 2 / 0.10, wide 5 / 0.25 — overlay 만 이기고 공통값 유지 |
+| launch 주입 4개 | BT xml · map · scan topic · use_sim_time 전부 반영 확인 |
+| `space` 전환 | 한 단어로 4가지가 동시에 바뀜. RViz 팽창 띠 두께로 육안 확인 |
+| 자율주행 | 목표 도달 **성공**, 오차 11.8 / 13.7 cm (허용 15 cm) |
+| 속도 | 최대 정확히 **0.150**, 주행 중 평균 0.115~0.130 |
+| 원형 순찰 12점 | 11/12 · 12/12 성공, 오차 13~15 cm |
+
+**Step 6 으로 넘기는 설계 입력 4개**
+
+1. **출발 정렬** — 순찰 첫 웨이포인트에서 실패한 유일한 사례가 스폰 방향(+90°)과
+   접선 방향(−90°)이 정반대였던 경우다. 순찰 시작 전에 접선 방향으로 맞추거나
+   현재 방향에서 가까운 웨이포인트부터 시작한다.
+2. **목표 완료를 기다린 뒤 다음 웨이포인트** — 주행 중에 목표를 갈아끼우면 옛
+   경로가 무효가 되어 복구(`Wait` 5초)가 한 번 돈다. 공간과 무관한 타이밍 문제다.
+3. **도달 오차는 항상 13~15 cm** — `xy_goal_tolerance: 0.15` 를 넘는 순간 도달
+   처리된다. 원 궤적이 실제보다 안쪽/바깥쪽으로 흐를 수 있다.
+4. **반지름 0.30 m 순찰은 이 로봇에게 무리** — 차체가 0.4 m 다. 제자리 회전에
+   필요한 여유(옆으로 0.259 m 추가)도, 전방주시가 원을 자르는 깊이도 감당이 안 된다.
+   대상 주변을 치우고 재매핑해 반지름을 키우는 것이 정답이다.
+
+**Step 8 로 넘기는 관찰**
+
+주행 중 `detected collision ahead` 경고가 제어 주기의 약 16% 로 상시 발생한다
+(150~342회). 목표에는 도달하므로 치명적이지 않지만 정상이라 보기도 어렵다.
+3.7 m 방에 0.4 m 로봇이라 원래 빡빡한 것인지, `footprint_padding` 조정이
+필요한 것인지는 **시연장 크기를 알아야** 판단할 수 있다.
+
+---
+
+#### Step 4 완료 기록 (2026-08-11) — Nav2 파라미터 확정
+
+**산출물 2개**
+
+| 파일 | 내용 |
+|---|---|
+| `config/nav2_params.yaml` | A절(로봇이 결정) / B절(장소가 결정)로 나눈 전체 설정 |
+| `behavior_trees/navigate_no_spin.xml` | 복구 행동 트리. Nav2 기본에서 2줄만 변경 |
+
+컨트롤러는 **RPP**(원형 경로 추종이 부드럽고 튜닝 파라미터가 적음), 플래너는
+**NavFn**(제자리 회전 되는 차동구동에 Smac Hybrid는 과함), **AMCL은 미사용**
+(EKF가 이미 `map→odom`을 발행하므로 켜면 TF 이중 발행).
+
+**가속 한계를 속도 한계에서 유도했다**
+
+슬램 담당자가 정한 0.15 m/s · 0.6 rad/s 를 기준으로 **최고속 도달시간 0.5초**를
+채택했다. `가속도 = 최고속도 / 도달시간` 이므로 0.30 m/s² · 1.20 rad/s².
+
+0.5초의 근거: ① Nav2 컨트롤러 20 Hz 기준 10 제어주기 ② 감속 0.5 m/s² 기준
+정지거리 2.25 cm ③ 순찰(R=0.95 m)에 필요한 0.158 rad/s를 0.13초에 도달
+④ 아두이노 PID에 가속 램프가 없어 급격한 명령은 토크 스파이크를 만든다.
+
+**모터 사양(JGB37-520)으로 상한을 확인해 Step 8의 실측 항목을 없앴다**
+
+| 항목 | 값 | 채택값 대비 |
+|---|---|---|
+| 최고 속도 (정격 250 RPM) | 0.806 m/s | 0.15 m/s = **19 %** |
+| 모터 토크 가속 한계 | 6.16 m/s² | 0.30 = **4.9 %** |
+| 바퀴 슬립 한계 ← 진짜 상한 | 4.61 m/s² | 0.30 = **6.5 %** |
+| 각가속 한계 (대략) | 39 rad/s² | 1.20 = **3.0 %** |
+
+정격 3.5 kg·cm / 250 RPM 자체가 부하 상태의 값이라 별도 실측이 필요 없다.
+**모터(6.16)가 접지력(4.61)보다 강하다** — 급가속하면 힘이 달리는 게 아니라
+바퀴가 헛돈다. 질량 3.5 kg이 대략치라 2배로 틀려도 10배 여유가 남는다.
+→ **속도·가속 한계는 Step 8에서 손댈 것이 없다.**
+
+**작업 중 발견해 고친 버그 3개**
+
+| # | 문제 | 결과 |
+|---|---|---|
+| 1 | `velocity_smoother.deadband_velocity` 에 모터 데드밴드(0.15 rad/s)를 그대로 옮김 | R=2 m 순찰에 필요한 0.075 rad/s가 0으로 눌려 **직진해버림**. 0으로 되돌림 |
+| 2 | `behavior_server` 를 최신 Nav2 문법으로 작성 | Humble은 `costmap_topic`(단수형). `local_costmap_topic` 등은 **선언되지 않은 파라미터라 경고도 없이 무시**된다 |
+| 3 | `behavior_server.global_frame: map` | Humble 정답은 **`odom`**. 복구 행동은 지도가 아니라 현재 위치 기준으로 움직인다 |
+
+버그 2는 Humble이 배포하는 `nav2_bringup/params/nav2_params.yaml`과 직접 diff해서
+찾았다. **런타임 경고가 없으므로 이 대조 없이는 발견할 수 없다.**
+
+**spin 을 끄려면 BT까지 같이 갈아야 한다**
+
+`behavior_plugins`에서 spin만 빼면 Nav2가 아예 뜨지 않는다. 기본 BT가 `<Spin>`을
+호출하는데 BT 노드는 **생성 시점에** 액션 서버를 찾고 없으면 예외를 던진다
+(`nav2_behavior_tree/bt_action_node.hpp` 의 `createActionClient`).
+그래서 `navigate_no_spin.xml`을 따로 두었다.
+
+시연장에서 spin을 켤 때 **4곳을 전부 같이** 바꾼다. 어느 줄도 지우지 않고
+`#`만 붙였다 뗐다 하면 왕복할 수 있게 두 벌을 나란히 적어두었다.
+위치와 절차는 `nav2_params.yaml` **B절 ②**에 단계별로 있다.
+
+**검증 결과 (2026-08-11, 사용자 직접 확인)**
+
+| 항목 | 결과 |
+|---|---|
+| footprint 다각형 실측 | 0.218 × 0.441 m — 패딩 0.02 포함 기대값과 일치 |
+| base_link 위치 | 앞 +0.352 / 뒤 −0.089 / 좌우 ±0.109 — **설정값과 정확히 일치**. 전체 길이의 뒤에서 20 % 지점 |
+| inflation 실측 | 코스트가 0이 되는 거리 **0.255 m** (설정 0.250, 격자 0.05 m) |
+| 코스트 곡선 | 0.10/0.15/0.20/0.25 m 에서 94/81/70/60 — 이론값과 일치 |
+| `velocity_smoother` 기동 | active, 속도·가속·데드밴드 7개 값 그대로 반영 |
+| rolling window | 주행 시 5×5 m 코스트맵이 로봇을 따라 이동 |
+
+**부수적으로 고친 것 2개**
+
+| 파일 | 내용 |
+|---|---|
+| `rviz/sim.rviz` | LaserScan `Style: Points` → **`Flat Squares`**. Points 스타일은 `Size (m)`를 무시하고 `Size (Pixels)`(기본 3픽셀)를 써서 줌아웃하면 스캔이 안 보였다 |
+| `ship_ugv_core.urdf.xacro` | `<material>` 4개 추가. RViz는 `<gazebo>` 태그 안의 색을 읽지 않아 로봇이 전부 흰색이었고, **앞뒤 구분이 안 돼 footprint 검증이 불가능**했다. 전방 라이다를 빨강으로 칠해 앞쪽 표식으로 쓴다 |
+
+**⚠️ Step 5 로 넘길 필수 작업**
+
+`nav2_params.yaml`에 **빈 문자열로 남겨둔 값 2개**가 있다. YAML 안에서는 패키지
+설치 경로를 알 수 없어 `navigation.launch.py`가 주입해야 한다.
+
+| 파라미터 | 노드 | 넣을 값 |
+|---|---|---|
+| `default_nav_to_pose_bt_xml` | `bt_navigator` | `<pkg share>/behavior_trees/navigate_no_spin.xml` |
+| `yaml_filename` | `map_server` | launch의 `map` 인자 |
+
+**하드코딩 금지** — 젯슨은 홈 디렉토리가 달라 경로가 바뀐다. 반드시
+`get_package_share_directory()`로 계산한다. BT 주입을 빠뜨리면 기본 BT
+(=`<Spin>` 포함)가 로드돼 `Action server spin not available`로 죽는다.
+
+---
 
 #### Step 3 완료 기록 (2026-08-07) — 시뮬 기동 검증 결과
 
@@ -909,15 +1109,52 @@ ROS 2 Humble / Gazebo Classic (`gazebo_ros_pkgs`) / nav2 전체 / `nav2_simple_c
 ### 시뮬 (개발용)
 
 ```bash
-# 터미널 1 — Gazebo + 로봇 + TF 트리
-ros2 launch ship_ugv_navigation sim_bringup.launch.py use_rviz:=true
+# ★ 0단계 — 반드시 먼저. 남은 프로세스가 있으면 RViz 가 얼어붙는다
+~/smart-shipyard/edge/ros2_ws/src/ship_ugv_navigation/scripts/stop_all.sh
 
-# 터미널 2 — Nav2 (Step 5 완성 후)
-ros2 launch ship_ugv_navigation navigation.launch.py use_sim_time:=true
+# 터미널 1 — Gazebo + 로봇 + TF 트리
+ros2 launch ship_ugv_navigation sim_bringup.launch.py
+
+# 터미널 2 — Nav2 + RViz. space 로 장소 프리셋을 고른다
+ros2 launch ship_ugv_navigation navigation.launch.py \
+    use_sim_time:=true space:=wide map:=demo_room use_rviz:=true
 
 # 터미널 3 — 키보드 주행 (Nav2 없이 물리 확인만 할 때)
-ros2 run teleop_twist_keyboard teleop_twist_keyboard
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p use_sim_time:=true
 ```
+
+#### ★ 시뮬을 다시 띄우기 전에 반드시 좀비 프로세스를 청소한다
+
+`Ctrl+C` 로 launch 를 껐어도 자식 노드가 남는 경우가 있다. 남은 `ekf_local` 과
+`fake_global_localization` 은 죽은 Gazebo 의 옛 시계로 **얼어붙은 TF 를 계속 쏜다.**
+그러면 `Tf has two or more unconnected trees` 가 뜨면서 **Gazebo 에서는 로봇이
+움직이는데 RViz 에서는 멈춰 있는** 증상이 나온다. (2026-08-11 실제로 물림)
+
+```bash
+~/smart-shipyard/edge/ros2_ws/src/ship_ugv_navigation/scripts/stop_all.sh
+```
+
+`✅ 정리 완료 — 남은 프로세스 없음` 이 떠야 다음으로 간다.
+
+**⚠️ 이 명령들을 터미널에 직접 치지 말고 반드시 스크립트로 실행한다.**
+세션 중 세 번 물린 함정이다.
+
+| # | 함정 | 내용 |
+|---|---|---|
+| 1 | `pkill -f` 가 셸을 죽인다 | 여러 명령을 한 줄로 붙여 넣으면 **그 명령줄 자체가 패턴에 걸린다.** 셸이 죽으면 뒤쪽 명령이 실행되지 않아 일부가 살아남는다. 스크립트 안에서는 명령줄이 스크립트 경로뿐이라 안전하다 |
+| 2 | `pkill -x` 가 긴 이름에 안 먹는다 | 리눅스는 프로세스 이름을 **15글자**까지만 저장한다. `-x` 는 그 잘린 이름과 완전 일치를 요구한다 |
+| 3 | `ros2 node list` 가 거짓말한다 | 백그라운드 데몬의 캐시라 `-9` 로 죽인 노드가 한동안 유령으로 남는다. 확인은 `pgrep` 으로 한다 (스크립트가 그렇게 한다). 굳이 쓰려면 `ros2 daemon stop` 을 먼저 |
+
+`-x` 로 못 죽이는 것들 (전부 15글자 초과):
+
+| 프로세스 | 글자 수 | 리눅스가 저장하는 이름 |
+|---|---|---|
+| `robot_state_publisher` | 21 | `robot_state_pub` |
+| `fake_global_localization` | 24 | `fake_global_loc` |
+| `teleop_twist_keyboard` | 21 | (python3 로 실행되어 더 다름) |
+| `controller_server` | 17 | `controller_serv` |
+| `velocity_smoother` | 17 | `velocity_smooth` |
+| `lifecycle_manager` | 17 | `lifecycle_manag` |
 
 ### 실물 (시연장) — ★ 끄고 켜는 시점이 중요하다
 
@@ -931,8 +1168,25 @@ ros2 launch ship_ugv_localization mapping.launch.py
 #   여기서 Ctrl+C  ★필수★
 
 # ── 터미널 2 : 매핑을 끈 뒤에 Nav2를 띄운다 ────────────────────────
-ros2 launch ship_ugv_navigation navigation.launch.py map:=<맵경로>
+#   map 은 이름만. space 는 시연장 넓이에 맞춰 narrow / wide
+ros2 launch ship_ugv_navigation navigation.launch.py \
+    space:=wide map:=shipyard_map_v3
 ```
+
+**실물에서 달라지는 것은 두 가지뿐이고 둘 다 자동이다.**
+
+| | 시뮬 | 실물 |
+|---|---|---|
+| `use_sim_time` | `true` 로 준다 | 생략 (기본 false) |
+| 라이다 토픽 | `/scan` | **`/scan_filtered`** ← `use_sim_time` 보고 자동 선택 |
+
+기동 배너에서 `scan_topic : /scan_filtered` 인지 **반드시 확인한다.**
+`/scan` 이면 후방 180도가 안 잘려 차체 뒷부분이 장애물로 찍히고 계속 갇힌다.
+
+⚠️ **젯슨 전제:** `ship_ugv_navigation` 패키지는 아직 `main` 에 없다.
+작업 브랜치를 머지한 뒤 젯슨에서 `git pull` + `colcon build` 해야
+맵·설정·launch 가 생긴다. 그 뒤에는 설치 경로가 노트북과 같아져
+위 명령을 양쪽에서 그대로 쓸 수 있다.
 
 **`localization.launch.py`는 매핑 시작부터 시연 종료까지 한 번도 끄지 않는다.**
 Nav2가 필요로 하는 것을 전부 이 launch가 제공하기 때문이다.
@@ -995,15 +1249,36 @@ Nav2가 필요로 하는 것을 전부 이 launch가 제공하기 때문이다.
 
 ### 10-4. 시뮬·실물 공용 (그대로 이식)
 
-`nav2_params.yaml` · `navigation.launch.py` · `patrol_mission_node.py` ·
-`event_gate_node.py` · `ekf_local` · `ship_ugv_core.urdf.xacro`
+`nav2_params.yaml` · `space_narrow.yaml` · `space_wide.yaml` ·
+`navigate_no_spin.xml` · `navigate_with_spin.xml` · `navigation.launch.py` ·
+`nav.rviz` · `patrol_mission_node.py` · `event_gate_node.py` · `ekf_local` ·
+`ship_ugv_core.urdf.xacro`
+
+**설정 파일들은 실물에서 뺄 것도 더할 것도 없다.** 바뀌는 것은 2개뿐이며
+둘 다 `navigation.launch.py`가 자동으로 처리한다.
+
+| 값 | 시뮬 | 실물 |
+|---|---|---|
+| `use_sim_time` | `true` 로 준다 | 생략 (파일 기본값 false) |
+| `obstacle_layer.scan.topic` | `/scan` | **`/scan_filtered`** ← use_sim_time 보고 자동 |
+
+속도·가속·footprint·컨트롤러 게인은 모두 **실물 기준으로 계산한 값**이라
+그대로 간다. 현장에서 고르는 것은 `space:=narrow|wide` 단어 하나뿐이다.
 
 ### 10-5. 아직 해소되지 않은 차이
 
 | 차이 | 대응 |
 |---|---|
-| 라이다 토픽·화각 (시뮬 `/scan` 360° / 실물 `/scan_filtered` 후방 180° 제거) | **Step 5**에서 `scan_topic`을 launch 인자로 분리 |
 | 시뮬 정지 시 1.6 mm/s 측면 드리프트 | 주행 속도의 1 %. 실물엔 없는 현상이라 무시 |
 | 시뮬 절대위치는 참값(오차 0) / 실물 UWB는 ±15 cm | **Step 8**에서 실물 튜닝 시 `inflation_radius` 재확인 |
+| `detected collision ahead` 가 제어 주기의 약 16% 로 상시 발생 | **Step 8**. 시연장 크기를 알아야 판단 가능 (7-1절 Step 5 기록 참고) |
+
+**라이다 토픽 차이는 Step 5 에서 해소됐다.** `navigation.launch.py` 가
+`use_sim_time` 을 보고 `/scan` ↔ `/scan_filtered` 를 자동으로 고른다.
+`scan_topic` 인자로 수동 지정도 가능하지만 평소에는 건드릴 필요가 없다.
+
+**속도·가속 한계는 Step 8 대상이 아니다.** JGB37-520 사양표로 계산이 끝났고
+채택값이 모터 한계의 5 % 수준이라 실물에서 못 낼 가능성이 없다
+(7-1절 Step 4 완료 기록 참고).
 
 ---

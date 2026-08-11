@@ -1,0 +1,68 @@
+<!--
+  navigate_with_spin.xml — 넓은 곳용 행동트리  (space:=wide 일 때 쓰인다)
+  ========================================================================
+  navigate_no_spin.xml 과 **딱 한 줄** 다르다: <Spin spin_dist="1.57"/> 이 있다.
+  나머지는 두 파일이 완전히 같아야 한다.
+
+  ⚠️ 한쪽만 고치지 말 것. 복구 순서나 후진 거리를 바꿀 일이 생기면
+     navigate_no_spin.xml 과 **양쪽 다** 고친다. 아래로 확인할 수 있다.
+
+         diff behavior_trees/navigate_no_spin.xml \
+              behavior_trees/navigate_with_spin.xml
+     주석을 뺀 실제 코드 차이가 <Spin> 한 줄뿐이어야 정상이다.
+
+  ── 왜 넓은 곳에서는 spin 을 쓰나 ───────────────────────────────────────
+  spin 은 길이 막혔을 때 제자리에서 한 바퀴 돌아 주변을 다시 스캔한다.
+      - 지나간 사람의 잔상 때문에 갇혔을 때 스캔을 새로 해서 풀린다
+      - 코스트맵 비우기 -> 대기 -> 후진 으로 안 풀리는 경우의 마지막 수단
+  제자리 회전에 필요한 여유는 반지름 0.344 m (지름 0.69 m) 다.
+  넓은 곳에서는 확보되므로 복구 수단을 하나 더 갖는 편이 낫다.
+
+  spin 의 속도·가속은 nav2_params.yaml 의 behavior_server 에 있다
+  (max_rotational_vel 0.6 / min_rotational_vel 0.15 / rotational_acc_lim 1.2).
+  Humble 기본값 1.0 / 0.4 / 3.2 는 우리 로봇에겐 너무 빠르다.
+
+  ── 복구 순서 (RoundRobin — 실패할 때마다 다음 것으로 넘어감) ───────────
+      1. 코스트맵 비우기   지나간 장애물 잔상 제거. 가장 자주 통하는 수단
+      2. 제자리 90도 회전  ← 이 파일에만 있다
+      3. 5초 대기
+      4. 15 cm 후진
+  바깥 RecoveryNode 가 number_of_retries="6" 이므로 위 4개를 한 바퀴 반 돈다.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+
+          <!-- ★ navigate_no_spin.xml 과의 유일한 차이. 90도(1.57 rad) 회전 -->
+          <Spin spin_dist="1.57"/>
+
+          <Wait wait_duration="5"/>
+
+          <!-- ★ 후진 거리를 기본 0.30 -> 0.15 로 줄였다.
+               실물은 laser_filters 가 후방 180도를 잘라내 뒤를 보지 못한다.
+               안 보이는 방향으로 가는 것이므로 최소한만 움직인다. -->
+          <BackUp backup_dist="0.15" backup_speed="0.05"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

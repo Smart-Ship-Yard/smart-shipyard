@@ -53,8 +53,13 @@ Visualization Manager:
         Depth: 5
         Durability Policy: Volatile
         Reliability Policy: Best Effort
-      Size (m): 0.03
-      Style: Points
+      # ★ Style 은 반드시 Flat Squares 로 둔다.
+      #   RViz2 에서 Style: Points 는 "Size (m)" 를 무시하고 "Size (Pixels)"
+      #   (기본 3픽셀) 를 쓴다. 줌아웃하면 점이 화면에서 사라져 스캔이
+      #   안 나오는 것처럼 보인다. Flat Squares 는 Size (m) 를 그대로 쓴다.
+      Style: Flat Squares
+      Size (m): 0.05
+      Size (Pixels): 5
       Color: 255; 60; 60
       Color Transformer: FlatColor
       Decay Time: 0

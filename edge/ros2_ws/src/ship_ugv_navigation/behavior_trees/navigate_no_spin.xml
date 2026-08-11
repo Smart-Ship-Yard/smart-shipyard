@@ -1,0 +1,77 @@
+<!--
+  navigate_no_spin.xml — 좁은 방용 행동트리  (space:=narrow 일 때 쓰인다)
+  ========================================================================
+  Nav2 기본 트리
+      nav2_bt_navigator/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml
+  를 복사해서 두 군데만 바꾼 것이다. 그 외는 원본과 완전히 동일하다.
+
+      (1) <Spin> 제거              — 제자리 회전 복구를 쓰지 않는다
+      (2) BackUp 거리 0.30 -> 0.15 — 실물은 후방을 못 본다
+
+  ── 짝이 되는 파일 ──────────────────────────────────────────────────────
+      navigate_with_spin.xml   넓은 곳용. 이 파일과의 차이는 <Spin> 한 줄뿐.
+  두 파일 중 무엇을 쓸지는 navigation.launch.py 의 space 인자가 정한다.
+  손으로 고르는 것이 아니므로 이 파일을 직접 편집할 일은 없다.
+
+      space:=narrow -> navigate_no_spin.xml    (이 파일)
+      space:=wide   -> navigate_with_spin.xml
+
+  ── 왜 좁은 방에서 spin 을 쓰지 않나 ────────────────────────────────────
+  우리 로봇은 base_link(뒷바퀴 축)에서 앞으로 0.332 m 튀어나와 있어
+  제자리 회전이 그리는 원의 반지름이
+        sqrt(0.332^2 + 0.089^2) = 0.344 m   (지름 0.69 m)
+  나 된다. 좁은 방에서는 이만한 여유가 없다.
+
+  Spin 은 회전 중 충돌을 예측하면 스스로 중단하므로("Collision Ahead -
+  Exiting Spin") 켜서 위험해진다기보다, **6번뿐인 복구 시도 중 2번을
+  즉시 실패할 행동에 낭비**하게 되는 것이 문제다. 그 2번이 대기나 후진이었다면
+  실제로 풀렸을 수도 있다.
+
+  ── ⚠️ spin 을 여기서 손으로 켜지 말 것 ─────────────────────────────────
+  이 파일에 <Spin> 을 넣어도 space:=narrow 로 실행하면 이 파일이 쓰이므로
+  동작은 하지만, 두 트리의 역할 구분이 무너져 나중에 무엇이 켜져 있는지
+  알 수 없게 된다. 넓은 곳에서 spin 이 필요하면 **space:=wide 로 실행**한다.
+  (spin 액션 서버는 nav2_params.yaml 에서 항상 등록되므로 어느 쪽이든 뜬다)
+
+  ── 복구 순서 (RoundRobin — 실패할 때마다 다음 것으로 넘어감) ───────────
+      1. 코스트맵 비우기   지나간 장애물 잔상 제거. 가장 자주 통하는 수단
+      2. 5초 대기          사람이 지나가는 중이면 이걸로 해결된다
+      3. 15 cm 후진
+  바깥 RecoveryNode 가 number_of_retries="6" 이므로 위 3개를 두 바퀴 돈다.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+
+          <!-- navigate_with_spin.xml 은 여기에 <Spin spin_dist="1.57"/> 이 들어간다 -->
+
+          <Wait wait_duration="5"/>
+
+          <!-- ★ 후진 거리를 기본 0.30 -> 0.15 로 줄였다.
+               실물은 laser_filters 가 후방 180도를 잘라내 뒤를 보지 못한다.
+               안 보이는 방향으로 가는 것이므로 최소한만 움직인다. -->
+          <BackUp backup_dist="0.15" backup_speed="0.05"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

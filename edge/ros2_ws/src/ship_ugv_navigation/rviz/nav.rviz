@@ -1,0 +1,193 @@
+# nav.rviz — Nav2 자율주행 확인용  (navigation.launch.py use_rviz:=true)
+#
+# sim.rviz(로봇·TF·스캔만)에 Nav2 표시를 더한 것이다.
+# 시뮬·실물 공용 — 실물에서도 그대로 쓴다.
+#
+# ★ LaserScan 의 Style 은 Flat Squares 로 둘 것.
+#   Points 스타일은 Size (m) 를 무시하고 Size (Pixels)(기본 3픽셀)를 써서
+#   줌아웃하면 스캔이 안 보인다.
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+  - Class: nav2_rviz_plugins/Navigation 2
+    Name: Navigation 2
+
+Visualization Manager:
+  Global Options:
+    Fixed Frame: map
+    Background Color: 48; 48; 48
+    Frame Rate: 30
+
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 20
+      Color: 100; 100; 100
+
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Enabled: true
+      Description Topic:
+        Value: /robot_description
+        Depth: 5
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: false          # 필요할 때만 켠다. 켜두면 화면이 지저분하다
+      Show Names: true
+      Marker Scale: 0.3
+
+    # ── 센서 ──────────────────────────────────────────────────────────
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Enabled: true
+      Topic:
+        Value: /scan
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+      Style: Flat Squares
+      Size (m): 0.05
+      Size (Pixels): 5
+      Color: 255; 60; 60
+      Color Transformer: FlatColor
+      Decay Time: 0
+
+    # ── 지도 ──────────────────────────────────────────────────────────
+    - Class: rviz_default_plugins/Map
+      Name: Map(static)
+      Enabled: true
+      Topic:
+        Value: /map
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Alpha: 1
+      Color Scheme: map
+
+    # ── 코스트맵 ───────────────────────────────────────────────────────
+    # 팽창 띠(inflation)를 보려면 Color Scheme 이 costmap 이어야 한다.
+    - Class: rviz_default_plugins/Map
+      Name: Costmap(global)
+      Enabled: true
+      Topic:
+        Value: /global_costmap/costmap
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Alpha: 0.5
+      Color Scheme: costmap
+
+    - Class: rviz_default_plugins/Map
+      Name: Costmap(local)
+      Enabled: true
+      Topic:
+        Value: /local_costmap/costmap
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Alpha: 0.7
+      Color Scheme: costmap
+
+    # ── 차체 외곽선 ────────────────────────────────────────────────────
+    # 앞으로 길쭉한 직사각형이고 바퀴축이 뒤에서 20% 지점에 있어야 정상.
+    - Class: rviz_default_plugins/Polygon
+      Name: Footprint
+      Enabled: true
+      Topic:
+        Value: /local_costmap/published_footprint
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Color: 60; 255; 60
+      Alpha: 1
+
+    # ── 경로 ──────────────────────────────────────────────────────────
+    - Class: rviz_default_plugins/Path
+      Name: Path(global)
+      Enabled: true
+      Topic:
+        Value: /plan
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Color: 0; 170; 255
+      Line Style: Lines
+      Alpha: 1
+
+    # ⚠️ /local_plan 은 **DWB 컨트롤러 전용** 토픽이라 우리는 못 쓴다.
+    #    우리는 RPP 를 쓰고, RPP 는 아래 세 가지를 대신 발행한다.
+    #        received_global_plan     지금 따라가는 전역 경로 구간
+    #        lookahead_point          쫓아가는 목표점(carrot)
+    #        lookahead_collision_arc  충돌 검사에 쓰는 예측 궤적
+    #    (2026-08-11: /local_plan 을 넣어놨다가 아무것도 안 나와서 확인함)
+
+    # ★ 이 노란 궤적이 로봇이 "곧 지나갈 것"이라 예측하는 경로다.
+    #   이게 벽이나 장애물에 닿으면 컨트롤러가 멈추고
+    #   "detected collision ahead" 경고를 낸다. 경고가 자주 뜰 때
+    #   이 선이 어디에 걸리는지 보면 원인을 바로 알 수 있다.
+    - Class: rviz_default_plugins/Path
+      Name: Lookahead arc(충돌예측)
+      Enabled: true
+      Topic:
+        Value: /lookahead_collision_arc
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Color: 255; 255; 0
+      Line Style: Lines
+      Alpha: 1
+
+    # 로봇이 지금 쫓아가고 있는 목표점. lookahead_dist 만큼 앞에 찍힌다.
+    - Class: rviz_default_plugins/PointStamped
+      Name: Lookahead point(추종목표)
+      Enabled: true
+      Topic:
+        Value: /lookahead_point
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Color: 255; 170; 0
+      Radius: 0.05
+      Alpha: 1
+
+    # ── 절대 위치 (평소엔 꺼둔다) ──────────────────────────────────────
+    - Class: rviz_default_plugins/Odometry
+      Name: Odometry(global)
+      Enabled: false
+      Topic:
+        Value: /odometry/global
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Keep: 100
+
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+    # ★ 목표 지점 찍기. Step 6 순찰 노드 전까지 이걸로 자율주행을 시험한다.
+    - Class: rviz_default_plugins/SetGoal
+      Topic:
+        Value: /goal_pose
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 8
+      Pitch: 1.2
+      Yaw: 3.14
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0

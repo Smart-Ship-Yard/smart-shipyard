@@ -27,6 +27,9 @@ setup(
             glob('maps/*.yaml') + glob('maps/*.pgm')),
         (os.path.join('share', package_name, 'worlds'), glob('worlds/*.world')),
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
+        # 행동트리(BT). navigation.launch.py가 절대경로로 bt_navigator에 넘긴다.
+        (os.path.join('share', package_name, 'behavior_trees'),
+            glob('behavior_trees/*.xml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
