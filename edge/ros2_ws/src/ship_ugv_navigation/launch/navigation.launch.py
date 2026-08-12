@@ -258,7 +258,9 @@ def launch_setup(context, *args, **kwargs):
     # 순찰 원의 중심·반지름은 **맵마다 다르다.** 그래서 맵 이름에 묶어
     # config/patrol_<맵이름>.yaml 을 자동으로 찾는다. map 인자 하나가
     # 맵과 순찰 원을 같이 정하므로 따로 지정할 일이 없다.
-    if LaunchConfiguration('patrol').perform(context).lower() in ('true', '1', 'yes'):
+    patrol_on = LaunchConfiguration('patrol').perform(context).lower() in (
+        'true', '1', 'yes')
+    if patrol_on:
         map_name = os.path.splitext(os.path.basename(map_yaml))[0]
         patrol_cfg = os.path.join(pkg_share, 'config', f'patrol_{map_name}.yaml')
         if os.path.isfile(patrol_cfg):
@@ -277,6 +279,25 @@ def launch_setup(context, *args, **kwargs):
     else:
         banner_patrol = '사용 안 함 (patrol:=true 로 켠다)'
 
+    # ---- 이벤트 게이트 (Step 7) -----------------------------------------
+    # 기본값은 "patrol 을 따라간다". 순찰을 켜면 이벤트 정지도 함께 켜지는 것이
+    # 시연에서 원하는 동작이고, 튜닝 중에만 events:=false 로 끄면 된다.
+    events_arg = LaunchConfiguration('events').perform(context).strip().lower()
+    if events_arg == '':
+        events_on = patrol_on
+        how = '(patrol 을 따라감)'
+    else:
+        events_on = events_arg in ('true', '1', 'yes')
+        how = '(직접 지정)'
+    if events_on:
+        nodes.append(Node(
+            package='ship_ugv_navigation', executable='event_gate_node',
+            name='event_gate_node', parameters=[{'use_sim_time': is_sim}],
+            **common))
+        banner_events = f'사용 {how} — fire/fallen_person/no_helmet 에 정지'
+    else:
+        banner_events = f'사용 안 함 {how}'
+
     if LaunchConfiguration('use_rviz').perform(context).lower() in ('true', '1', 'yes'):
         nodes.append(Node(
             package='rviz2', executable='rviz2', name='rviz2_nav',
@@ -293,6 +314,7 @@ def launch_setup(context, *args, **kwargs):
         LogInfo(msg=f'  덮어쓰기     : {preset["overlay"]}'),
         LogInfo(msg=f'  행동트리     : {preset["bt"]}'),
         LogInfo(msg=f'  순찰         : {banner_patrol}'),
+        LogInfo(msg=f'  이벤트 정지  : {banner_events}'),
         LogInfo(msg='  cmd_vel 경로 : controller -> /cmd_vel_nav -> smoother -> /cmd_vel'),
         LogInfo(msg='─' * 60),
     ]
@@ -330,6 +352,10 @@ def generate_launch_description():
             'patrol', default_value='false',
             description='순찰 노드 동시 실행. 원의 중심·반지름은 map 이름에 묶인 '
                         'config/patrol_<맵이름>.yaml 에서 자동으로 읽는다'),
+        DeclareLaunchArgument(
+            'events', default_value='',
+            description='이벤트 정지 노드(event_gate_node) 실행. '
+                        '비우면 patrol 값을 따라간다. 튜닝 중 끄려면 events:=false'),
         DeclareLaunchArgument(
             'use_rviz', default_value='false',
             description='Nav2 전용 RViz(nav.rviz) 동시 실행'),

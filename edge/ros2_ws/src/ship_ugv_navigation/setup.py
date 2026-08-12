@@ -55,7 +55,8 @@ setup(
             # ── [시뮬·실물 공용] 아래 둘은 양쪽에서 그대로 실행한다 ─────────
             'patrol_mission_node = '
             'ship_ugv_navigation.patrol_mission_node:main',
-            # 'event_gate_node = ship_ugv_navigation.event_gate_node:main',   # Step 7
+            'event_gate_node = '
+            'ship_ugv_navigation.event_gate_node:main',
         ],
     },
 )
