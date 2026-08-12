@@ -146,7 +146,7 @@ Step 6은 독립적으로 완성·테스트할 수 있다.
 따라서 저장된 맵은 `slam_map` 좌표계이며, `map` 좌표계로 도는 Nav2·EKF와 어긋난다.
 RViz가 정상으로 보이는 것은 RViz가 TF를 실시간 적용하기 때문이고 파일엔 반영되지 않는다.
 
-**실측 확인 (2026-08-06, shipyard_map_v2).** `tf2_echo map slam_map` =
+**실측 확인 (2026-08-06, shipyard_map_JG_room_v2).** `tf2_echo map slam_map` =
 평행이동 0.94 m + **회전 138.19°**. 보정 없이 썼다면 사용 불가였다.
 
 **해결.** 맵 yaml `origin`의 3번째 값이 yaw이므로 이미지 재렌더링 없이 숫자만 고치면 된다.
@@ -177,7 +177,7 @@ v1(JG방)은 **어떤 반지름으로도 완주 불가**였다. 원인 분석 �
 **실제 벽·가구** 때문이었다(미탐사를 전부 빈 바닥으로 가정해도 결과 동일).
 → 매핑을 다시 하는 것으로는 해결되지 않고 바닥을 치워야 했다.
 
-폼롤러(⌀12.7 세움)로 중앙 물체를 바꾸고 재매핑한 `shipyard_map_v2`로 해결.
+폼롤러(⌀12.7 세움)로 중앙 물체를 바꾸고 재매핑한 `shipyard_map_JG_room_v2`로 해결.
 
 | 항목 | 값 |
 |---|---|
@@ -410,7 +410,7 @@ edge/ros2_ws/src/
 │   └── ship_ugv_gazebo.xacro         # ✅ 완료: <gazebo> 태그, diff_drive, 센서 플러그인
 └── ship_ugv_navigation/              # 신규 패키지 (ament_python)
     ├── config/nav2_params.yaml       # ★ 진짜 산출물
-    ├── maps/                         # ✅ 완료 (shipyard_map_v2 보정 완료)
+    ├── maps/                         # ✅ 완료 (shipyard_map_JG_room_v2 보정 완료)
     ├── worlds/demo_room.world        # ✅ 완료
     ├── scripts/                      # ✅ 완료 (매핑 후처리 3종 + 월드 생성기)
     ├── launch/
@@ -440,10 +440,109 @@ edge/ros2_ws/src/
 | 3 | `sim_bringup.launch.py` — Gazebo 기동 + 로봇 스폰 + TF 트리 | ✅ 완료 |
 | 4 | `nav2_params.yaml` + `navigate_no_spin.xml` — footprint·속도·코스트맵·planner·controller·복구행동 | ✅ 완료 (2026-08-11) |
 | 5 | `navigation.launch.py` + `space_*.yaml` + `nav.rviz` — Nav2 기동, 장소 프리셋 | ✅ 완료 (2026-08-11) |
-| **6** | **`patrol_mission_node.py`** — 원형 순찰 무한 순회 | ← 다음 |
-| **7** | **`event_gate_node.py`** — 이벤트 감지 시 정지 / 관제 확인 시 재개 | |
+| 6 | `patrol_mission_node.py` + 순찰 설정 자동 생성 — 원형 순찰 무한 순회 | ✅ 완료 (2026-08-12) |
+| **7** | **`event_gate_node.py`** — 이벤트 감지 시 정지 / 관제 확인 시 재개 | ← 다음 |
 | 8 | 실물 이식 + 튜닝 | |
 | **9** | **문서 최종 정리** — 아래 목록 갱신 | ★ 각 Step 종료 시마다 부분 수행 |
+
+#### Step 6 완료 기록 (2026-08-12) — 원형 순찰 + 순찰 설정 자동 생성
+
+**산출물**
+
+| 파일 | 내용 |
+|---|---|
+| `ship_ugv_navigation/patrol_mission_node.py` | 원형 순찰, 이벤트 정지/재개, 실패 처리 |
+| `config/patrol_demo_room.yaml` | **자동 생성** — demo_room 순찰 원 |
+| `config/patrol_shipyard_map_JG_room_v2.yaml` | **자동 생성** — 내 방 순찰 원 |
+| `scripts/check_patrol_space.py` | `--emit-patrol` 추가 (순찰 설정 파일 생성) |
+| `scripts/finalize_map.py` | 위 옵션을 붙여 호출 |
+| `launch/navigation.launch.py` | `patrol:=true` 인자 |
+
+**순찰 설정을 손으로 적지 않게 만들었다**
+
+예전 흐름은 `check_patrol_space.py` 가 출력한 center/radius 를 **사람이 보고
+파일에 옮겨 적는** 것이었다. 오타가 나면 로봇이 엉뚱한 원을 돌고, 파일 만드는
+것을 잊으면 노드 기본값으로 뜬다. 이제 스크립트가 직접 쓴다.
+
+```
+재매핑 -> finalize_map.py 한 줄 -> config/patrol_<맵이름>.yaml 완성
+navigation.launch.py 가 map 인자를 보고 그 파일을 자동 로드
+```
+
+맵 이름 하나가 **지도와 순찰 원을 같이** 정하므로 어긋날 수가 없다.
+파일이 없으면 기동 배너에 경고가 뜬다.
+
+**작업 중 잡은 문제 4개**
+
+| # | 문제 | 원인·조치 |
+|---|---|---|
+| 1 | 시작하자마자 목표가 전부 거부됨 | `server_is_ready()` 가 true 여도 `bt_navigator` 는 **activate 전이라 목표를 거부**한다. lifecycle 상태를 직접 물어 `ACTIVE` 일 때만 시작하도록 변경 |
+| 2 | 재시도가 0.2초 간격으로 즉시 → 1초에 소진 | Nav2 가 상황을 다시 판단할 틈이 없다. `retry_delay_s: 2.0` 추가 |
+| 3 | **로봇이 순찰 원 밖으로 밀려나 한 자리에서 굳음** | 아래 참고 |
+| 4 | 재동기화가 무한 루프 | 아래 참고 |
+
+**③ 목표가 등 뒤가 되는 문제 — 이번 Step 의 핵심**
+
+도달 판정 반경이 0.15 m 라 로봇은 원을 정확히 밟지 않고 매번 조금씩 어긋난 채
+통과한다. 그 오차가 한 바퀴 동안 누적되면 **원 바깥으로 0.3 m 까지** 밀려난다.
+그 상태에서 "다음 번호" 웨이포인트를 고집하면 **이미 지나친 지점으로 돌아가라**는
+목표가 되어 큰 방향 전환이 필요해진다. 그러면 제자리 회전 → 충돌 예측 → 목표
+실패 → 복구가 반복되며 로봇이 한 자리에서 굳는다.
+
+실측 당시: 로봇 위치가 중심에서 1.09 → 1.25 m 로 밀려났고, 바퀴는 8초에
+좌 +9.1 rad / 우 −1.6 rad 로 돌았지만 **참값 회전은 3분에 3도**였다.
+`/cmd_vel` 에 컨트롤러(velocity_smoother 경유)와 복구 행동이 번갈아 명령을
+넣어 서로 상쇄된 것이다.
+
+→ **현재 위치 기준 재동기화**를 넣었다.
+
+**④ 단, 무조건 앞쪽으로 덮으면 무한 루프가 된다**
+
+도달 판정 반경 때문에 Nav2 는 로봇이 지점에 **닿기 직전**(R 0.95 에서 약 5도 앞)에
+이미 "도달"로 처리한다. 그 상태에서 다음 번호로 넘어가면 재동기화가 "너는 아직
+그 지점 앞이다"라며 도로 되돌려, 같은 지점을 무한히 반복한다(실제로 발생).
+
+→ **진행 방향으로 잰 목표까지의 각도가 반 바퀴를 넘을 때만** = 목표가 사실상
+등 뒤일 때만 다시 잡도록 했다.
+
+**BasicNavigator 를 쓰지 않은 이유**
+
+문서에는 `nav2_simple_commander` 의 `BasicNavigator` 를 쓰라고 적었지만, 그것은
+자기 자신이 Node 이고 `isTaskComplete()` 안에서 자기 노드를 spin 한다. 그 사이
+우리 노드의 `/event/active` 구독이 처리되지 않아 **정지 명령이 늦게 먹는다.**
+이벤트 정지는 안전 기능이라 지연을 허용할 수 없어 `ActionClient` 로 직접 구현했다.
+
+**검증 결과 (2026-08-12)**
+
+| 항목 | 결과 |
+|---|---|
+| 순찰 | **2바퀴 완주**, 웨이포인트 25개 도달 |
+| 실패 처리 | 재시도 2회 전부 회복, 건너뜀 0 / BLOCKED 0 |
+| 이벤트 정지 | 마지막 비영 속도까지 **0.00초**, 밀린 거리 **2.3 cm** (감속 0.5 기준 이론값 1.7 cm) |
+| 정지 유지 | 8초간 1.1 cm (시뮬 잔류 드리프트뿐), 비영 명령 **0건** |
+| 재개 | 12초에 90.5 cm 이동, `RUNNING` 복귀 |
+| 자동 생성 대조 | demo_room N 12 (손으로 쓴 값과 일치) / JG_room_v2 **N 10** (손으로 넣었던 8을 자동 정정) |
+
+**맵 이름 규칙 정리 (같은 날 함께 처리)**
+
+`shipyard_map_<장소>_v<버전번호>` 로 통일했다. 버전만 있으면 어디를 찍은
+맵인지 알 수 없기 때문이다.
+
+- `shipyard_map_v2` → `shipyard_map_JG_room_v2` (정합·캘리브 기록, 순찰 설정 포함)
+- `shipyard_map_v1_JG_room` **삭제** — 완주 가능한 반지름이 하나도 없던 맵이다.
+  남겨두면 실수로 로드할 수 있다. git 히스토리에는 남아 있어 언제든 복구 가능.
+- 문서의 예시 표기 21곳을 `shipyard_map_<장소>_v<버전번호>` 자리표시자로 교체
+
+⚠️ 맵 이름을 바꿀 때는 **맵 yaml 안의 `image:` 필드**도 같이 고쳐야 한다.
+안 고치면 `map_saver` 형식상 옛 pgm 을 찾아 로드에 실패한다.
+
+**Step 7 로 넘기는 것**
+
+`patrol_mission_node` 는 `/event/active` 가 **어디서 왔는지 모른다.** true/false 만
+본다. Step 7 은 그 토픽을 발행하는 판정기만 만들면 되고, 순찰 쪽은 손댈 것이 없다.
+①~④ 검증(7-3절)은 Step 7 없이도 이미 가능한 상태다.
+
+---
 
 #### Step 5 완료 기록 (2026-08-11) — Nav2 기동 + 장소 프리셋
 
@@ -797,8 +896,8 @@ Step 6·7(순찰·이벤트 노드)이 완성되면 3부 명령어가 실제로 
 
 | 방향 | 대상 | 타입 | 내용 |
 |---|---|---|---|
-| 구독 | `/event/active` | `std_msgs/Bool` | true면 `cancelTask()`, false면 순찰 재개 |
-| 액션 | `navigate_to_pose` | Nav2 | `BasicNavigator.goToPose()` 로 호출 |
+| 구독 | `/event/active` | `std_msgs/Bool` | true면 목표 취소, false면 순찰 재개 |
+| 액션 | `navigate_to_pose` | Nav2 | `ActionClient` 로 직접 호출 (아래 참고) |
 | 발행 | `/cmd_vel` | `geometry_msgs/Twist` | 정지 시 0속도 (Nav2와 별개로 확실히 멈추기) |
 | 발행 | `/patrol/status` | `std_msgs/String` | 현재 상태·웨이포인트 번호 (디버깅/발표용) |
 
@@ -842,25 +941,54 @@ patrol_mission_node  ──goToPose()──>  Nav2 스택  ──/cmd_vel──>
    (운전자)                            (자동차)
 ```
 
-- 원 위의 웨이포인트 N개(12개 권장)를 순서대로 `goToPose()`
+- 원 위의 웨이포인트 N개를 순서대로 목표로 준다
 - 마지막까지 가면 처음으로 되돌아가 무한 순회
-- `/event/active` 를 구독해 `cancelTask()` / 재개
-- 구현: `nav2_simple_commander`의 `BasicNavigator`
-  (`goToPose` / `isTaskComplete` / `cancelTask`)
+- `/event/active` 를 구독해 목표 취소 / 재개
 
-주요 파라미터 (검사 스크립트가 출력하는 값을 그대로 사용):
+**구현: `BasicNavigator` 대신 `ActionClient` 를 직접 썼다 (Step 6 에서 변경).**
+~~`nav2_simple_commander` 의 `BasicNavigator`~~ 는 **자기 자신이 Node** 이고
+`isTaskComplete()` 안에서 자기 노드를 spin 한다. 그 사이 우리 노드의
+`/event/active` 구독이 처리되지 않아 **정지 명령이 늦게 먹는다.**
+이벤트 정지는 안전 기능이라 지연을 허용할 수 없어, 노드 하나 +
+`ActionClient` + 타이머 상태 기계로 직접 구현했다. 동작은 동일하고
+코드가 50줄쯤 늘어날 뿐이다.
+
+주요 파라미터 — **손으로 적지 않는다. 자동 생성된다.**
+`finalize_map.py` 가 `check_patrol_space.py --emit-patrol` 로
+`config/patrol_<맵이름>.yaml` 을 직접 만들고, `navigation.launch.py` 가
+`map` 인자를 보고 그 파일을 자동으로 로드한다. 아래는 그 파일의 내용 예시다.
 ```yaml
-center_x: 3.457      # check_patrol_space.py 출력
+# --- patrol_<맵이름>.yaml : 자동 생성 ---
+center_x: 3.457      # 맵 픽셀 검사 결과
 center_y: 0.543
 radius:   0.30
-num_waypoints: 12    # 12개면 경로가 중심에서 0.97R 이상 떨어져 배를 안 스침
+num_waypoints: 10    # 아래 규칙으로 자동 계산
 direction: cw        # 시계방향 = 카메라(오른쪽 90도)가 배를 향함
 
+# --- 노드 기본값 : 맵과 무관하므로 파일에 안 쓴다 ---
 goal_retry_count: 2          # 목표 실패 시 재시도 횟수
-on_goal_fail: skip           # skip | wait — 실패 시 다음 웨이포인트로 건너뜀
+retry_delay_s: 2.0           # 재시도 전 대기 (즉시 재시도하면 1초에 소진된다)
 max_consecutive_fails: 4     # 연속 실패가 이만큼이면 건너뛰기를 멈추고 대기
-wait_retry_interval_s: 5.0   # 대기 상태에서 이 간격으로 재시도 (길이 열렸는지 확인)
+wait_retry_interval_s: 5.0   # 대기 상태에서 이 간격으로 재시도
+resync_from_pose: true       # 목표가 등 뒤면 앞쪽 지점으로 다시 잡는다
 ```
+
+**웨이포인트 개수 계산 규칙** (`check_patrol_space.py` 가 자동 적용):
+
+```
+① 방향 변화 360/N < 40도          (rotate_to_heading_min_angle)
+② 지점 간격 2R·sin(pi/N) >= 도달반경 0.15 m 의 1.5배
+둘 다 만족 못 하면 ① 우선
+```
+
+| | 위반하면 | 성격 |
+|---|---|---|
+| ① | 지점마다 제자리 회전이 필요 → 좁은 곳에서 **아예 못 감** | 치명적 |
+| ② | 한 지점에 선 채로 다음 지점도 "도달" 처리 → 궤적이 헐거워짐 | 품질 저하 |
+
+실제 적용 결과: `demo_room`(R 0.95) → N 12 / `JG_room_v2`(R 0.30) → **N 10**.
+후자는 두 제약을 동시에 만족할 수 없어 ①을 택했고, 스크립트가 그 사실을
+파일 주석과 콘솔에 경고로 남긴다.
 
 **대기 상태에서 빠져나오는 방법 = 주기적 재시도.** 막혀서 대기로 전환된 뒤에도
 `wait_retry_interval_s`마다 같은 목표를 다시 시도한다. 성공하면 자동으로 순찰
@@ -912,9 +1040,15 @@ controller가 경로를 수정한다. 우리가 코드를 짤 부분이 아니�
 발표 중 로봇이 한 지점에서 굳어있지 않는다.
 
 **관련 nav2_params 설정:**
-- **복구 행동 `spin` 비활성화** — 막히면 기본적으로 제자리 회전을 시도하는데
-  이 공간에서는 벽을 긁는다. `backup`도 거리를 축소한다.
-- **RPP 컨트롤러의 장애물 근접 감속 활성화** — 사람 근처에서 부드럽게 느려지도록.
+- **복구 행동 `spin`** — `space:=narrow` 일 때 쓰지 않는다. 제자리 회전은 옆으로
+  0.259 m 를 더 요구하는데 이 공간에는 없다. `backup` 은 거리를 0.30 → 0.15 로
+  줄였다(실물은 후방을 못 본다). Step 5 에서 `space` 프리셋으로 자동화됐다.
+- **RPP 의 장애물 근접 감속(`use_cost_regulated_linear_velocity_scaling`)은 껐다.**
+  ~~사람 근처에서 부드럽게 느려지도록 켠다~~ 는 처음 계획이었으나, 좁은 실내에서는
+  팽창 영역이 바닥 거의 전체를 덮어 **상시 감속**이 걸린다. 실측 결과 주행 중 평균
+  속도가 0.050 m/s (설정의 1/3)까지 떨어졌고, 끄니 0.116~0.130 으로 회복됐다.
+  최고 속도 0.15 자체가 이미 모터 정격의 19 % 인 서행이라 더 줄일 이유가 없다.
+  곡률 기반 감속은 그대로 켜둔다(성격이 다르다).
 
 ⚠️ **후방 180도는 감지되지 않는다.**
 [laser_filter.yaml](../ros2_ws/src/ship_ugv_localization/config/laser_filter.yaml)이
@@ -1115,9 +1249,16 @@ ROS 2 Humble / Gazebo Classic (`gazebo_ros_pkgs`) / nav2 전체 / `nav2_simple_c
 # 터미널 1 — Gazebo + 로봇 + TF 트리
 ros2 launch ship_ugv_navigation sim_bringup.launch.py
 
-# 터미널 2 — Nav2 + RViz. space 로 장소 프리셋을 고른다
+# 터미널 2 — Nav2 + 순찰 + RViz. space 로 장소 프리셋을 고른다
 ros2 launch ship_ugv_navigation navigation.launch.py \
-    use_sim_time:=true space:=wide map:=demo_room use_rviz:=true
+    use_sim_time:=true space:=wide map:=demo_room patrol:=true use_rviz:=true
+
+# 터미널 3 — 순찰 상태 보기
+ros2 topic echo /patrol/status
+
+# 터미널 4 — 이벤트 정지/재개 시험 (Step 7 없이도 가능)
+ros2 topic pub --once /event/active std_msgs/msg/Bool "{data: true}"    # 정지
+ros2 topic pub --once /event/active std_msgs/msg/Bool "{data: false}"   # 재개
 
 # 터미널 3 — 키보드 주행 (Nav2 없이 물리 확인만 할 때)
 ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p use_sim_time:=true
@@ -1170,8 +1311,12 @@ ros2 launch ship_ugv_localization mapping.launch.py
 # ── 터미널 2 : 매핑을 끈 뒤에 Nav2를 띄운다 ────────────────────────
 #   map 은 이름만. space 는 시연장 넓이에 맞춰 narrow / wide
 ros2 launch ship_ugv_navigation navigation.launch.py \
-    space:=wide map:=shipyard_map_v3
+    space:=wide map:=shipyard_map_<장소>_v<버전번호> patrol:=true
 ```
+
+`patrol:=true` 를 주면 순찰 노드가 함께 뜬다. 순찰 원(중심·반지름·웨이포인트
+개수)은 `config/patrol_<맵이름>.yaml` 에서 자동으로 읽으므로 따로 줄 값이 없다.
+그 파일은 `finalize_map.py` 가 만들어 둔 것이다.
 
 **실물에서 달라지는 것은 두 가지뿐이고 둘 다 자동이다.**
 
@@ -1250,12 +1395,17 @@ Nav2가 필요로 하는 것을 전부 이 launch가 제공하기 때문이다.
 ### 10-4. 시뮬·실물 공용 (그대로 이식)
 
 `nav2_params.yaml` · `space_narrow.yaml` · `space_wide.yaml` ·
-`navigate_no_spin.xml` · `navigate_with_spin.xml` · `navigation.launch.py` ·
-`nav.rviz` · `patrol_mission_node.py` · `event_gate_node.py` · `ekf_local` ·
-`ship_ugv_core.urdf.xacro`
+`patrol_<맵이름>.yaml` · `navigate_no_spin.xml` · `navigate_with_spin.xml` ·
+`navigation.launch.py` · `nav.rviz` · `patrol_mission_node.py` ·
+`event_gate_node.py` · `ekf_local` · `ship_ugv_core.urdf.xacro`
 
 **설정 파일들은 실물에서 뺄 것도 더할 것도 없다.** 바뀌는 것은 2개뿐이며
 둘 다 `navigation.launch.py`가 자동으로 처리한다.
+
+⚠️ **새 맵을 찍으면 그 맵의 `patrol_<맵이름>.yaml` 이 필요하다.**
+`finalize_map.py` 가 자동으로 만들어 주므로 따로 할 일은 없다. 다만 그 파일이
+없는 맵으로 `patrol:=true` 를 주면 노드 기본값(중심 0,0 / R 0.95)으로 뜨므로
+기동 배너의 경고를 확인할 것.
 
 | 값 | 시뮬 | 실물 |
 |---|---|---|

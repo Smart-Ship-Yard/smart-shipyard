@@ -11,11 +11,11 @@ navigation.launch.py — Nav2 자율주행 스택 기동 (Step 5)
 
     # 내 방 맵으로 시뮬
     ros2 launch ship_ugv_navigation navigation.launch.py \
-        use_sim_time:=true space:=narrow map:=shipyard_map_v2 use_rviz:=true
+        use_sim_time:=true space:=narrow map:=shipyard_map_JG_room_v2 use_rviz:=true
 
     # 실물 (젯슨) — localization.launch.py 를 켜둔 상태에서
     ros2 launch ship_ugv_navigation navigation.launch.py \
-        space:=wide map:=shipyard_map_v2
+        space:=wide map:=shipyard_map_JG_room_v2
 
 ★ space 인자가 무엇을 바꾸나 — 4가지가 한 번에 바뀐다
 ------------------------------------------------------
@@ -38,7 +38,7 @@ navigation.launch.py — Nav2 자율주행 스택 기동 (Step 5)
     map 인자에는 **이름만** 넣는다 (확장자·경로 불필요).
 
         map:=demo_room         -> <pkg share>/maps/demo_room.yaml
-        map:=shipyard_map_v2   -> <pkg share>/maps/shipyard_map_v2.yaml
+        map:=shipyard_map_JG_room_v2   -> <pkg share>/maps/shipyard_map_JG_room_v2.yaml
 
     패키지 밖의 맵을 쓰려면 .yaml 로 끝나는 전체 경로를 주면 된다.
 
@@ -254,6 +254,29 @@ def launch_setup(context, *args, **kwargs):
                           'node_names': LIFECYCLE_NODES}], **common),
     ]
 
+    # ---- 순찰 노드 (Step 6) ---------------------------------------------
+    # 순찰 원의 중심·반지름은 **맵마다 다르다.** 그래서 맵 이름에 묶어
+    # config/patrol_<맵이름>.yaml 을 자동으로 찾는다. map 인자 하나가
+    # 맵과 순찰 원을 같이 정하므로 따로 지정할 일이 없다.
+    if LaunchConfiguration('patrol').perform(context).lower() in ('true', '1', 'yes'):
+        map_name = os.path.splitext(os.path.basename(map_yaml))[0]
+        patrol_cfg = os.path.join(pkg_share, 'config', f'patrol_{map_name}.yaml')
+        if os.path.isfile(patrol_cfg):
+            patrol_params = [patrol_cfg, {'use_sim_time': is_sim}]
+            banner_patrol = f'patrol_{map_name}.yaml'
+        else:
+            # 없는 맵이면 노드 기본값으로 뜬다. 엉뚱한 원을 돌게 되므로 크게 알린다.
+            problems.append(
+                f'{os.path.basename(patrol_cfg)} 가 없다. 순찰 원을 모르는 상태로 뜬다. '
+                f'check_patrol_space.py 로 중심·반지름을 구해 파일을 만들 것')
+            patrol_params = [{'use_sim_time': is_sim}]
+            banner_patrol = '(없음 — 노드 기본값)'
+        nodes.append(Node(
+            package='ship_ugv_navigation', executable='patrol_mission_node',
+            name='patrol_mission_node', parameters=patrol_params, **common))
+    else:
+        banner_patrol = '사용 안 함 (patrol:=true 로 켠다)'
+
     if LaunchConfiguration('use_rviz').perform(context).lower() in ('true', '1', 'yes'):
         nodes.append(Node(
             package='rviz2', executable='rviz2', name='rviz2_nav',
@@ -269,6 +292,7 @@ def launch_setup(context, *args, **kwargs):
         LogInfo(msg=f'  map          : {map_yaml}'),
         LogInfo(msg=f'  덮어쓰기     : {preset["overlay"]}'),
         LogInfo(msg=f'  행동트리     : {preset["bt"]}'),
+        LogInfo(msg=f'  순찰         : {banner_patrol}'),
         LogInfo(msg='  cmd_vel 경로 : controller -> /cmd_vel_nav -> smoother -> /cmd_vel'),
         LogInfo(msg='─' * 60),
     ]
@@ -290,7 +314,7 @@ def generate_launch_description():
             description='시뮬이면 true. 실물은 false (기본)'),
         DeclareLaunchArgument(
             'map', default_value='demo_room',
-            description='맵 이름 (패키지 maps/ 안). 실물은 shipyard_map_v2. '
+            description='맵 이름 (패키지 maps/ 안). 실물은 shipyard_map_JG_room_v2. '
                         '또는 .yaml 로 끝나는 전체 경로'),
         DeclareLaunchArgument(
             'scan_topic', default_value='',
@@ -302,6 +326,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'autostart', default_value='true',
             description='lifecycle 노드를 자동으로 activate 할지'),
+        DeclareLaunchArgument(
+            'patrol', default_value='false',
+            description='순찰 노드 동시 실행. 원의 중심·반지름은 map 이름에 묶인 '
+                        'config/patrol_<맵이름>.yaml 에서 자동으로 읽는다'),
         DeclareLaunchArgument(
             'use_rviz', default_value='false',
             description='Nav2 전용 RViz(nav.rviz) 동시 실행'),

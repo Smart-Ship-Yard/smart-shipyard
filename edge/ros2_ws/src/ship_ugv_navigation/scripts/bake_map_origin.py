@@ -34,11 +34,11 @@ slam_toolbox는 이 프로젝트 규칙상 map_frame을 `slam_map`으로 쓴다.
 사용법
 ------
   # align 결과 json에서 자동으로 읽기 (권장)
-  python3 bake_map_origin.py maps/shipyard_map_v3.yaml \
+  python3 bake_map_origin.py maps/shipyard_map_<장소>_v<버전번호>.yaml \
       --align maps/calibration_records/align_001.json
 
   # tf2_echo map slam_map 값을 직접 넣기
-  python3 bake_map_origin.py maps/shipyard_map_v3.yaml \
+  python3 bake_map_origin.py maps/shipyard_map_<장소>_v<버전번호>.yaml \
       --tf 0.9446 0.1026 2.4119
 
   # 계산만 해보고 파일은 안 고치기

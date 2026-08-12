@@ -202,7 +202,132 @@ def check_circle(m, cx, cy, r, step_deg=2):
 
 
 # ======================================================================
-def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN):
+#  웨이포인트 개수 계산
+# ======================================================================
+#  nav2_params.yaml 의 값과 맞물려 있다. 그쪽을 바꾸면 여기도 바꿔야 한다.
+XY_GOAL_TOLERANCE = 0.15    # controller_server > general_goal_checker
+ROTATE_MIN_ANGLE_DEG = 40.0  # FollowPath > rotate_to_heading_min_angle (0.7 rad)
+SPACING_FACTOR = 1.5         # 지점 간격이 도달반경의 몇 배 이상이어야 하는가
+PREFERRED_N = 12
+
+
+def pick_num_waypoints(radius):
+    """순찰 반지름에 맞는 웨이포인트 개수를 고른다.
+
+    제약 두 가지
+      ① 방향 변화 360/N 이 rotate_to_heading_min_angle(40도) 미만이어야 한다.
+         넘으면 지점마다 제자리 회전이 필요해진다. 우리 로봇은 회전에
+         옆으로 0.259 m 를 더 요구하므로 좁은 곳에서는 **물리적으로 불가능**하다.
+      ② 지점 간격 2R·sin(pi/N) 이 도달 판정 반경의 1.5배 이상이어야 한다.
+         간격이 판정 반경만 하면 한 지점에 서 있는 채로 다음 지점도
+         "도달"로 처리되어 순찰이 제자리에서 헛돈다.
+
+    둘 다 만족하는 N 이 없으면 **①을 우선**한다.
+      ① 위반 = 회전이 필요해짐   -> 좁은 곳에서 아예 못 감 (치명적)
+      ② 위반 = 원 궤적이 헐거워짐 -> 품질 저하일 뿐 (감수 가능)
+
+    반환: (N, 경고문자열 또는 None)
+    """
+    n_min = math.ceil(360.0 / ROTATE_MIN_ANGLE_DEG) + 1      # 40도 "미만"이라 +1
+    def spacing(n):
+        return 2.0 * radius * math.sin(math.pi / n)
+
+    both = [n for n in range(n_min, 25)
+            if spacing(n) >= XY_GOAL_TOLERANCE * SPACING_FACTOR]
+    if both:
+        n = PREFERRED_N if PREFERRED_N in both else max(both)
+        return n, None
+
+    # ① 만 만족하는 것 중 간격이 가장 넓은 것 = n_min
+    n = n_min
+    ratio = spacing(n) / XY_GOAL_TOLERANCE
+    warn = (f'반지름 {radius:.2f} m 가 작아 두 제약을 동시에 만족할 수 없다. '
+            f'회전을 피하는 쪽(N={n}, 방향변화 {360.0/n:.0f}도)을 택했고 '
+            f'지점 간격은 {spacing(n):.3f} m 로 도달반경의 {ratio:.2f}배뿐이다. '
+            f'순찰은 돌지만 궤적이 헐거워진다. 대상 주변을 더 치우고 재매핑해 '
+            f'반지름을 0.45 m 이상으로 키우는 것이 근본 해결이다.')
+    return n, warn
+
+
+def emit_patrol_yaml(path, map_name, cx, cy, radius, margin_val, tight):
+    """patrol_<맵이름>.yaml 을 만든다. 손으로 옮겨 적는 단계를 없애기 위함."""
+    n, warn = pick_num_waypoints(radius)
+    spacing = 2.0 * radius * math.sin(math.pi / n)
+    lines = [
+        '# ' + '=' * 74,
+        f'#  patrol_{map_name}.yaml — {map_name} 맵의 순찰 원',
+        '# ' + '=' * 74,
+        '#  ⚠️ 이 파일은 check_patrol_space.py 가 자동으로 만든다. 손으로 고치지 말 것.',
+        '#     맵을 다시 만들면 finalize_map.py 가 이 파일도 다시 쓴다.',
+        '#',
+        '#  navigation.launch.py 가 map 인자를 보고 patrol_<맵이름>.yaml 을 찾아',
+        '#  자동으로 로드한다. 따로 지정할 일이 없다.',
+        '#',
+        f'#      ros2 launch ship_ugv_navigation navigation.launch.py \\',
+        f'#          map:={map_name} patrol:=true ...',
+        '#',
+        '#  ── 이 값들이 나온 근거 ────────────────────────────────────────────',
+        '#  중심·반지름: 실제 footprint 를 원 위에서 한 바퀴 쓸어보며 통과 가능한',
+        '#               반지름을 찾은 결과. 추측이 아니라 맵 픽셀 검사 결과다.',
+        f'#      최소 여유 {margin_val:.3f} m',
+        '#',
+        '#  웨이포인트 개수: 아래 두 제약으로 계산',
+        f'#      ① 방향 변화 360/N < {ROTATE_MIN_ANGLE_DEG:.0f}도  '
+        f'(넘으면 지점마다 제자리 회전이 필요)',
+        f'#      ② 지점 간격 >= 도달반경 {XY_GOAL_TOLERANCE} m 의 {SPACING_FACTOR}배',
+        f'#      -> N={n}: 방향 변화 {360.0/n:.0f}도, 지점 간격 {spacing:.3f} m '
+        f'(도달반경의 {spacing/XY_GOAL_TOLERANCE:.2f}배)',
+        '#',
+    ]
+    if warn:
+        lines += ['#  ⚠️ 경고'] + ['#     ' + s for s in _wrap(warn, 70)] + ['#']
+    if tight:
+        lines += [
+            '#  🟡 이 맵은 여유가 0.1 m 미만이다.',
+            '#     사람이 막아서면 우회할 공간이 없어 대기(BLOCKED)로 들어간다.',
+            '#     그것이 올바른 동작이다 — 비집고 가는 편이 위험하다.',
+            '#     space:=narrow 를 반드시 함께 준다 (inflation 0.25 로는 경로가 안 나온다).',
+            '#',
+        ]
+    lines += [
+        '# ' + '=' * 74,
+        '',
+        'patrol_mission_node:',
+        '  ros__parameters:',
+        f'    center_x: {cx:.3f}',
+        f'    center_y: {cy:.3f}',
+        f'    radius: {radius:.2f}',
+        f'    num_waypoints: {n}',
+        '',
+        '    # 시계방향 = 로봇 오른쪽 90도에 달린 카메라가 중앙 대상을 향한다',
+        '    direction: cw',
+        '',
+    ]
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write('\n'.join(lines))
+    print(f'   📝 순찰 설정 생성: {path}')
+    print(f'      center ({cx:.3f}, {cy:.3f})  radius {radius:.2f}  '
+          f'num_waypoints {n}')
+    if warn:
+        print(f'      ⚠️ {warn}')
+    return n
+
+
+def _wrap(text, width):
+    out, cur = [], ''
+    for word in text.split():
+        if len(cur) + len(word) + 1 > width:
+            out.append(cur); cur = word
+        else:
+            cur = (cur + ' ' + word).strip()
+    if cur:
+        out.append(cur)
+    return out
+
+
+# ======================================================================
+def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None):
     m = load_map(yaml_path)
     res, w, h = m['res'], m['w'], m['h']
     n_free = sum(sum(row) for row in m['free'])
@@ -257,26 +382,37 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN):
             print(f'  {r:.2f}m |  --  |  {worst:.3f}m | {bad}개 각도에서 충돌')
         r += 0.05
 
-    def report(cands, radius_label):
+    def report(cands, radius_label, tight):
         best = max(cands, key=lambda t: t[1])
         lo, hi = cands[0][0], cands[-1][0]
         print(f'   {radius_label} {lo:.2f} ~ {hi:.2f} m')
         print(f'   권장: {best[0]:.2f} m (여유 {best[1]:.3f} m)')
         print()
-        print('   patrol_mission_node 파라미터에 넣을 값:')
-        print(f'     center_x: {cx:.3f}')
-        print(f'     center_y: {cy:.3f}')
-        print(f'     radius:   {best[0]:.2f}')
+        if emit_patrol:
+            map_name = os.path.splitext(os.path.basename(yaml_path))[0]
+            emit_patrol_yaml(emit_patrol, map_name, cx, cy, best[0], best[1], tight)
+        else:
+            n, warn = pick_num_waypoints(best[0])
+            print('   patrol_mission_node 파라미터에 넣을 값:')
+            print(f'     center_x: {cx:.3f}')
+            print(f'     center_y: {cy:.3f}')
+            print(f'     radius:   {best[0]:.2f}')
+            print(f'     num_waypoints: {n}')
+            if warn:
+                print(f'   ⚠️ {warn}')
+            print()
+            print('   (--emit-patrol <경로> 를 주면 이 값으로 파일을 만들어 준다.')
+            print('    finalize_map.py 를 쓰면 자동으로 붙는다)')
 
     print()
     if good:
         print('✅ 순찰 가능 (여유 충분)')
-        report(good, '반지름')
+        report(good, '반지름', tight=False)
         return 0
 
     if passable:
         print(f'🟡 순찰 가능하지만 여유가 {margin} m 미만이다 — 사용은 가능')
-        report(passable, '완주 가능 반지름')
+        report(passable, '완주 가능 반지름', tight=True)
         print()
         print('   좁아도 되는 이유: Nav2 로컬 코스트맵이 라이다로 실시간 회피하므로')
         print('   UWB 위치 오차와 무관하게 벽에 부딪히지 않는다.')
@@ -301,6 +437,9 @@ def main():
                     help='중앙 물체 크기(m). 맵 없이 필요 공터만 계산')
     ap.add_argument('--margin', type=float, default=DEFAULT_MARGIN,
                     help=f'안전여유 m (기본 {DEFAULT_MARGIN})')
+    ap.add_argument('--emit-patrol', metavar='PATH',
+                    help='순찰 가능하면 이 경로에 patrol_<맵이름>.yaml 을 만든다. '
+                         '순찰 불가 맵이면 만들지 않는다')
     a = ap.parse_args()
 
     if a.obstacle:
@@ -308,7 +447,7 @@ def main():
         return 0
     if a.map:
         # 종료 코드: 0 = 여유 충분, 2 = 완주되나 여유 부족(사용 가능), 1 = 순찰 불가
-        return analyze_map(a.map, a.center, a.margin)
+        return analyze_map(a.map, a.center, a.margin, a.emit_patrol)
     ap.print_help()
     return 3
 

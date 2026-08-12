@@ -5,7 +5,7 @@ finalize_map.py
 매핑이 끝난 뒤 실행하는 **마무리 명령 하나**.
 맵을 저장한 직후 이것만 돌리면 Nav2에 바로 쓸 수 있는 상태가 된다.
 
-    python3 scripts/finalize_map.py shipyard_map_v3
+    python3 scripts/finalize_map.py shipyard_map_<장소>_v<버전번호>
 
 하는 일 (4가지를 순서대로)
 --------------------------
@@ -67,7 +67,7 @@ def pick_align(align_dir, pgm_mtime):
         14:05  map_v3.pgm 저장
         14:10  align_002 생성 (B방)
         14:15  map_v4.pgm 저장
-        14:20  finalize_map.py shipyard_map_v3
+        14:20  finalize_map.py shipyard_map_<장소>_v<버전번호>
     이때 "최신"은 align_002(B방)이지만 v3에 필요한 것은 align_001(A방)이다.
     시간 차이가 5분뿐이라 차이 기반 검사로는 절대 잡히지 않는다.
     맵보다 나중에 만들어진 정합 기록은 그 맵의 것일 수 없다는 순서 규칙으로 판별한다.
@@ -97,7 +97,7 @@ def main():
     ap = argparse.ArgumentParser(
         description='매핑 후 마무리: 기록 보존 + origin 보정 + 순찰 검사')
     ap.add_argument('map_name',
-                    help='맵 이름 (확장자 없이). 예: shipyard_map_v3')
+                    help='맵 이름 (확장자 없이). 예: shipyard_map_JG_room_v2, +) 버전번호는 같은 장소에서 여러 번 맵핑했을 때 맵핑한 순서를 기입하면 됨')
     ap.add_argument('--maps-dir', default=os.path.join(PKG_ROOT, 'maps'))
     ap.add_argument('--align-dir', default='/tmp/slam_map_alignment_results')
     ap.add_argument('--align-file',
@@ -229,23 +229,33 @@ def main():
         print('\n[4/4] 순찰 검사 생략 (--skip-check)')
         return 0
 
-    step(4, '순찰 가능 여부 검사')
+    step(4, '순찰 가능 여부 검사 + 순찰 설정 생성')
+    # ★ --emit-patrol 을 주면 순찰 원(중심·반지름·웨이포인트 개수)을 계산해
+    #   config/patrol_<맵이름>.yaml 을 직접 만든다. 사람이 출력값을 보고
+    #   손으로 옮겨 적는 단계를 없애기 위함이다(오타·누락 방지).
+    #   순찰 불가 맵이면 파일을 만들지 않는다.
+    patrol_out = os.path.join(PKG_ROOT, 'config', f'patrol_{a.name}.yaml')
     r = subprocess.run(
         [sys.executable, os.path.join(SCRIPTS, 'check_patrol_space.py'),
-         '--map', yaml_path])
+         '--map', yaml_path, '--emit-patrol', patrol_out])
 
     print()
     print('=' * 60)
     if r.returncode == 0:
         print('  ✅ 완료 — 이 맵으로 Nav2를 돌릴 수 있다')
         print()
-        print('  위에 출력된 center_x / center_y / radius 를')
-        print('  순찰 노드 파라미터에 넣을 것.')
+        print(f'  순찰 설정이 자동으로 만들어졌다: config/patrol_{a.name}.yaml')
+        print('  손으로 값을 옮겨 적을 필요 없다. 실행할 때 map 이름만 주면 된다:')
+        print(f'    ros2 launch ship_ugv_navigation navigation.launch.py \\')
+        print(f'        map:={a.name} patrol:=true space:=wide')
     elif r.returncode == 2:
         print('  🟡 완료 — 사용 가능하지만 여유가 빠듯하다')
         print()
-        print('  위에 출력된 center_x / center_y / radius 를')
-        print('  순찰 노드 파라미터에 넣을 것.')
+        print(f'  순찰 설정이 자동으로 만들어졌다: config/patrol_{a.name}.yaml')
+        print('  실행할 때 **space:=narrow** 를 반드시 함께 줄 것:')
+        print(f'    ros2 launch ship_ugv_navigation navigation.launch.py \\')
+        print(f'        map:={a.name} patrol:=true space:=narrow')
+        print()
         print('  더 넉넉하게 하려면 대상 주변을 더 치우고 재매핑.')
     else:
         print('  ❌ 맵은 만들어졌지만 순찰 경로가 안 나온다')
