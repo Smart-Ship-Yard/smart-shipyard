@@ -283,7 +283,7 @@ PR #14에 있다. **머지 전에는 실물에서 Nav2가 로봇을 움직일 �
 |---|---|
 | `/cmd_vel`에 0 덮어쓰기 | ❌ Nav2가 "진행 없음"으로 판단 → **복구 행동(제자리 회전/후진) 발동.** 좁은 방에서 위험 |
 | lifecycle deactivate | ❌ 과함, 재개가 느림 |
-| **`cancelTask()` + 0속도 발행** | ✅ 채택. `nav2_simple_commander` 표준 방법 |
+| **목표 취소 + 0속도 발행** | ✅ 채택. Nav2 가 "임무 종료"로 이해해 조용히 멈춘다 |
 
 **기존 3중 안전장치 활용:** `wheel_odom_bridge` cmd_vel 0.5초 타임아웃,
 아두이노 펌웨어 500ms 워치독 → 순찰 노드가 죽어도 0.5초 안에 정지.
@@ -441,9 +441,115 @@ edge/ros2_ws/src/
 | 4 | `nav2_params.yaml` + `navigate_no_spin.xml` — footprint·속도·코스트맵·planner·controller·복구행동 | ✅ 완료 (2026-08-11) |
 | 5 | `navigation.launch.py` + `space_*.yaml` + `nav.rviz` — Nav2 기동, 장소 프리셋 | ✅ 완료 (2026-08-11) |
 | 6 | `patrol_mission_node.py` + 순찰 설정 자동 생성 — 원형 순찰 무한 순회 | ✅ 완료 (2026-08-12) |
-| **7** | **`event_gate_node.py`** — 이벤트 감지 시 정지 / 관제 확인 시 재개 | ← 다음 |
-| 8 | 실물 이식 + 튜닝 | |
+| 7 | `event_gate_node.py` — 이벤트 감지 시 정지 / 관제 확인 시 재개 | ✅ 완료 (2026-08-12) |
+| **8** | **실물 이식 + 튜닝** | ← 다음 |
 | **9** | **문서 최종 정리** — 아래 목록 갱신 | ★ 각 Step 종료 시마다 부분 수행 |
+
+#### Step 7 완료 기록 (2026-08-12) — 이벤트 정지/재개 판정
+
+**산출물**
+
+| 파일 | 내용 |
+|---|---|
+| `ship_ugv_navigation/event_gate_node.py` | 입력 3개 -> `/event/active` 하나 |
+| `launch/navigation.launch.py` | `events` 인자 (비우면 `patrol` 을 따라감) |
+| `backend/tools/fake_send_event_ack.py` | 프론트 "확인" 버튼 대역 (검증용) |
+
+**이 노드는 로봇을 직접 멈추지 않는다**
+
+"지금 멈춰야 하나"만 판단해 `/event/active` 를 발행한다. 실제로 멈추는 것은
+`patrol_mission_node` 다. 그래서 순찰 노드는 신호가 **어디서 왔는지 모르고**
+true/false 만 본다. Step 6 을 Step 7 없이 완성할 수 있었던 이유다.
+
+**실제로 멈추는 코드 (patrol_mission_node 쪽)**
+
+```python
+def _cancel_goal(self):
+    self.goal_handle.cancel_goal_async()   # ① Nav2 목표 취소
+    self._stop_robot()                     # ② 0속도 직접 발행
+```
+
+①이 본질이다. 목표를 취소해야 Nav2 가 "임무가 끝났다"로 이해하고 조용히 있는다.
+`/cmd_vel` 에 0만 덮어쓰면 Nav2 는 "진행이 없다"로 판단해 **복구 행동(제자리
+회전·후진)을 발동**한다. 좁은 방에서는 위험하다.
+②는 취소가 전달되는 사이 velocity_smoother 에 남은 명령이 나갈 수 있어 두는
+안전장치다. 정지 중에는 10 Hz 로 계속 0을 쏜다.
+
+**실제 스펙을 코드에서 확인하고 맞췄다 (추측 안 함)**
+
+`/event_detection/uvd` 형식:
+```json
+{"u":.., "v":.., "depth":.., "depth_xyz":[X,Y,Z],
+ "class_id":"이름", "confidence":..}
+```
+- `class_id` 인데 값은 숫자가 아니라 **클래스 이름 문자열**이다
+  (`yolo_depth_publisher` 가 `model.names[cls]` 를 그대로 넣는다)
+- 발행기가 `reported_tids` 로 **track_id 중복을 이미 제거**하므로
+  **새 객체당 한 번**만 온다. 연속 스트림이 아니다
+
+**히스테리시스를 넣지 않은 이유**
+
+처음에는 "감지가 깜빡이면 멈췄다 갔다 하니 히스테리시스가 필요하다"고 판단했으나
+**틀렸다.** 위와 같이 객체당 1회만 오므로 뗄 떨림이 없다. 대신 **래치**가 맞다 —
+한 번 걸리면 ack 까지 true 를 유지한다. 반복 수신이 생겨도 이미 true 라 무해하다.
+
+**ship_defect 는 정지 대상에서 제외**
+
+모델 클래스 4개 중 `ship_defect` 는 사람 안전과 무관하고 순찰 중 계속 나올 수
+있어 멈추면 순찰이 진행되지 않는다. `trigger_classes` 에 없으면 무시하는
+구조라, 나중에 모델에서 이 클래스를 빼더라도 노드는 고칠 것이 없다.
+
+**launch 인자 설계**
+
+`events` 를 비워두면 `patrol` 값을 따라간다. 순찰을 켜면 이벤트 정지도 함께
+켜지는 것이 시연에서 원하는 동작이고, 튜닝 중에만 `events:=false` 로 끈다.
+**시연에서 기억할 인자가 하나로 유지된다.**
+
+**검증 — 7-3절 ①~④ 전 구간 + 실제 서버 경로**
+
+| 시험 | 결과 |
+|---|---|
+| `ship_defect` 감지 | 계속 주행 (`정지 대상 아님` 로그) |
+| `fire` 감지 | 즉시 정지, 이동 0.7 cm |
+| 감지 끊긴 뒤 8초 | 정지 유지 (1.1 cm), **자동 재개 안 함** |
+| `/event/ack` (수동 폴백) | 재개, 6초에 59.9 cm |
+| `/server/inbound` 의 `event_ack` | 재개, 6초에 35.8 cm |
+| `stream_boost`·깨진 JSON | 무시, 영향 없음 |
+| **백엔드 경유 전체 경로** | fake_send_event_ack -> 백엔드 -> websocket_client -> event_gate -> 재개. 로봇 10초에 18.1 cm 이동 확인 |
+
+**작업 중 알게 된 것 — `websocket_client` 는 재연결 루프가 있다**
+
+노트북에서 시험용으로 띄운 `websocket_client` 를 안 끄면, 백엔드를 다시 띄우는
+순간 **알아서 다시 접속한다.** 띄운 적도 없는데 "젯슨 연결됨" 로그가 찍히고,
+실물 젯슨을 붙였을 때 노트북 쪽 연결이 젯슨을 밀어낼 수 있다(백엔드는 마지막
+접속 하나만 들고 있다). 실제로 2개가 붙어 있는 것을 발견해
+`stop_all.sh` 가 `ship_ugv_perception` 노드도 정리하도록 고쳤다.
+
+**백엔드 실행 명령을 통일했다**
+
+`uvicorn main:app --reload` 는 `127.0.0.1` 에만 묶여 **이 노트북에서만** 접속된다.
+젯슨·프론트가 붙으려면 `--host 0.0.0.0` 이 필요하다. 리포 5곳
+(`backend/README.md`, `backend/main.py`, `CONTRIBUTING.md`,
+`fake_send_event_ack.py` 2곳)을 아래로 통일했다.
+
+```bash
+cd ~/smart-shipyard/backend && venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+**⚠️ 시험 방법이 바뀌었다**
+
+```bash
+ros2 topic pub --once /event/active std_msgs/msg/Bool "{data: true}"   # ❌ 이제 안 먹는다
+```
+`event_gate_node` 가 1초마다 자기 상태를 재발행해 바로 덮어쓴다. 대신
+`/event_detection/uvd` 에 가짜 감지를 흘리고 `/event/ack` 로 재개한다.
+
+**남은 팀 대기 항목**
+
+프론트 "확인" 버튼 하나뿐이다. 없어도 `fake_send_event_ack.py` 로 전체 경로가
+검증되므로 Nav2 쪽은 더 기다릴 것이 없다.
+
+---
 
 #### Step 6 완료 기록 (2026-08-12) — 원형 순찰 + 순찰 설정 자동 생성
 
@@ -920,15 +1026,34 @@ Step 6·7(순찰·이벤트 노드)이 완성되면 3부 명령어가 실제로 
 **①~④는 팀원 작업과 무관하게 전부 검증 가능하다.** 그들의 작업이 끝나면 ⑤로
 한 번만 이어보면 되고, 이때 문제가 생겨도 어느 구간인지 즉시 좁혀진다.
 
-**준비 상태 (2026-08-07):**
+**준비 상태 (2026-08-12 갱신):**
 
 | 구간 | 상태 |
 |---|---|
 | 백엔드 중계 (`event_ack`) | ✅ 완료 (커밋 `b275609`) |
 | `docs/interface.md` ⑧ 스펙 | ✅ 완료 (v1.4) |
-| 프론트 "확인" 버튼 | ⏳ 요청 전달됨 |
-| 젯슨 수신 루프 | ⏳ 요청 전달됨 |
-| `event_gate_node` / `patrol_mission_node` | ⏳ Step 6·7에서 작성 |
+| 젯슨 수신 루프 (`/server/inbound`) | ✅ **완료 — PR #17 머지** |
+| `patrol_mission_node` | ✅ 완료 (Step 6) |
+| `event_gate_node` | ✅ 완료 (Step 7) |
+| 프론트 "확인" 버튼 | ⏳ 대기 중 — 아래 대역 스크립트로 시험 가능 |
+
+**프론트 없이 ⑤ 전체 연동까지 시험하는 방법 (2026-08-12 확인)**
+
+`backend/tools/fake_send_event_ack.py` 가 프론트의 "확인" 버튼을 대신한다.
+서버가 아니라 **접속 -> 메시지 하나 전송 -> 종료** 하는 스크립트다.
+프론트가 완성되면 그냥 실행하지 않으면 된다(백엔드 코드는 안 건드렸다).
+
+```
+fake_send_event_ack.py ──/ws/frontend──> 백엔드 ──/ws/jetson──>
+    websocket_client._recv_loop ──/server/inbound──> event_gate_node ──> 재개
+        (가짜 1칸)                    나머지는 전부 실제 코드
+```
+
+`websocket_client` 는 카메라·YOLO 와 별개 노드라 **젯슨 하드웨어 없이
+노트북에서도 뜬다.** 서버 주소만 바꿔주면 된다.
+
+    ros2 run ship_ugv_perception websocket_client \
+        --ros-args -p server_ws_url:=ws://127.0.0.1:8000/ws/jetson
 
 ### Step 6: `patrol_mission_node.py` — 왜 필요한가
 
@@ -1256,9 +1381,16 @@ ros2 launch ship_ugv_navigation navigation.launch.py \
 # 터미널 3 — 순찰 상태 보기
 ros2 topic echo /patrol/status
 
-# 터미널 4 — 이벤트 정지/재개 시험 (Step 7 없이도 가능)
-ros2 topic pub --once /event/active std_msgs/msg/Bool "{data: true}"    # 정지
-ros2 topic pub --once /event/active std_msgs/msg/Bool "{data: false}"   # 재개
+# 터미널 4 — 이벤트 정지/재개 시험
+#   ⚠️ /event/active 를 직접 pub 하면 안 된다. event_gate_node 가 1초마다
+#      자기 상태를 재발행해 바로 덮어쓴다. 감지를 흘려보내는 방식으로 한다.
+ros2 topic pub --once /event_detection/uvd std_msgs/msg/String \
+  '{data: "{\"class_id\":\"fire\",\"confidence\":0.9,\"depth\":0.8}"}'   # 정지
+ros2 topic pub --once /event/ack std_msgs/msg/Empty "{}"                        # 재개(수동)
+
+# 백엔드 경유 전체 경로로 재개하려면 (프론트 "확인" 버튼 대역)
+#   미리: 백엔드 + websocket_client 를 띄워둘 것 (7-3절 참고)
+cd ~/smart-shipyard/backend && venv/bin/python tools/fake_send_event_ack.py
 
 # 터미널 3 — 키보드 주행 (Nav2 없이 물리 확인만 할 때)
 ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p use_sim_time:=true
@@ -1314,9 +1446,11 @@ ros2 launch ship_ugv_navigation navigation.launch.py \
     space:=wide map:=shipyard_map_<장소>_v<버전번호> patrol:=true
 ```
 
-`patrol:=true` 를 주면 순찰 노드가 함께 뜬다. 순찰 원(중심·반지름·웨이포인트
-개수)은 `config/patrol_<맵이름>.yaml` 에서 자동으로 읽으므로 따로 줄 값이 없다.
-그 파일은 `finalize_map.py` 가 만들어 둔 것이다.
+`patrol:=true` 를 주면 순찰 노드와 **이벤트 게이트가 함께** 뜬다. 순찰 원
+(중심·반지름·웨이포인트 개수)은 `config/patrol_<맵이름>.yaml` 에서 자동으로
+읽으므로 따로 줄 값이 없다. 그 파일은 `finalize_map.py` 가 만들어 둔 것이다.
+
+이벤트 게이트만 따로 끄려면 `events:=false` 를 준다(튜닝할 때만).
 
 **실물에서 달라지는 것은 두 가지뿐이고 둘 다 자동이다.**
 
@@ -1398,6 +1532,10 @@ Nav2가 필요로 하는 것을 전부 이 launch가 제공하기 때문이다.
 `patrol_<맵이름>.yaml` · `navigate_no_spin.xml` · `navigate_with_spin.xml` ·
 `navigation.launch.py` · `nav.rviz` · `patrol_mission_node.py` ·
 `event_gate_node.py` · `ekf_local` · `ship_ugv_core.urdf.xacro`
+
+`event_gate_node` 는 실물에서도 그대로 쓴다. 실물에서는 `/event_detection/uvd`
+가 진짜 YOLO 에서, `/server/inbound` 가 진짜 관제 버튼에서 오는 것만 다르다.
+노드 입장에서는 구분이 없다.
 
 **설정 파일들은 실물에서 뺄 것도 더할 것도 없다.** 바뀌는 것은 2개뿐이며
 둘 다 `navigation.launch.py`가 자동으로 처리한다.

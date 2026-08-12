@@ -155,8 +155,9 @@ pip install -r requirements.txt
 # 환경 변수 파일 생성 후, MONGO_URL 등 실제 값 채우기
 cp .env.example .env
 
-# 서버 실행
-uvicorn main:app --reload
+# 서버 실행 (팀 연동용 — 0.0.0.0 이 핵심)
+venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+#   --host 0.0.0.0 을 빼면 127.0.0.1 에만 묶여 젯슨·프론트가 접속하지 못한다
 ```
 
 터미널 맨 앞에 `(venv)` 표시가 뜨면 가상환경 활성화 성공입니다.

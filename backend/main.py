@@ -23,7 +23,8 @@ main.py — 스마트 조선소 FastAPI 백엔드 서버
 최근 수정일 : 2026-07-10
 
 의존성     : Python 3.10+, FastAPI 0.138.2, motor 3.7.1 (requirements.txt 참조)
-실행 방법  : uvicorn main:app --reload
+실행 방법  : venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+             (--host 0.0.0.0 필수. 생략하면 이 노트북에서만 접속됨)
 환경 변수  : .env 파일에 MONGO_URL 필요 (.env.example 참조, CONTRIBUTING.md 참고)
 
 탐지 이벤트 (2026-07-09 팀 확정 — 위험 이벤트는 YOLO 클래스 이름과 동일):

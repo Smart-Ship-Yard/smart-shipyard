@@ -31,9 +31,17 @@ patterns=(
   '/opt/ros/humble/lib/nav2_'                 # Nav2 6개 노드 + lifecycle_manager
   '/opt/ros/humble/lib/robot_state_publisher' # URDF -> TF
   '/opt/ros/humble/lib/robot_localization'    # ekf_local
-  'ship_ugv_navigation/lib'                   # fake_global_localization 등 우리 노드
+  'ship_ugv_navigation/lib'                   # fake_global_localization, 순찰, 이벤트게이트
   'ros2 launch ship_ugv_navigation'           # launch 부모 프로세스
   'teleop_twist_keyboard'
+  # ★ 노트북에서 시험용으로 띄운 인지 패키지 노드도 정리한다.
+  #   특히 websocket_client 는 **재연결 루프**가 있어서, 죽이지 않으면
+  #   백엔드를 다시 띄우는 순간 알아서 다시 붙는다. 그러면 띄운 적도 없는데
+  #   "젯슨 연결됨" 로그가 찍히고, 실물 젯슨을 붙였을 때 노트북 쪽 연결이
+  #   젯슨을 밀어낼 수 있다 (백엔드는 마지막 접속 하나만 들고 있다).
+  #   2026-08-12 실제로 물려서 websocket_client 가 2개 붙어 있었다.
+  'ship_ugv_perception/lib'
+  'ros2 run ship_ugv_perception'
 )
 names=( gzserver gzclient rviz2 )             # 15글자 이하라 -x 가능
 
@@ -44,7 +52,7 @@ sleep 2
 
 # ros2 node list 는 데몬 캐시라 죽은 노드를 한동안 유령으로 보여준다.
 # 확인은 실제 프로세스로 한다.
-left=$(pgrep -af 'gzserver|gzclient|rviz2|/opt/ros/humble/lib/nav2_|robot_state_publisher|robot_localization|ship_ugv_navigation/lib' 2>/dev/null)
+left=$(pgrep -af 'gzserver|gzclient|rviz2|/opt/ros/humble/lib/nav2_|robot_state_publisher|robot_localization|ship_ugv_navigation/lib|ship_ugv_perception/lib' 2>/dev/null)
 
 if [ -z "$left" ]; then
   echo "✅ 정리 완료 — 남은 프로세스 없음"
