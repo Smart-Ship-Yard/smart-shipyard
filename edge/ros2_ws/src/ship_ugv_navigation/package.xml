@@ -13,7 +13,18 @@
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>tf2_ros</depend>
-  <depend>nav2_simple_commander</depend>
+  <!-- 아래 넷은 실제로 import 한다. nav2 설치에 딸려 오므로 지금까지
+       선언이 없어도 동작했지만, 깨끗한 기계에서 rosdep install 할 때
+       빠지지 않도록 명시한다. -->
+  <depend>action_msgs</depend>          <!-- GoalStatus (순찰 노드) -->
+  <depend>lifecycle_msgs</depend>       <!-- GetState (Nav2 활성 확인) -->
+  <depend>nav2_msgs</depend>            <!-- NavigateToPose 액션 -->
+  <depend>nav2_common</depend>          <!-- RewrittenYaml (launch) -->
+  <!-- nav2_simple_commander 는 제거했다. Step 6 에서 BasicNavigator 대신
+       ActionClient 를 직접 쓰기로 바꿔(이유는 nav2_작업_정리.md 참고)
+       더 이상 import 하지 않는다. 주석에만 이름이 남아 있다. -->
+  <!-- <depend>nav2_simple_commander</depend> -->
+  <depend>nav2_behaviors</depend>       <!-- 복구 행동 플러그인 (BT 가 호출) -->
 
   <!-- launch에서 기동하는 것들 (빌드 의존 아님, 런타임 의존) -->
   <exec_depend>nav2_bringup</exec_depend>

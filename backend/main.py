@@ -146,6 +146,24 @@ async def lifespan(app: FastAPI):
             await retry_task
         except asyncio.CancelledError:
             pass
+
+        # ★ 진행 중인 저장 작업도 정리한다.
+        #   백그라운드로 던진 작업(_save_tasks)을 그냥 두고 종료하면
+        #   "Task was destroyed but it is pending!" 경고가 뜨고, 저장이
+        #   중간에 잘려 이벤트가 소리 없이 사라질 수 있다.
+        #
+        #   짧게 기다려주되(2초) 무한정 붙들지는 않는다. DB 가 불통이면
+        #   각 작업이 타임아웃(5초)까지 걸릴 수 있는데, 그 때문에 서버 종료가
+        #   느려지면 Ctrl+C 가 안 먹는 것처럼 보인다.
+        if _save_tasks:
+            pending = list(_save_tasks)
+            print(f"⏳ [DB] 진행 중인 저장 {len(pending)}건 마무리 대기 (최대 2초)")
+            done, still = await asyncio.wait(pending, timeout=2.0)
+            for t in still:
+                t.cancel()
+            if still:
+                print(f"   {len(still)}건은 시간 내 못 끝나 취소함")
+
         if failed_saves:
             print(f"⚠️ [DB] 저장하지 못한 이벤트 {len(failed_saves)}건이 "
                   f"남은 채로 서버가 종료된다 (메모리 큐라 사라진다)")

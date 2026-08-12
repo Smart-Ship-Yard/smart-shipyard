@@ -234,7 +234,7 @@ def main():
     #   config/patrol_<맵이름>.yaml 을 직접 만든다. 사람이 출력값을 보고
     #   손으로 옮겨 적는 단계를 없애기 위함이다(오타·누락 방지).
     #   순찰 불가 맵이면 파일을 만들지 않는다.
-    patrol_out = os.path.join(PKG_ROOT, 'config', f'patrol_{a.name}.yaml')
+    patrol_out = os.path.join(PKG_ROOT, 'config', f'patrol_{name}.yaml')
     r = subprocess.run(
         [sys.executable, os.path.join(SCRIPTS, 'check_patrol_space.py'),
          '--map', yaml_path, '--emit-patrol', patrol_out])
@@ -244,17 +244,17 @@ def main():
     if r.returncode == 0:
         print('  ✅ 완료 — 이 맵으로 Nav2를 돌릴 수 있다')
         print()
-        print(f'  순찰 설정이 자동으로 만들어졌다: config/patrol_{a.name}.yaml')
+        print(f'  순찰 설정이 자동으로 만들어졌다: config/patrol_{name}.yaml')
         print('  손으로 값을 옮겨 적을 필요 없다. 실행할 때 map 이름만 주면 된다:')
         print(f'    ros2 launch ship_ugv_navigation navigation.launch.py \\')
-        print(f'        map:={a.name} patrol:=true space:=wide')
+        print(f'        map:={name} patrol:=true space:=wide')
     elif r.returncode == 2:
         print('  🟡 완료 — 사용 가능하지만 여유가 빠듯하다')
         print()
-        print(f'  순찰 설정이 자동으로 만들어졌다: config/patrol_{a.name}.yaml')
+        print(f'  순찰 설정이 자동으로 만들어졌다: config/patrol_{name}.yaml')
         print('  실행할 때 **space:=narrow** 를 반드시 함께 줄 것:')
         print(f'    ros2 launch ship_ugv_navigation navigation.launch.py \\')
-        print(f'        map:={a.name} patrol:=true space:=narrow')
+        print(f'        map:={name} patrol:=true space:=narrow')
         print()
         print('  더 넉넉하게 하려면 대상 주변을 더 치우고 재매핑.')
     else:
