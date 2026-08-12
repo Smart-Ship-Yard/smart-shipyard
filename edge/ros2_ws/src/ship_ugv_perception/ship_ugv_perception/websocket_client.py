@@ -2,7 +2,7 @@
 """
 websocket_client.py
 --------------------
-젯슨 -> 백엔드 서버 WebSocket 전송 노드. (스펙: 젯슨-서버 통신 스펙 v1.3)
+젯슨 <-> 백엔드 서버 WebSocket 노드. (스펙: 젯슨-서버 통신 스펙 v1.3)
 
 [2026-07-17 스펙 v1.3 반영]
 - ① position에 yaw(로봇이 바라보는 방향, 라디안) 추가
@@ -13,6 +13,14 @@ websocket_client.py
   -> TF(map->base_link) 조회 실패 시(EKF 미가동 등) 해당 이벤트 전송 보류.
 - depth_xyz, ekf_global은 디버깅용으로 유지.
 - ③ block_level, ④ ship_pose는 변경 없음.
+
+[수신 루프 추가]
+- 기존에는 송신만 하던 노드였으나, 서버 -> 젯슨 메시지를 받는 수신 루프를 추가함.
+- 받은 메시지는 이 노드에서 해석하지 않고, 그대로 /server/inbound
+  (std_msgs/String) 토픽으로 발행만 한다. 내용 판단/분기는 Nav2 쪽 노드가
+  담당한다. 서버->젯슨 메시지 종류가 앞으로 늘어나도 이 노드는 손댈 필요 없음.
+- 송신 로직(_ws_worker, _enqueue 등)과 YOLO 관련 부분은 전혀 건드리지 않음.
+  같은 WebSocket 연결 객체에서 별도 스레드(_recv_loop)로 수신만 전담.
 
 공통 규칙: person/helmet은 전송 안 함, conf 0.5 미만 버림, 같은 상황 연사 금지,
 timestamp는 서버가 붙이므로 생략.
@@ -86,6 +94,10 @@ class WebSocketClient(Node):
         self.declare_parameter('camera_offset_y', 0.0)
         self.declare_parameter('tf_timeout_s', 0.3)
 
+        # ★ 수신 루프 관련
+        self.declare_parameter('inbound_topic', '/server/inbound')
+        self.declare_parameter('recv_timeout_s', 1.0)
+
         self.server_url = self.get_parameter('server_ws_url').value
         uvd_topic = self.get_parameter('uvd_topic').value
         ekf_topic = self.get_parameter('ekf_odom_topic').value
@@ -102,6 +114,9 @@ class WebSocketClient(Node):
         self.cam_offset_x = self.get_parameter('camera_offset_x').value
         self.cam_offset_y = self.get_parameter('camera_offset_y').value
         self.tf_timeout = Duration(seconds=self.get_parameter('tf_timeout_s').value)
+
+        inbound_topic = self.get_parameter('inbound_topic').value
+        self.recv_timeout = self.get_parameter('recv_timeout_s').value
 
         if ws_connect is None:
             self.get_logger().error(
@@ -123,6 +138,9 @@ class WebSocketClient(Node):
 
         self.send_queue = queue.Queue()
 
+        # ★ 서버 -> 젯슨 수신 메시지를 그대로 중계할 퍼블리셔 (해석하지 않음)
+        self.inbound_pub = self.create_publisher(String, inbound_topic, 10)
+
         self.create_subscription(String, uvd_topic, self._uvd_cb, 10)
         self.create_subscription(Odometry, ekf_topic, self._ekf_cb, 10)
         self.create_subscription(String, ship_pose_topic, self._ship_pose_cb, 10)
@@ -134,9 +152,9 @@ class WebSocketClient(Node):
         self._ws_thread.start()
 
         self.get_logger().info(
-            f"websocket_client 시작 (스펙 v1.3): server={self.server_url}, "
+            f"websocket_client 시작 (스펙 v1.3 + 수신 루프): server={self.server_url}, "
             f"ekf_topic={ekf_topic}, ping={self.ping_interval}s, "
-            f"min_conf={self.min_confidence}"
+            f"min_conf={self.min_confidence}, inbound_topic={inbound_topic}"
         )
 
     def _ekf_cb(self, msg: Odometry):
@@ -298,13 +316,42 @@ class WebSocketClient(Node):
     def _enqueue(self, payload: dict):
         self.send_queue.put(payload)
 
+    # ------------------------------------------------------------------
+    # ★ 수신 루프: 서버 -> 젯슨 메시지를 해석 없이 그대로 /server/inbound로 발행.
+    def _recv_loop(self, ws):
+        while not self._stop_event.is_set():
+            try:
+                message = ws.recv(timeout=self.recv_timeout)
+            except TimeoutError:
+                continue
+            except (ConnectionClosed, Exception) as e:
+                self.get_logger().info(f"[수신 루프] 연결 종료/오류로 중단: {e}")
+                return
+
+            if isinstance(message, bytes):
+                try:
+                    message = message.decode('utf-8')
+                except UnicodeDecodeError:
+                    self.get_logger().warn("[수신 루프] 바이너리 메시지 디코딩 실패, 무시")
+                    continue
+
+            out_msg = String()
+            out_msg.data = message
+            self.inbound_pub.publish(out_msg)
+            self.get_logger().info(f"[수신] /server/inbound 로 중계: {message[:200]}")
+
     def _ws_worker(self):
         while not self._stop_event.is_set():
             ws = None
+            recv_thread = None
             try:
                 self.get_logger().info(f"서버 연결 시도: {self.server_url}")
                 ws = ws_connect(self.server_url, open_timeout=5)
                 self.get_logger().info("서버 연결 성공")
+
+                recv_thread = threading.Thread(
+                    target=self._recv_loop, args=(ws,), daemon=True)
+                recv_thread.start()
 
                 with self._level_lock:
                     current_level = self._level_confirmed
@@ -338,6 +385,8 @@ class WebSocketClient(Node):
                         ws.close()
                     except Exception:
                         pass
+                if recv_thread is not None:
+                    recv_thread.join(timeout=2.0)
 
             time.sleep(self.reconnect_interval)
 
