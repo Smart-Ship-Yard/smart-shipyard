@@ -37,6 +37,7 @@ class ChangePointDetector(Node):
         self.declare_parameter('output_topic', '/event_detection/map_point')
         self.declare_parameter('map_frame_id', 'map')
         self.declare_parameter('base_frame_id', 'base_link')
+        # ★ 실측: base_link(바퀴축 중점) 기준 카메라 렌즈 위치 (사용자 확인됨)
         self.declare_parameter('camera_offset_x', 0.13)
         self.declare_parameter('camera_offset_y', 0.09)
         self.declare_parameter('camera_offset_z', 0.1)

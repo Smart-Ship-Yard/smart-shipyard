@@ -14,9 +14,11 @@ UWB <-> Map Calibration Node (ROS2)
 2. 사용자가 ~/calibrate (std_srvs/Trigger) 서비스를 호출하면:
    a. 로봇을 정지 상태에서 알고 있는 방향(예: map 좌표계 +x 방향)으로 직진시킨다는
       전제 하에, 그 구간 동안의 /uwb/pose 샘플을 수집한다 (COLLECTING 상태).
-   b. 수집 시간(기본 5초) 종료 후 시작점/끝점을 직선 피팅하여 uwb_frame 상에서의
-      진행 방향 벡터를 구하고, 이를 map 좌표계 상의 알려진 직진 방향과 비교해
-      회전각(theta)을 역산한다.
+   b. 수집된 전체 샘플에 대해 SVD 기반 총최소제곱(total least squares) 직선
+      피팅으로 uwb_frame 상에서의 진행 방향 벡터를 구하고, 이를 map 좌표계
+      상의 알려진 직진 방향과 비교해 회전각(theta)을 역산한다. (시작/끝 두
+      점만 쓰면 그 두 샘플에 낀 UWB 잔차가 그대로 각도 오차가 되므로, 수집된
+      모든 샘플을 다 활용해 노이즈에 강건하게 만든다.)
    c. 시작점을 두 좌표계의 원점 오프셋 계산에 사용해 평행이동(tx, ty)을 구한다.
    d. map -> uwb_frame 정적 TF를 발행(갱신)한다.
    e. 결과를 회차 번호를 붙여 파일로 저장한다 (재현/디버깅용).
@@ -33,6 +35,7 @@ import os
 import time
 from enum import Enum, auto
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
@@ -208,8 +211,17 @@ class UwbMapCalibration(Node):
                 "더 길게, 더 곧게 직진 후 재시도하세요."
             )
 
-        # uwb_frame 상에서 관측된 진행 방향
-        uwb_heading = math.atan2(dy, dx)
+        # uwb_frame 상에서 관측된 진행 방향: 시작/끝 두 점이 아니라 수집된
+        # 전체 샘플에 대한 SVD 총최소제곱 직선 피팅으로 구한다 (양 끝 샘플만
+        # 쓰면 그 두 점의 UWB 잔차가 그대로 각도 오차로 들어가기 때문).
+        pts = np.array([(s[1], s[2]) for s in self.samples])
+        centered = pts - pts.mean(axis=0)
+        _, _, vt = np.linalg.svd(centered)
+        direction = vt[0]  # 주성분 방향 (부호는 ±180도 모호함)
+        if direction[0] * dx + direction[1] * dy < 0:
+            # 실제 주행 방향(시작->끝)과 반대로 나왔으면 뒤집어 부호를 맞춘다
+            direction = -direction
+        uwb_heading = math.atan2(direction[1], direction[0])
 
         # map 상에서는 known_heading_in_map_rad 방향으로 움직였다고 알고 있으므로
         # 회전각 theta = (map에서의 방향) - (uwb_frame에서의 방향)
