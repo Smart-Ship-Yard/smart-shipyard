@@ -29,7 +29,7 @@
 ## 실행 방법
 
 ```bash
-cd backend
+cd ~/smart-shipyard/backend
 
 # 1. 가상환경 생성 및 활성화 (최초 1회)
 python -m venv venv

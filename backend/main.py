@@ -40,6 +40,7 @@ main.py — 스마트 조선소 FastAPI 백엔드 서버
                             "map_xy": [5.1, 4.8], "yaw": 1.57})
 """
 
+import asyncio
 import json
 import os
 # python-dotenv 패키지: .env 파일에 적힌 키=값 쌍을 읽어서
@@ -56,6 +57,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # 타입 힌트용 List/Optional (연결 목록, 젯슨 단일 연결 참조 타입 표기에 사용)
+from collections import deque
+from contextlib import asynccontextmanager
 from typing import List, Optional
 
 # 이벤트 저장 시각을 기록하기 위한 datetime (시간대 명시 기록용 timedelta/timezone 포함)
@@ -121,12 +124,40 @@ KST = timezone(timedelta(hours=9))
 # 최신 값을 init-data 상태 복원에 쓰므로 저장 대상에 포함.
 LOGGED_EVENT_TYPES = {SHIP_DEFECT, NO_HELMET, FALLEN_PERSON, FIRE, BLOCK_LEVEL, SHIP_POSE}
 
+# =========================================================
+# [서버 수명 주기 구역]
+# 서버가 뜰 때 배경에서 계속 돌아야 하는 일을 등록하고,
+# 내려갈 때 정리한다.
+#
+# @app.on_event("startup") 방식은 FastAPI 0.138 기준 폐기 예정이라
+# (DeprecationWarning) 권장 방식인 lifespan 을 쓴다.
+# =========================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 인터넷이 끊긴 동안 쌓인 저장 실패분을 주기적으로 다시 밀어 넣는 작업.
+    # 아래 retry_failed_saves 는 DB 구역에 정의돼 있다.
+    retry_task = asyncio.create_task(retry_failed_saves())
+    print(f"🔁 [DB] 재시도 작업 시작 ({RETRY_INTERVAL_S}초 주기)")
+    try:
+        yield                       # 여기서 서버가 돌아간다
+    finally:
+        retry_task.cancel()
+        try:
+            await retry_task
+        except asyncio.CancelledError:
+            pass
+        if failed_saves:
+            print(f"⚠️ [DB] 저장하지 못한 이벤트 {len(failed_saves)}건이 "
+                  f"남은 채로 서버가 종료된다 (메모리 큐라 사라진다)")
+
+
 # FastAPI 서버 객체 생성 (우리의 백엔드 서버 본체).
 # title/description/version은 자동 생성되는 API 문서(/docs)에 표시됨.
 app = FastAPI(
     title="Smart Shipyard Digital Twin Backend",
     description="젯슨 UGV ↔ 서버 ↔ 프론트엔드 실시간 이벤트 중계 API",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 # =========================================================
@@ -153,14 +184,131 @@ app.add_middleware(
 MONGO_URL = os.getenv("MONGO_URL")
 
 # 비동기 방식으로 MongoDB에 접속하는 클라이언트 객체 생성.
-# 비동기이기 때문에 DB에 쓰는 동안에도 웹소켓 통신이 멈추지 않음.
-client = AsyncIOMotorClient(MONGO_URL)
+#
+# ★ 타임아웃을 반드시 지정한다 (기본값은 30초).
+#   MongoDB Atlas는 클라우드라 인터넷이 필요하다. 시연장 와이파이가 불안정하면
+#   저장 시도가 기본 30초를 붙들고 있다가 실패한다. 그동안 그 작업이 살아 있어
+#   이벤트가 계속 오면 대기 중인 작업이 수십 개로 불어난다.
+#
+#   5초로 정한 이유:
+#     - mongodb+srv 는 접속할 때 DNS SRV 조회 + TLS 악수를 한다. 인터넷이
+#       '느리지만 살아있는' 상태면 정상 저장에도 2~3초가 걸릴 수 있어,
+#       3초로 자르면 성공할 수 있었던 저장을 실패로 만든다.
+#     - 반대로 30초는 실패 판정이 너무 늦다.
+#   실패해도 아래 재시도 큐가 받아주므로 값이 조금 어긋나도 손해가 작다.
+client = AsyncIOMotorClient(
+    MONGO_URL,
+    serverSelectionTimeoutMS=5000,   # 쓸 수 있는 서버를 찾는 데 쓸 최대 시간
+    connectTimeoutMS=5000,           # TCP/TLS 연결 수립 최대 시간
+    socketTimeoutMS=10000,           # 연결된 뒤 응답을 기다리는 최대 시간
+)
 
 # 'shipyard_db'라는 이름의 데이터베이스를 선택 (없으면 첫 데이터 삽입 시 자동 생성됨).
 db = client.shipyard_db
 
 # 그 안의 'events' 컬렉션(=서류함)을 선택. 여기에 4종 이벤트 로그가 쌓임.
 event_collection = db.events
+
+
+# =========================================================
+# [DB 저장 구역 — 알림 경로에서 DB를 완전히 분리한다]
+# =========================================================
+#
+# ★ 왜 이렇게 하는가
+#
+#   원래는 젯슨 메시지를 받는 루프 안에서 곧바로 insert_one 을 await 했다.
+#   그러면 인터넷이 끊겼을 때 이런 일이 벌어진다:
+#
+#       젯슨: "화재 신고"  ->  서버가 받음
+#       서버: 몽고에 저장 시도  ->  인터넷 끊김  ->  타임아웃까지 대기
+#                                  그동안 다음 메시지를 못 받는다
+#       타임아웃 후: 예외 발생  ->  except WebSocketDisconnect 로는 안 잡힘
+#                                  -> 핸들러가 끝나며 웹소켓이 닫힌다
+#       젯슨: 재접속  ->  다음 이벤트에서 똑같이 반복
+#
+#   더 나쁜 것은 broadcast() 가 insert_one **다음 줄**이라, DB가 실패하면
+#   프론트 실시간 알림까지 안 나갔다는 점이다. DB는 통계용 과거 기록인데
+#   그것 때문에 안전 알림이 막히는 것은 우선순위가 뒤집힌 것이다.
+#
+#   그래서 저장을 **백그라운드 작업**으로 떼어냈다. 메인 루프는 저장을
+#   시켜놓고 즉시 broadcast() 로 넘어간다. 인터넷이 아예 죽어도 프론트
+#   알림 지연은 0이다.
+#
+#   저장에 실패한 것은 버리지 않고 재시도 큐에 넣어, 인터넷이 돌아오면
+#   자동으로 밀어 넣는다.
+#
+# ※ 프론트/젯슨이 접속하는 주소·형식은 전혀 바뀌지 않는다. 서버 안에서
+#   일하는 순서만 달라진 것이다.
+
+# 저장 실패분을 담아두는 대기줄. 인터넷이 오래 끊겨도 메모리가 계속 불어나지
+# 않도록 상한을 둔다. maxlen 을 넘기면 **가장 오래된 것부터** 자동으로 밀려난다.
+# (최신 이벤트가 더 중요하므로 오래된 쪽을 버리는 것이 맞다)
+FAILED_SAVE_MAX = 200
+failed_saves: deque = deque(maxlen=FAILED_SAVE_MAX)
+
+# 재시도 주기(초). 너무 짧으면 인터넷이 끊긴 동안 로그가 폭주하고,
+# 너무 길면 복구가 늦다.
+RETRY_INTERVAL_S = 30
+
+# asyncio.create_task 로 만든 작업은 참조를 붙들지 않으면 실행 도중
+# 가비지 컬렉션될 수 있다(파이썬 공식 문서 경고). 그래서 집합에 담아두고
+# 끝나면 스스로 빠지게 한다.
+_save_tasks: set = set()
+
+
+async def save_event_background(doc: dict):
+    """이벤트 하나를 몽고에 저장한다. 실패해도 예외를 밖으로 내보내지 않는다.
+
+    이 함수는 백그라운드 작업으로 실행되므로, 여기서 예외가 새어나가면
+    잡아줄 곳이 없다. 반드시 안에서 처리한다.
+    """
+    try:
+        await event_collection.insert_one(doc)
+        print(f"💾 몽고DB에 이벤트 저장 완료: {doc.get('event_type')}")
+    except Exception as e:
+        failed_saves.append(doc)
+        print(f"⚠️ [DB] 저장 실패({type(e).__name__}) — 재시도 대기줄에 넣음 "
+              f"({len(failed_saves)}/{FAILED_SAVE_MAX}): {doc.get('event_type')}")
+
+
+def schedule_save(doc: dict):
+    """저장을 백그라운드로 던지고 즉시 돌아온다.
+
+    호출한 쪽(젯슨 메시지 루프)은 DB를 기다리지 않는다.
+    """
+    task = asyncio.create_task(save_event_background(doc))
+    _save_tasks.add(task)
+    task.add_done_callback(_save_tasks.discard)
+
+
+async def retry_failed_saves():
+    """인터넷이 돌아왔는지 주기적으로 확인하며 밀린 저장을 처리한다.
+
+    한 번에 전부 시도하지 않고 대기줄을 앞에서부터 비워나간다. 도중에 다시
+    실패하면 그 항목을 되돌려 넣고 멈춘다 — 아직 인터넷이 안 됐다는 뜻이므로
+    나머지를 시도해봐야 시간만 버린다.
+    """
+    while True:
+        await asyncio.sleep(RETRY_INTERVAL_S)
+        if not failed_saves:
+            continue
+
+        pending = len(failed_saves)
+        print(f"🔁 [DB] 밀린 저장 {pending}건 재시도")
+        saved = 0
+        while failed_saves:
+            doc = failed_saves.popleft()
+            try:
+                await event_collection.insert_one(doc)
+                saved += 1
+            except Exception as e:
+                # 아직 안 된다 — 꺼낸 것을 앞으로 되돌리고 다음 주기를 기다린다
+                failed_saves.appendleft(doc)
+                print(f"   아직 실패({type(e).__name__}). {saved}건 저장, "
+                      f"{len(failed_saves)}건 남음")
+                break
+        if saved and not failed_saves:
+            print(f"   ✅ 밀린 저장 {saved}건 모두 완료")
 
 
 # =========================================================
@@ -397,11 +545,16 @@ async def websocket_jetson(websocket: WebSocket):
                 # 프론트 JS의 new Date()도 정확히 해석함.
                 data["timestamp"] = datetime.now(KST).isoformat()
 
-                # data.copy()로 복사본을 저장 — 원본 dict는 곧이어 그대로
-                # broadcast()에도 쓰이므로, insert_one이 원본을 변형하지
-                # 않도록 방어적으로 복사해서 넘김.
-                await event_collection.insert_one(data.copy())
-                print(f"💾 몽고DB에 이벤트 저장 완료: {event_type}")
+                # ★ 저장을 기다리지 않는다 (2026-08-12).
+                #   schedule_save 는 백그라운드 작업만 만들고 즉시 돌아온다.
+                #   인터넷이 끊겨 저장이 오래 걸리거나 실패해도 이 루프는
+                #   멈추지 않고, 아래 broadcast 가 지연 없이 실행된다.
+                #   실패분은 재시도 대기줄에 들어가 인터넷 복구 시 자동 저장된다.
+                #
+                #   data.copy() 로 복사본을 넘기는 이유: 원본 dict 는 곧이어
+                #   broadcast() 에도 쓰이는데, 저장이 백그라운드로 도는 동안
+                #   원본이 바뀌면 엉뚱한 값이 저장될 수 있다.
+                schedule_save(data.copy())
 
             # DB 저장 여부와 관계없이, 프론트엔드에는 지연 없이 즉시 브로드캐스트.
             await manager.broadcast(data)
