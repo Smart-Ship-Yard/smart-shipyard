@@ -5,7 +5,7 @@
 > 배경·설계 근거는 [nav2_작업_정리.md](nav2_작업_정리.md),
 > 실행 명령은 [전체_실행_명령어_요약본](전체_실행_명령어_요약본%20—%20매핑부터_자율주행까지.md) 참고.
 
-작성: 2026-08-12 (Step 7 완료 시점) · 작성자: 이정기 + Claude
+작성: 2026-08-12 (Step 7 완료 시점) · 갱신: 2026-08-14 · 작성자: 이정기 + Claude
 
 ---
 
@@ -23,18 +23,37 @@
 **시뮬에서는 전부 동작한다.** 원형 순찰 무한 순회, 위험 이벤트 감지 시 즉시
 정지, 관제 "확인" 신호로 재개까지 백엔드·웹소켓을 거치는 전체 경로가 검증됐다.
 
+### 2026-08-14 갱신 — Step 8 은 재매핑부터 시작한다
+
+`feature/ed` (PR #19) 가 main 에 머지되면서 **UWB 캘리브레이션 각도 정확도가
+올라갔다** (2점 직선 → 전체 샘플 SVD 총최소제곱, `min_travel` 1.0 → 1.4 m).
+
+그 결과 **기존 맵 `shipyard_map_JG_room_v2` 를 재사용할 수 없다.**
+
+맵의 `origin` 은 그 세션 캘리브레이션이 정의한 `map` 프레임 기준으로 구워져
+있다. 캘리브레이션을 다시 하면 theta 가 달라지므로 옛 맵이 그만큼 회전한
+상태가 된다. 정확도가 올라갈수록 옛 값과의 차이는 오히려 커진다.
+
+> 이것은 캘리브레이션 변경 때문만은 아니다. theta 는 UWB 측정 노이즈 때문에
+> **세션마다 새로 뽑히므로**, 코드를 안 바꿨어도 맵을 재사용하려면
+> 같은 자리·같은 방향에서 캘리브레이션을 재현해야 한다. 원래 그런 구조다.
+
+→ Step 8 의 첫 작업은 **재매핑**이다. `재매핑_체크리스트.md` 를 그대로 따른다.
+  이때 순찰 반지름을 0.45 m 이상 확보하도록 중앙 물체 주변을 더 치우는 것이 좋다
+  (v2 는 R 0.30 이라 물리적으로 빡빡했다).
+
 ---
 
-## 1. 가장 먼저 — 브랜치가 main 에 없다
+## 1. 코드는 전부 main 에 있다
 
-`ship_ugv_navigation` 패키지는 **작업 브랜치 `sim/nav2-gazebo` 에만** 있다.
-젯슨에서 `main` 을 pull 해도 맵·설정·launch 가 없다.
+~~작업 브랜치에만 있다~~ → **2026-08-13 PR #18 머지로 해소됨.**
+`ship_ugv_navigation` 패키지·맵·설정·launch 전부 `main` 에 있다.
 
 ```bash
 # 젯슨에서
 cd ~/smart-shipyard
-git fetch origin
-git checkout sim/nav2-gazebo        # 또는 main 에 머지한 뒤 main 을 pull
+git status                          # 로컬 변경 없는지 먼저 확인
+git pull
 cd edge/ros2_ws
 colcon build --symlink-install
 source install/setup.bash
@@ -76,8 +95,8 @@ sim_bringup.launch.py        ← 위 노드를 띄운다
 # 터미널 1 — 센서·EKF·TF 전부. 시연 끝날 때까지 끄지 않는다
 ros2 launch ship_ugv_localization localization.launch.py
 
-# (최초 1회) UWB 캘리브레이션 — 재매핑_체크리스트.md 3~5단계 참고
-#   이게 안 되면 map->odom TF 가 없어 Nav2 가 못 뜬다
+# (매 세션 1회) UWB 캘리브레이션 — 재매핑_체크리스트.md 3~5단계 참고
+#   ⚠️ 빼먹어도 에러가 안 난다. 아래 5-6 참고 — 조용히 틀린 위치로 주행한다
 
 # 터미널 2 — Nav2 + 순찰 + 이벤트게이트
 ros2 launch ship_ugv_navigation navigation.launch.py \
@@ -99,6 +118,9 @@ ros2 launch ship_ugv_navigation navigation.launch.py \
 ---
 
 ## 4. Step 8 에서 실제로 할 일
+
+> 순서: **재매핑(필수) → space 선택 → 실물 튜닝.**
+> 재매핑이 왜 필수인지는 0장 "2026-08-14 갱신" 참고.
 
 ### 4-1. 새 장소를 매핑하면
 
@@ -132,6 +154,7 @@ wide 로 두면 통로 전체가 막힌 것으로 판정되어 경로가 아예 
 | **`detected collision ahead` 빈도** | 시뮬에서 제어 주기의 약 16% 로 상시 발생했다. 목표에는 도달하므로 치명적이지 않지만 정상이라 보기도 어렵다. **시연장 크기를 알아야** 판단 가능하다. 실물에서도 잦으면 `footprint_padding`(현재 0.02) 조정 검토 |
 | **UWB 위치 오차 ±15 cm** | 시뮬은 참값(오차 0)이었다. 실물에서 `inflation_radius` 를 재확인할 것 |
 | **순찰 반지름** | `shipyard_map_JG_room_v2` 는 R 0.30 이라 이 로봇(차체 0.4 m)에게 물리적으로 빡빡하다. 대상 주변을 치우고 재매핑해 **0.45 m 이상**을 확보하는 것이 근본 해결 |
+| **중앙 물체가 모형 배일 때** | 라이다 평면(0.20 m)에 선체가 안 걸려 **맵에도 코스트맵에도 안 잡힌다.** 매핑할 때만 임시 상자를 놓는 방식으로 대응한다 — `재매핑_체크리스트.md` 0단계, 설계 배경은 `nav2_작업_정리.md` 4-1장 |
 
 ### 4-4. 손댈 필요 **없는** 것
 
@@ -195,6 +218,37 @@ cd ~/smart-shipyard/backend && venv/bin/uvicorn main:app --host 0.0.0.0 --port 8
 맵 yaml 안의 `image:` 필드도 **같이** 고쳐야 한다. 안 고치면 옛 pgm 을 찾아
 로드에 실패한다.
 
+### 5-6. 캘리브레이션을 빼먹어도 **에러가 안 난다**
+
+`uwb_map_calibration` 노드는 기동하자마자 **항등변환(0,0,0)** 으로
+`map→uwb_frame` TF를 먼저 발행한다 (`calibration_node.py:98`,
+"TF tree 끊김 방지"). 그래서 `~/calibrate` 를 호출하지 않아도:
+
+- TF 트리는 멀쩡하고
+- `ekf_global` 도 정상 기동하고
+- Nav2 도 잘 뜨고
+- **로그에 경고가 하나도 안 뜬다**
+
+그런데 `ekf_global` 은 `/uwb/pose`(frame_id = `uwb_frame`)를 TF로 map 에
+옮겨 쓰므로, 변환이 0이면 **로봇이 자기 위치를 조용히 틀리게 믿는다.**
+
+**눈으로 잡는 법:** RViz 에서 맵을 띄우고 `/scan_filtered` 가 맵의 벽선과
+겹치는지 본다. 통째로 돌아가 있거나 멀찍이 떨어져 있으면 캘리브레이션이
+안 됐거나 옛 맵을 쓰고 있는 것이다. **이 확인 하나가 두 실수를 동시에 잡는다.**
+
+### 5-7. `kill` 은 `ros2 run` 래퍼만 죽인다
+
+`ros2 run pkg node` 를 PID 로 죽이면 **래퍼만 죽고 실제 노드 자식 프로세스는
+살아남는다.** 옛 파라미터로 계속 돌면서 같은 토픽을 발행해 원인 모를 증상을
+만든다 (검증 중 실제로 겪었다 — 옛 서버 주소로 재접속을 계속 시도했다).
+
+```bash
+ps -eo pid,args | grep 'ship_ugv_perception/lib'   # 자식 PID 확인 후
+kill -9 <자식 PID>
+```
+
+되도록 `stop_all.sh` 를 쓸 것.
+
 ---
 
 ## 6. 설계상 알아둘 것 (코드만 봐서는 안 보이는 이유들)
@@ -247,7 +301,9 @@ cd ~/smart-shipyard/backend && venv/bin/uvicorn main:app --host 0.0.0.0 --port 8
 | 백엔드 `event_ack` 중계 | ✅ |
 | 젯슨 수신 루프 `/server/inbound` | ✅ PR #17 머지 |
 | `patrol_mission_node` / `event_gate_node` | ✅ |
+| 카메라 좌표계 일치 · UWB SVD 캘리브레이션 | ✅ PR #19 머지 (2026-08-14) |
 | **프론트 "확인" 버튼** | ⏳ 대기 중 |
+| **배 중심좌표 측량 `ship_survey_node`** | ⏳ 요청함 — [배_중심좌표_측량_요청.md](../../docs/배_중심좌표_측량_요청.md) |
 
 프론트가 없어도 `backend/tools/fake_send_event_ack.py` 로 전체 경로를 시험할
 수 있다. 프론트가 완성되면 그 스크립트를 실행하지 않으면 그만이다.
@@ -263,6 +319,8 @@ cd ~/smart-shipyard/backend && venv/bin/uvicorn main:app --host 0.0.0.0 --port 8
 | 매핑 절차 · 문제해결 | [재매핑_체크리스트.md](재매핑_체크리스트.md) |
 | 젯슨↔서버 메시지 규격 | [../../docs/interface.md](../../docs/interface.md) |
 | 하드웨어 실측값 | [설치가이드.md](설치가이드.md) |
+| 배가 라이다에 안 잡히는 문제 · keepout 계획 | [nav2_작업_정리.md](nav2_작업_정리.md) 4-1장 |
+| 젯슨 측 배 측량 노드 요청서 | [../../docs/배_중심좌표_측량_요청.md](../../docs/배_중심좌표_측량_요청.md) |
 
 **Step 별 완료 기록은 `nav2_작업_정리.md` 7-1 절에 있다.** 어떤 문제를 어떻게
 해결했는지, 무엇을 시도했다가 되돌렸는지가 전부 적혀 있으니 같은 길을 다시
