@@ -63,7 +63,11 @@ class UwbMapCalibration(Node):
         self.declare_parameter('map_frame_id', 'map')
         self.declare_parameter('uwb_frame_id', 'uwb_frame')
         self.declare_parameter('collection_duration_s', 5.0)  # 더 이상 종료 조건으로 안 씀, 하위 호환용
-        self.declare_parameter('min_travel_distance_m', 1.0)  # 직선 피팅 신뢰를 위한 최소 이동거리
+        # 직선 피팅 신뢰를 위한 최소 이동거리.
+        # ★ 1.4m (실측, 2026-08): 캘리브레이션 시 move_distance 1.5m로 주행하는데
+        #   기존 1.0m 기준에서는 실제로 약 0.85m만 쓰인 채 계산이 끝나버렸음.
+        #   1.4m로 올려 1.5m 주행을 거의 다 쓰게 하니 각도오차 5.58° -> 3.00°로 개선됨.
+        self.declare_parameter('min_travel_distance_m', 1.4)
         # ★ 로봇 최고속도(예: 0.15m/s)로는 고정된 5초 안에 1.0m를 못 채우는 구조적
         #   모순이 있어, 시간이 아니라 "실제 이동거리"를 종료 조건으로 바꿈.
         #   이 값은 순수 안전장치(로봇이 안 움직이거나 UWB가 끊겼을 때 무한 대기 방지)로만 씀.
