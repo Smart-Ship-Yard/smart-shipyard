@@ -90,8 +90,12 @@ class WebSocketClient(Node):
 
         self.declare_parameter('map_frame_id', 'map')
         self.declare_parameter('base_frame_id', 'base_link')
-        self.declare_parameter('camera_offset_x', 0.15)
-        self.declare_parameter('camera_offset_y', 0.0)
+        # ★ 실측: base_link 기준 카메라 RGB 렌즈 위치 (2026-08-13 재실측).
+        # change_point.py와 반드시 동일한 값 유지 - 다르면 위험 이벤트 map_xy가
+        # change_point.py의 /event_detection/map_point와 어긋난 위치로 발행됨.
+        self.declare_parameter('camera_offset_x', 0.135)
+        self.declare_parameter('camera_offset_y', -0.089)
+        self.declare_parameter('camera_yaw_deg', -90.0)
         self.declare_parameter('tf_timeout_s', 0.3)
 
         # ★ 수신 루프 관련
@@ -113,6 +117,7 @@ class WebSocketClient(Node):
         self.base_frame = self.get_parameter('base_frame_id').value
         self.cam_offset_x = self.get_parameter('camera_offset_x').value
         self.cam_offset_y = self.get_parameter('camera_offset_y').value
+        self.cam_yaw = math.radians(self.get_parameter('camera_yaw_deg').value)
         self.tf_timeout = Duration(seconds=self.get_parameter('tf_timeout_s').value)
 
         inbound_topic = self.get_parameter('inbound_topic').value
@@ -189,8 +194,17 @@ class WebSocketClient(Node):
     def _camera_xyz_to_map_xy(self, depth_xyz):
         x_cam, y_cam, z_cam = depth_xyz
 
-        local_x = z_cam + self.cam_offset_x
-        local_y = -x_cam + self.cam_offset_y
+        # change_point.py와 동일한 카메라 장착 회전(cam_yaw) 보정.
+        # 카메라 기준 "전방"은 z_cam, "좌측"은 -x_cam (OpenCV: x=우측이므로 좌측=-x_cam)
+        cam_local_x = z_cam
+        cam_local_y = -x_cam
+        cos_yaw = math.cos(self.cam_yaw)
+        sin_yaw = math.sin(self.cam_yaw)
+        rotated_x = cam_local_x * cos_yaw - cam_local_y * sin_yaw
+        rotated_y = cam_local_x * sin_yaw + cam_local_y * cos_yaw
+
+        local_x = rotated_x + self.cam_offset_x
+        local_y = rotated_y + self.cam_offset_y
 
         point_in_base = PointStamped()
         point_in_base.header.frame_id = self.base_frame

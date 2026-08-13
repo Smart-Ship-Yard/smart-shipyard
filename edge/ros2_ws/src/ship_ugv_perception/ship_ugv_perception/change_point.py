@@ -37,9 +37,13 @@ class ChangePointDetector(Node):
         self.declare_parameter('output_topic', '/event_detection/map_point')
         self.declare_parameter('map_frame_id', 'map')
         self.declare_parameter('base_frame_id', 'base_link')
-        self.declare_parameter('camera_offset_x', 0.13)
-        self.declare_parameter('camera_offset_y', 0.09)
-        self.declare_parameter('camera_offset_z', 0.1)
+        # ★ 실측: base_link(바퀴축 중점) 기준 카메라 RGB 렌즈(광학중심) 위치 (2026-08-13 재실측)
+        #   x: 휠 축에서 전방 13.5cm
+        #   y: 차체 오른쪽 면 장착 → ROS(+y=좌측) 규약상 음수. chassis_width(0.178)/2와 일치
+        #   z: 지상고(URDF 0.075) + 차체 밑면에서 3.5cm
+        self.declare_parameter('camera_offset_x', 0.135)
+        self.declare_parameter('camera_offset_y', -0.089)
+        self.declare_parameter('camera_offset_z', 0.110)
         # ★ 카메라 장착 회전각 (실측: 로봇 정면 기준 오른쪽을 보도록 장착됨).
         #   yaw=0이면 카메라 정면=로봇 정면. 오른쪽을 보면 로봇 기준
         #   시계방향으로 돌아간 것이므로 REP-103 규약상 음수 각도.

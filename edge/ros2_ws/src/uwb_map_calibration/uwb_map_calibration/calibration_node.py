@@ -14,9 +14,11 @@ UWB <-> Map Calibration Node (ROS2)
 2. 사용자가 ~/calibrate (std_srvs/Trigger) 서비스를 호출하면:
    a. 로봇을 정지 상태에서 알고 있는 방향(예: map 좌표계 +x 방향)으로 직진시킨다는
       전제 하에, 그 구간 동안의 /uwb/pose 샘플을 수집한다 (COLLECTING 상태).
-   b. 수집 시간(기본 5초) 종료 후 시작점/끝점을 직선 피팅하여 uwb_frame 상에서의
-      진행 방향 벡터를 구하고, 이를 map 좌표계 상의 알려진 직진 방향과 비교해
-      회전각(theta)을 역산한다.
+   b. 수집된 전체 샘플에 대해 SVD 기반 총최소제곱(total least squares) 직선
+      피팅으로 uwb_frame 상에서의 진행 방향 벡터를 구하고, 이를 map 좌표계
+      상의 알려진 직진 방향과 비교해 회전각(theta)을 역산한다. (시작/끝 두
+      점만 쓰면 그 두 샘플에 낀 UWB 잔차가 그대로 각도 오차가 되므로, 수집된
+      모든 샘플을 다 활용해 노이즈에 강건하게 만든다.)
    c. 시작점을 두 좌표계의 원점 오프셋 계산에 사용해 평행이동(tx, ty)을 구한다.
    d. map -> uwb_frame 정적 TF를 발행(갱신)한다.
    e. 결과를 회차 번호를 붙여 파일로 저장한다 (재현/디버깅용).
@@ -33,6 +35,7 @@ import os
 import time
 from enum import Enum, auto
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
@@ -60,7 +63,11 @@ class UwbMapCalibration(Node):
         self.declare_parameter('map_frame_id', 'map')
         self.declare_parameter('uwb_frame_id', 'uwb_frame')
         self.declare_parameter('collection_duration_s', 5.0)  # 더 이상 종료 조건으로 안 씀, 하위 호환용
-        self.declare_parameter('min_travel_distance_m', 1.0)  # 직선 피팅 신뢰를 위한 최소 이동거리
+        # 직선 피팅 신뢰를 위한 최소 이동거리.
+        # ★ 1.4m (실측, 2026-08): 캘리브레이션 시 move_distance 1.5m로 주행하는데
+        #   기존 1.0m 기준에서는 실제로 약 0.85m만 쓰인 채 계산이 끝나버렸음.
+        #   1.4m로 올려 1.5m 주행을 거의 다 쓰게 하니 각도오차 5.58° -> 3.00°로 개선됨.
+        self.declare_parameter('min_travel_distance_m', 1.4)
         # ★ 로봇 최고속도(예: 0.15m/s)로는 고정된 5초 안에 1.0m를 못 채우는 구조적
         #   모순이 있어, 시간이 아니라 "실제 이동거리"를 종료 조건으로 바꿈.
         #   이 값은 순수 안전장치(로봇이 안 움직이거나 UWB가 끊겼을 때 무한 대기 방지)로만 씀.
@@ -208,8 +215,17 @@ class UwbMapCalibration(Node):
                 "더 길게, 더 곧게 직진 후 재시도하세요."
             )
 
-        # uwb_frame 상에서 관측된 진행 방향
-        uwb_heading = math.atan2(dy, dx)
+        # uwb_frame 상에서 관측된 진행 방향: 시작/끝 두 점이 아니라 수집된
+        # 전체 샘플에 대한 SVD 총최소제곱 직선 피팅으로 구한다 (양 끝 샘플만
+        # 쓰면 그 두 점의 UWB 잔차가 그대로 각도 오차로 들어가기 때문).
+        pts = np.array([(s[1], s[2]) for s in self.samples])
+        centered = pts - pts.mean(axis=0)
+        _, _, vt = np.linalg.svd(centered)
+        direction = vt[0]  # 주성분 방향 (부호는 ±180도 모호함)
+        if direction[0] * dx + direction[1] * dy < 0:
+            # 실제 주행 방향(시작->끝)과 반대로 나왔으면 뒤집어 부호를 맞춘다
+            direction = -direction
+        uwb_heading = math.atan2(direction[1], direction[0])
 
         # map 상에서는 known_heading_in_map_rad 방향으로 움직였다고 알고 있으므로
         # 회전각 theta = (map에서의 방향) - (uwb_frame에서의 방향)

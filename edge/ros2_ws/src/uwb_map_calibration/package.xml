@@ -11,6 +11,8 @@
   <depend>geometry_msgs</depend>
   <depend>std_srvs</depend>
   <depend>tf2_ros</depend>
+  <!-- calibration_node.py의 _compute_calibration 진행방향 SVD 피팅에 사용 — 누락 시 새 환경에서 rosdep 미해결 -->
+  <depend>python3-numpy</depend>
 
   <export>
     <build_type>ament_python</build_type>

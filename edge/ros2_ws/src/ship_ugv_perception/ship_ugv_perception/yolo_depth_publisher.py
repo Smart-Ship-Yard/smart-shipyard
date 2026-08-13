@@ -21,6 +21,7 @@ Astra+ 카메라로 Color+Depth를 받아 YOLO로 객체를 검출하고,
 
 import json
 import math
+import os
 import re
 import threading
 import numpy as np
