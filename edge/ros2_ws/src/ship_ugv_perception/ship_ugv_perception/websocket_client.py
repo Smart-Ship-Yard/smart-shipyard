@@ -90,11 +90,11 @@ class WebSocketClient(Node):
 
         self.declare_parameter('map_frame_id', 'map')
         self.declare_parameter('base_frame_id', 'base_link')
-        # ★ 실측: base_link 기준 카메라 렌즈 위치 (사용자 확인됨).
+        # ★ 실측: base_link 기준 카메라 RGB 렌즈 위치 (2026-08-13 재실측).
         # change_point.py와 반드시 동일한 값 유지 - 다르면 위험 이벤트 map_xy가
         # change_point.py의 /event_detection/map_point와 어긋난 위치로 발행됨.
-        self.declare_parameter('camera_offset_x', 0.13)
-        self.declare_parameter('camera_offset_y', 0.09)
+        self.declare_parameter('camera_offset_x', 0.135)
+        self.declare_parameter('camera_offset_y', -0.089)
         self.declare_parameter('camera_yaw_deg', -90.0)
         self.declare_parameter('tf_timeout_s', 0.3)
 
