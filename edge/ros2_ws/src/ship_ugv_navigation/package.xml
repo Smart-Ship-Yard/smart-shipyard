@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ship_ugv_navigation</name>
+  <version>0.1.0</version>
+  <description>Nav2 autonomous patrol for ship_ugv: circular waypoint patrol around the ship block, with event-driven stop/resume. Sim(Gazebo) and real robot share the same params/launch.</description>
+  <maintainer email="dhswjd2003@gmail.com">jg</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2_ros</depend>
+  <!-- 아래 넷은 실제로 import 한다. nav2 설치에 딸려 오므로 지금까지
+       선언이 없어도 동작했지만, 깨끗한 기계에서 rosdep install 할 때
+       빠지지 않도록 명시한다. -->
+  <depend>action_msgs</depend>          <!-- GoalStatus (순찰 노드) -->
+  <depend>lifecycle_msgs</depend>       <!-- GetState (Nav2 활성 확인) -->
+  <depend>nav2_msgs</depend>            <!-- NavigateToPose 액션 -->
+  <depend>nav2_common</depend>          <!-- RewrittenYaml (launch) -->
+  <!-- nav2_simple_commander 는 제거했다. Step 6 에서 BasicNavigator 대신
+       ActionClient 를 직접 쓰기로 바꿔(이유는 nav2_작업_정리.md 참고)
+       더 이상 import 하지 않는다. 주석에만 이름이 남아 있다. -->
+  <!-- <depend>nav2_simple_commander</depend> -->
+  <depend>nav2_behaviors</depend>       <!-- 복구 행동 플러그인 (BT 가 호출) -->
+
+  <!-- launch에서 기동하는 것들 (빌드 의존 아님, 런타임 의존) -->
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>ship_ugv_description</exec_depend>
+
+  <!-- 시뮬 전용 (실물 젯슨에는 설치 불필요) -->
+  <exec_depend>gazebo_ros</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

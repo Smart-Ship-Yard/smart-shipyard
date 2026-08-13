@@ -1,0 +1,278 @@
+<?xml version="1.0"?>
+<!--
+  ship_ugv_gazebo.xacro
+  ======================
+  시뮬(Gazebo Classic) 전용 서술. ship_ugv_core.urdf.xacro를 include한 뒤
+  그 위에 <gazebo> 태그(마찰, 센서, 플러그인)만 얹는다.
+
+  ★ core 파일은 절대 수정하지 않는다 ★
+    core에는 슬램 담당자가 맞춰둔 실측 TF 오프셋이 들어있고, 실물에서도 쓰이는
+    공용 파일이다. 여기서 include만 하고 원본은 건드리지 않는다.
+    (core 파일 상단 주석의 지시 그대로)
+
+  사용:
+    xacro ship_ugv_gazebo.xacro > /tmp/robot.urdf     # 확인용
+    (실제로는 sim_bringup.launch.py가 robot_description으로 처리)
+
+  ★★ 실물에는 이 파일을 보내지 않는다 ★★
+    관성/마찰/플러그인은 시뮬에서만 의미가 있다. 실물에는 진짜 물리법칙과
+    진짜 센서 드라이버가 있다.
+-->
+<robot name="ship_ugv" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- 실물/시뮬 공용 물리 서술을 그대로 가져온다 (수정 없음) -->
+  <xacro:include filename="$(find ship_ugv_description)/urdf/ship_ugv_core.urdf.xacro"/>
+
+  <!-- ================================================================
+       바퀴 구동 파라미터 (★ URDF 기하값과 의도적으로 다름 ★)
+       ================================================================
+       core의 track_width(0.2345) / wheel_radius(0.0335)는 캘리퍼로 잰
+       "생긴 모양" 값이고, 아래 값은 wheel_odom_bridge가 실주행에서
+       슬립·눌림까지 반영해 보정한 "유효" 값이다 (PR #14 wheel_odom_node
+       파라미터와 동일). 시뮬 물리 파라미터는 반드시 이쪽을 써야
+       "시뮬에서 1m = 실물에서 1m"가 성립한다.
+  -->
+  <xacro:property name="sim_wheel_separation" value="0.22568"/>
+  <xacro:property name="sim_wheel_diameter" value="0.0616"/>   <!-- 2 * 0.0308 -->
+
+  <!-- ================================================================
+       재질 색상 (Gazebo 화면에서 구분용, 물리와 무관)
+       ================================================================ -->
+  <gazebo reference="chassis_link">
+    <material>Gazebo/DarkGrey</material>
+  </gazebo>
+  <gazebo reference="laser">
+    <material>Gazebo/Red</material>
+  </gazebo>
+
+  <!-- ================================================================
+       마찰 계수
+       ================================================================
+       mu1/mu2 = 접촉면 마찰. kp/kd = 접촉 강성/감쇠(파고들기 방지).
+  -->
+  <!-- 바퀴: 접지력이 있어야 미끄러지지 않고 굴러간다 -->
+  <gazebo reference="left_wheel_link">
+    <mu1>1.0</mu1>
+    <mu2>1.0</mu2>
+    <kp>100000.0</kp>     <!-- 캐스터와 같은 이유로 완화 (2026-08-07) -->
+    <kd>1000.0</kd>
+    <material>Gazebo/Black</material>
+  </gazebo>
+  <gazebo reference="right_wheel_link">
+    <mu1>1.0</mu1>
+    <mu2>1.0</mu2>
+    <kp>100000.0</kp>     <!-- 캐스터와 같은 이유로 완화 (2026-08-07) -->
+    <kd>1000.0</kd>
+    <material>Gazebo/Black</material>
+  </gazebo>
+
+  <!-- 캐스터: core에서 스위블 조인트 없이 "고정된 구"로 근사했으므로,
+       마찰을 아주 낮게 두어 모든 방향으로 미끄러지며 실제 캐스터처럼 거동하게 한다.
+       마찰이 크면 구가 바닥에 붙어 제자리 회전을 방해한다.
+
+       ★ 마찰을 0이 아니라 0.05로 둔 이유 (2026-08-07 실측으로 수정)
+         (1) 실물 캐스터는 **고무 바퀴**다. 완전 무마찰은 실물과 더 먼 근사다.
+             실물은 스위블로 방향을 틀어 굴러가므로 "끌리는 저항"이 작을 뿐,
+             접지면 자체는 고무라 마찰이 0일 수 없다.
+         (2) 무마찰(0.0)로 두었더니 정지 상태에서도 로봇이 좌우로 흔들리고
+             (참값 angular.x ≈ 0.024 rad/s) 그 진동이 초당 3 mm씩 옆으로 밀어냈다.
+             무게중심 0.233 m가 트랙 폭 0.2345 m와 맞먹는 뒤뚱한 형상이라,
+             접촉점 하나가 완전 무마찰이면 진동이 감쇠되지 않는다.
+
+         0.05는 제자리 회전을 방해하지 않는다: 캐스터 접지 하중 약 19 N에
+         마찰력 0.95 N, 회전축에서 0.248 m -> 저항 토크 0.24 N·m.
+         바퀴가 낼 수 있는 회전 토크(약 14 N·m)의 2 % 수준이다.
+
+       ★ kp를 1e6 -> 1e5로 낮춘 이유
+         접촉이 너무 딱딱하면 미세하게 튕기며(linear.z 진동) 흔들림을 키운다.
+         무르게 하고 kd(감쇠)를 올려 접촉을 안정화한다. -->
+  <gazebo reference="caster_link">
+    <mu1>0.05</mu1>
+    <mu2>0.05</mu2>
+    <kp>100000.0</kp>
+    <kd>1000.0</kd>
+    <material>Gazebo/Grey</material>
+  </gazebo>
+
+  <!-- ================================================================
+       차동구동 플러그인 = 가짜 모터 드라이버 + 가짜 엔코더
+       ================================================================
+       실물의 wheel_odom_bridge(+아두이노)와 같은 자리를 차지한다.
+         /cmd_vel 구독  ->  바퀴 회전  ->  /wheel/odom 발행
+  -->
+  <gazebo>
+    <plugin name="diff_drive_controller" filename="libgazebo_ros_diff_drive.so">
+      <ros>
+        <!-- 실물과 토픽명을 한 글자도 다르지 않게 맞춘다.
+             이래야 나중에 "센서 소스만 교체" 이식이 실제로 성립한다. -->
+        <remapping>cmd_vel:=cmd_vel</remapping>
+        <remapping>odom:=wheel/odom</remapping>
+      </ros>
+
+      <update_rate>50</update_rate>
+
+      <left_joint>base_link_to_left_wheel</left_joint>
+      <right_joint>base_link_to_right_wheel</right_joint>
+
+      <!-- ★ URDF 기하값이 아니라 실주행 보정값 (위 property 주석 참고) -->
+      <wheel_separation>${sim_wheel_separation}</wheel_separation>
+      <wheel_diameter>${sim_wheel_diameter}</wheel_diameter>
+
+      <!-- 소형 DC 기어드모터(JGB37-520) 수준으로 제한.
+           너무 크면 시뮬에서만 급가속이 가능해져 실물과 거동이 벌어진다. -->
+      <max_wheel_torque>2.0</max_wheel_torque>
+      <max_wheel_acceleration>1.0</max_wheel_acceleration>
+
+      <!-- ENCODER(0): 바퀴 회전량으로 오도메트리 계산 -> 슬립 시 실물처럼 오차 발생.
+           WORLD(1)로 두면 참값이 나와 시뮬이 비현실적으로 정확해진다. -->
+      <odometry_source>0</odometry_source>
+
+      <odometry_frame>odom</odometry_frame>
+      <robot_base_frame>base_link</robot_base_frame>
+
+      <publish_odom>true</publish_odom>
+
+      <!-- ★★★ 이 프로젝트의 핵심 원칙 ★★★
+           TF 발행 권위자는 EKF 하나뿐이다.
+           - odom->base_link 는 ekf_local 이 발행
+           - map->odom  은 ekf_global(실물) / 시뮬 참값 노드가 발행
+           이 플러그인이 odom TF를 쏘면 odom의 부모가 둘이 되어 TF 트리가 깨지고,
+           실물과 시뮬의 구조가 달라져 파라미터 이식이 무의미해진다.
+           절대 true로 바꾸지 말 것. -->
+      <publish_odom_tf>false</publish_odom_tf>
+
+      <!-- 바퀴 TF는 robot_state_publisher가 joint_states를 보고 발행한다(아래 플러그인).
+           여기서도 쏘면 역시 이중 발행. -->
+      <publish_wheel_tf>false</publish_wheel_tf>
+    </plugin>
+  </gazebo>
+
+  <!-- ================================================================
+       조인트 상태 발행 (바퀴가 굴러가는 걸 RViz에서 보이게)
+       ================================================================
+       robot_state_publisher는 continuous 조인트의 현재 각도를 알아야
+       base_link->wheel TF를 만들 수 있다. 그 각도를 여기서 공급한다.
+  -->
+  <gazebo>
+    <plugin name="joint_state_publisher" filename="libgazebo_ros_joint_state_publisher.so">
+      <ros>
+        <remapping>~/out:=joint_states</remapping>
+      </ros>
+      <update_rate>30</update_rate>
+      <joint_name>base_link_to_left_wheel</joint_name>
+      <joint_name>base_link_to_right_wheel</joint_name>
+    </plugin>
+  </gazebo>
+
+  <!-- ================================================================
+       참값(ground truth) 위치 발행 — 실물의 UWB 자리를 대신한다
+       ================================================================
+       실물은 UWB로 절대 위치를 얻어 ekf_global이 map->odom을 발행한다.
+       시뮬에는 UWB가 없으므로 Gazebo가 알고 있는 참 위치를 꺼내 쓴다.
+       이 값을 ship_ugv_navigation의 fake_global_localization 노드가 받아
+       map->odom TF로 변환한다 (실물 ekf_global과 같은 역할·같은 계산식).
+
+       ★ 여기서 TF를 직접 쏘지 않는다.
+         frame_name을 odom으로 두면 ekf_local과 이중 발행이 된다.
+         오도메트리 메시지로만 내보내고 TF 변환은 fake_global_localization이
+         담당한다 — TF 권위자 단일화 원칙.
+  -->
+  <gazebo>
+    <plugin name="ground_truth_p3d" filename="libgazebo_ros_p3d.so">
+      <ros>
+        <remapping>odom:=odometry/ground_truth</remapping>
+      </ros>
+      <body_name>base_link</body_name>
+      <frame_name>world</frame_name>        <!-- Gazebo world 절대 좌표 -->
+      <update_rate>50.0</update_rate>
+      <gaussian_noise>0.0</gaussian_noise>  <!-- 참값이므로 노이즈 없음 -->
+    </plugin>
+  </gazebo>
+
+  <!-- ================================================================
+       2D 라이다 (RPLIDAR A1M8 모사)
+       ================================================================
+       core에서 laser 링크가 rpy="3.14159 0 0"(180도 뒤집힘)으로 정의돼 있어
+       실물의 거꾸로 장착 상태가 시뮬에서도 그대로 재현된다.
+
+       주의: 실물은 laser_filters로 후방 180도를 잘라낸 /scan_filtered를 쓴다.
+       시뮬은 360도 전체를 /scan으로 낸다. Nav2 launch에서 scan_topic을
+       인자로 받아 시뮬=/scan, 실물=/scan_filtered로 전환한다.
+       -> 실물이 후방을 못 보므로, 후진 복구 행동(backup)은 nav2_params에서
+          보수적으로 제한한다.
+  -->
+  <gazebo reference="laser">
+    <sensor name="rplidar" type="ray">
+      <pose>0 0 0 0 0 0</pose>
+      <visualize>false</visualize>
+      <always_on>true</always_on>
+      <update_rate>10.0</update_rate>       <!-- A1M8 실측 스캔 주파수대 -->
+      <ray>
+        <scan>
+          <horizontal>
+            <samples>360</samples>          <!-- 1도 간격 -->
+            <resolution>1</resolution>
+            <min_angle>-3.14159</min_angle>
+            <max_angle>3.14159</max_angle>
+          </horizontal>
+        </scan>
+        <range>
+          <min>0.2</min>                    <!-- slam_toolbox_mapping.yaml의 min_laser_range와 동일 -->
+          <max>12.0</max>                   <!-- 동 max_laser_range -->
+          <resolution>0.015</resolution>
+        </range>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.01</stddev>             <!-- 1cm. 노이즈 0이면 시뮬이 비현실적으로 쉬워짐 -->
+        </noise>
+      </ray>
+      <plugin name="rplidar_controller" filename="libgazebo_ros_ray_sensor.so">
+        <ros>
+          <remapping>~/out:=scan</remapping>
+        </ros>
+        <output_type>sensor_msgs/LaserScan</output_type>
+        <frame_name>laser</frame_name>       <!-- core의 링크명과 일치 -->
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <!-- ================================================================
+       IMU
+       ================================================================
+       ekf_local이 /imu/data의 angular_velocity.z(자이로)만 사용한다.
+       (ekf_local.yaml에서 절대 orientation과 가속도는 꺼져 있음)
+  -->
+  <gazebo reference="imu">
+    <sensor name="imu_sensor" type="imu">
+      <always_on>true</always_on>
+      <update_rate>100.0</update_rate>
+      <visualize>false</visualize>
+      <imu>
+        <angular_velocity>
+          <z>
+            <noise type="gaussian">
+              <mean>0.0</mean>
+              <stddev>0.002</stddev>        <!-- 저가 MEMS 자이로 수준 -->
+              <bias_mean>0.0000075</bias_mean>
+              <bias_stddev>0.0000008</bias_stddev>
+            </noise>
+          </z>
+        </angular_velocity>
+        <linear_acceleration>
+          <x><noise type="gaussian"><mean>0.0</mean><stddev>0.017</stddev></noise></x>
+          <y><noise type="gaussian"><mean>0.0</mean><stddev>0.017</stddev></noise></y>
+          <z><noise type="gaussian"><mean>0.0</mean><stddev>0.017</stddev></noise></z>
+        </linear_acceleration>
+      </imu>
+      <plugin name="imu_controller" filename="libgazebo_ros_imu_sensor.so">
+        <ros>
+          <remapping>~/out:=imu/data</remapping>   <!-- 실물 witmotion 드라이버와 동일 토픽 -->
+        </ros>
+        <frame_name>imu</frame_name>               <!-- core의 링크명(imu_link 아님)과 일치 -->
+        <initial_orientation_as_reference>false</initial_orientation_as_reference>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+</robot>

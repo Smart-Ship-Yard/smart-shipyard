@@ -1,0 +1,15 @@
+# Gazebo(gzserver) 자체 노드 파라미터 — 시뮬 전용
+#
+# ★ publish_rate 를 올리는 이유 (2026-08-07 실측)
+#   /clock 발행 주기는 **use_sim_time 을 쓰는 모든 노드의 타이머 해상도**를
+#   결정한다. 기본값 10 Hz 로 두면 ekf_local 이 frequency: 50.0 으로 설정돼
+#   있어도 실제로는 10 Hz 로만 돈다(실측 확인). Nav2 컨트롤러는 보통 20 Hz 로
+#   도는데 시계가 10 Hz 면 제어 주기가 깨진다.
+#
+#   100 Hz 로 올리면 ekf_local(50 Hz)·Nav2 컨트롤러(20 Hz)가 설정대로 동작한다.
+#   /clock 메시지는 매우 작아 100 Hz 발행 비용은 무시할 수준이다.
+#
+# ※ 실물에는 해당 없음 — 실물은 시스템 시계를 쓰므로 /clock 자체가 없다.
+gazebo:
+  ros__parameters:
+    publish_rate: 100.0

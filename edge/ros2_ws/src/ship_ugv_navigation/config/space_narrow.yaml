@@ -1,0 +1,37 @@
+# ============================================================================
+#  space_narrow.yaml — 좁은 방용 덮어쓰기  (기숙사 방 / shipyard_map_JG_room_v2)
+# ============================================================================
+#  nav2_params.yaml 위에 겹쳐 로드된다. **여기 적힌 값만** 덮어쓰고 나머지는
+#  전부 nav2_params.yaml 값이 그대로 쓰인다.
+#
+#      ros2 launch ship_ugv_navigation navigation.launch.py space:=narrow ...
+#
+#  ⚠️ 이 파일에 값을 추가하지 말 것. 장소와 무관한 값은 nav2_params.yaml 에
+#     둔다. 여기 늘어날수록 두 space 파일이 어긋날 위험이 커진다.
+#     지금 담당하는 것은 아래 3개뿐이고, 4번째 차이(spin)는 launch 가
+#     navigate_no_spin.xml 을 골라주는 것으로 처리된다.
+#
+#  ── 왜 좁은 방은 값이 달라야 하나 ────────────────────────────────────────
+#  shipyard_map_JG_room_v2 기준 순찰 가능한 여유가 0.075 m 뿐이다(check_patrol_space.py).
+#  wide 값(inflation 0.25)을 그대로 쓰면 통로 전체가 "장애물 근처"로 칠해져
+#  플래너가 경로를 아예 못 찾는다.
+#
+#  대신 감수하는 것: 벽에서 10 cm 까지 붙어 다닌다. 좁은 방에서는 다른 수가
+#  없고, 감속 0.5 m/s^2 기준 정지거리가 2.25 cm 라 부딪히지는 않는다.
+# ============================================================================
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      # 좁은 방에서는 5x5 창이 방 전체를 덮어 rolling window 의미가 없고
+      # 갱신 비용만 커진다. 2x2 면 전방 1 m 를 보므로 0.15 m/s 에 충분하다.
+      width: 2
+      height: 2
+      inflation_layer:
+        inflation_radius: 0.10
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      inflation_layer:
+        inflation_radius: 0.10

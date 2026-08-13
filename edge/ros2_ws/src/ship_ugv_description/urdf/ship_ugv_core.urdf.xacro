@@ -101,6 +101,28 @@
     </inertial>
   </xacro:macro>
 
+  <!-- ================= 표시 색상 (RViz 전용) =================
+       물리·좌표와 무관하며 RViz 렌더링에만 쓰인다.
+       (Gazebo 화면 색은 ship_ugv_gazebo.xacro의 <gazebo> 태그가 따로 담당한다.
+        RViz는 <gazebo> 안을 읽지 않으므로 여기에도 정의해야 한다.)
+
+       색을 구분해두는 실용적 이유: RViz에서 로봇이 전부 흰색이면
+       앞뒤를 구분할 수 없다. base_link가 차체 중심이 아니라 뒷바퀴 축이라
+       "차체가 앞으로 얼마나 튀어나왔는지"를 눈으로 확인해야 할 일이 많다.
+       전방에 달린 라이다를 빨강으로 칠해 앞쪽 표식으로 쓴다. -->
+  <material name="chassis_grey">
+    <color rgba="0.25 0.27 0.30 1.0"/>
+  </material>
+  <material name="wheel_black">
+    <color rgba="0.10 0.10 0.10 1.0"/>
+  </material>
+  <material name="caster_silver">
+    <color rgba="0.70 0.70 0.72 1.0"/>
+  </material>
+  <material name="laser_red">
+    <color rgba="0.85 0.15 0.15 1.0"/>
+  </material>
+
   <!-- ================= base_link ================= -->
   <!-- 물리적 실체 없는 기준 프레임. 실제 차체는 chassis_link로 분리
        (base_link를 바퀴축 중점/지면 기준으로 유지하기 위함) -->
@@ -118,6 +140,7 @@
       <geometry>
         <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
       </geometry>
+      <material name="chassis_grey"/>
     </visual>
     <collision>
       <geometry>
@@ -141,6 +164,7 @@
         <geometry>
           <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
         </geometry>
+        <material name="wheel_black"/>
       </visual>
       <collision>
         <geometry>
@@ -168,6 +192,7 @@
       <geometry>
         <sphere radius="${caster_radius}"/>
       </geometry>
+      <material name="caster_silver"/>
     </visual>
     <collision>
       <geometry>
@@ -207,6 +232,7 @@
       <geometry>
         <cylinder radius="0.03" length="0.04"/>
       </geometry>
+      <material name="laser_red"/>
     </visual>
     <xacro:cylinder_inertial mass="${sensor_mass}" r="0.03" h="0.04"/>
   </link>

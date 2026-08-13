@@ -1,0 +1,548 @@
+# ============================================================================
+#  nav2_params.yaml — ship_ugv 자율주행 공통 설정  (시뮬·실물 공용)
+# ============================================================================
+#  ★ 이 파일만으로는 완성되지 않는다 ★
+#
+#  Nav2 설정은 "공통 1 + 장소별 1" 로 나뉜다. navigation.launch.py 가 겹쳐 읽는다.
+#
+#      config/nav2_params.yaml    ← 이 파일. 장소와 무관한 값 전부
+#      config/space_narrow.yaml   ← 좁은 방에서만 다른 값
+#      config/space_wide.yaml     ← 넓은 곳에서만 다른 값
+#
+#  장소에 따라 달라지는 것은 딱 4가지다.
+#
+#  ┌──────────────────────────┬──────────────────┬──────────────────┬─────────┐
+#  │ 항목                     │ narrow (좁은 방) │ wide (넓은 곳)   │ 어디에  │
+#  ├──────────────────────────┼──────────────────┼──────────────────┼─────────┤
+#  │ local_costmap 크기       │ 2 x 2 m          │ 5 x 5 m          │ yaml    │
+#  │ local  inflation_radius  │ 0.10 m           │ 0.25 m           │ yaml    │
+#  │ global inflation_radius  │ 0.10 m           │ 0.25 m           │ yaml    │
+#  │ 복구 행동 spin(제자리회전)│ 쓰지 않음        │ 사용             │ xml     │
+#  └──────────────────────────┴──────────────────┴──────────────────┴─────────┘
+#     앞의 3개 -> space_narrow.yaml / space_wide.yaml
+#     마지막 1개 -> behavior_trees/navigate_no_spin.xml / navigate_with_spin.xml
+#
+#  ROS 2 는 --params-file 을 여러 개 받으면 **나중 파일이 이긴다.** 그래서
+#  space 파일에 적힌 값만 덮어써지고 나머지는 이 파일 값이 그대로 살아 있다.
+#
+#  쓰는 법 — 파일을 열어 고칠 일이 없다. 단어 하나만 바꾸면 위 4가지가 다 바뀐다.
+#
+#      ros2 launch ship_ugv_navigation navigation.launch.py space:=narrow ...
+#      ros2 launch ship_ugv_navigation navigation.launch.py space:=wide   ...
+#
+#  왜 이렇게 나눴나: 시연 당일에 YAML 을 열어 값을 고치는 것은 사고가 난다.
+#  그렇다고 설정 전체를 두 벌 복사해두면 나중에 한쪽만 고치고 다른 쪽을 잊는다.
+#  **공통은 한 곳, 다른 것만 따로** 두는 것이 양쪽 문제를 다 피한다.
+#
+#  ── 값의 출처 원칙 ──────────────────────────────────────────────────────
+#    - 로봇이 결정하는 값(차체 크기, 속도·가속 한계)은 실측·계산으로 확정하고
+#      이 파일에 둔다. 장소가 바뀌어도 그대로다.
+#    - 장소가 결정하는 값은 이 파일에 **아예 없다.** 위 표의 4가지가 전부이고
+#      space_*.yaml / navigate_*.xml 한 곳에만 존재한다.
+#
+#  ※ AMCL은 쓰지 않는다.
+#    이 프로젝트는 위치 추정을 EKF가 담당한다(실물 ekf_global = UWB 융합,
+#    시뮬 fake_global_localization = Gazebo 참값). 둘 다 map->odom TF를
+#    발행하므로 AMCL을 켜면 같은 TF를 두 주체가 쏘게 되어 트리가 깨진다.
+# ============================================================================
+
+
+# ============================================================================
+#  값의 근거 — 로봇이 결정하는 것들
+# ============================================================================
+#
+#  ── 차체 footprint (ship_ugv_core.urdf.xacro 실측) ──────────────────────
+#  ★ base_link가 차체 중심이 아니라 "뒷바퀴 축"이다. 앞으로 많이 튀어나와 있다.
+#      앞  +0.332 m  = chassis_offset_x(0.1315) + chassis_length/2(0.2005)
+#      뒤  -0.069 m  = wheel_axle_to_rear_face
+#      좌우 ±0.089 m = chassis_width(0.178) / 2
+#
+#  원형 근사(robot_radius)를 쓰면 반경이 0.344 m가 되어 3.5 m 방에서는
+#  과보호가 심하다. 반드시 다각형 footprint를 쓴다.
+#
+#  ── 속도 한계 ────────────────────────────────────────────────────────────
+#  슬램 담당자가 motion_controller_node.py에 정해둔 값을 그대로 따른다.
+#      max_linear_speed  0.15 m/s
+#      max_angular_speed 0.6  rad/s
+#
+#  ⚠️ 중요: 이 제한은 motion_controller_node 안에서만 걸린다.
+#     /cmd_vel을 받는 wheel_odom_bridge에는 클램프가 없고 아두이노 펌웨어도
+#     PWM_MAX=255 풀레인지다. Nav2는 motion_controller를 거치지 않고 /cmd_vel을
+#     직접 쏘므로, **속도 제한을 이 파일이 책임진다.**
+#
+#  ── 가속 한계 (속도 한계에서 유도) ───────────────────────────────────────
+#  가속도 = 최고속도 / 최고속 도달시간.  도달시간 0.5초를 채택했다.
+#      선가속  0.15 / 0.5 = 0.30 m/s^2
+#      각가속  0.6  / 0.5 = 1.20 rad/s^2
+#
+#  0.5초를 고른 근거:
+#    1) Nav2 컨트롤러 20 Hz 기준 10 제어주기 — 컨트롤러가 조절할 여유가 있다
+#    2) 감속 0.5 m/s^2 기준 정지거리 2.25 cm — inflation 대비 충분
+#    3) 순찰(반지름 0.95 m)에 필요한 각속도 0.158 rad/s를 0.13초에 도달
+#    4) 아두이노 PID에 가속 램프가 없어, 급격한 명령은 토크 스파이크를 만든다
+#
+#  ── 물리적 상한 (JGB37-520 사양표 + URDF 질량 3.62 kg 로 계산) ──────────
+#  바퀴 반지름 0.0308 m, 트랙 폭 0.22568 m (둘 다 보정된 실측값)
+#
+#      최고 속도   정격 250 RPM  -> 0.806 m/s
+#                  무부하 330 RPM -> 1.064 m/s
+#        => 담당자 제한 0.15 m/s 는 정격의 19%. 운용 회전수 47 RPM.
+#           모터가 못 내는 게 아니라 **일부러 느리게 잡은 것**이 수치로 확인된다.
+#
+#      가속 한계   모터 토크(정격 3.5 kg·cm) -> 6.16 m/s^2
+#                  바퀴 슬립                 -> 4.61 m/s^2   ← 진짜 상한
+#                  뒤로 젖혀짐               -> 5.73 m/s^2
+#                  시뮬 실측 도달치          -> 0.84 m/s^2
+#        => 모터(6.16)가 접지력(4.61)보다 강하다. 급가속하면 모터가 힘이
+#           달리는 게 아니라 바퀴가 헛돈다.
+#        => 채택값 0.3 m/s^2 은 모터 한계의 4.9%, 슬립 한계의 6.5%.
+#           질량 3.5 kg 이 대략치라 2배로 틀려도 여전히 10배 여유가 있다.
+#
+#      각가속 한계 제자리 회전 토크 2.52 N·m -> 대략 39 rad/s^2
+#        => 채택값 1.2 rad/s^2 은 그 3.0%.
+#
+#    -> 제약은 "힘"이 아니라 "부드러움"이다. 감속만 0.5로 비대칭을 준다.
+#    -> 실물 가속 성능은 사양표로 확정되었으므로 Step 8 에서 실측할 것이 없다.
+#
+#  ── 모터 데드밴드는 여기 반영하지 않는다 ─────────────────────────────────
+#  motion_controller_node.py 의 min_linear 0.04 / min_angular 0.15 를 그대로
+#  옮기면 순찰이 깨진다. 이유는 velocity_smoother 절의 주석 참고.
+#  Nav2 는 FollowPath 의 min_approach_linear_velocity 로 이미 대응한다.
+# ============================================================================
+
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false            # launch가 시뮬일 때 true로 덮어씀
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odometry/local    # 실물·시뮬 공통 (ekf_local 출력)
+    bt_loop_duration: 10
+    default_server_timeout: 20
+
+    # ★ 행동트리(BT)는 Nav2 기본 대신 우리 것을 쓴다. space 가 골라준다.
+    #     space:=narrow -> behavior_trees/navigate_no_spin.xml
+    #     space:=wide   -> behavior_trees/navigate_with_spin.xml
+    #   둘 다 Nav2 기본 트리 복사본이고 차이는 <Spin> 한 줄뿐이다.
+    #   (둘 다 후진 거리는 0.30 -> 0.15 로 줄여두었다. 후방을 못 보기 때문)
+    #
+    #   경로는 navigation.launch.py 가 절대경로로 주입한다. 패키지 설치 위치를
+    #   YAML 안에서는 알 수 없기 때문이다(map_server 의 yaml_filename 과 같음).
+    default_nav_to_pose_bt_xml: ""
+
+    # ★ Humble 의 nav2_bringup 기준 목록을 **그대로** 쓴다. 줄이지 말 것.
+    #
+    #   bt_navigator 는 트리를 두 개 띄운다.
+    #       navigate_to_pose        <- 우리 트리 (space 가 고른 것)
+    #       navigate_through_poses  <- Nav2 기본 트리 (우리는 쓰지 않는다)
+    #   쓰지 않아도 **활성화 시점에 둘 다 로드**되므로, 기본 트리가 쓰는 노드가
+    #   하나라도 빠지면 bt_navigator 가 activate 에서 죽고 스택 전체가 안 뜬다.
+    #       실제로 겪은 오류: "Node not recognized: RemovePassedGoals"
+    #
+    #   목록을 줄여서 얻는 것은 없다(플러그인 라이브러리 로드일 뿐이다).
+    #   spin 관련 노드도 여기 들어 있어야 space:=wide 트리가 뜬다.
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_smooth_path_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_assisted_teleop_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_drive_on_heading_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_is_path_valid_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_truncate_path_local_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_path_expiring_timer_condition
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_single_trigger_bt_node
+      - nav2_goal_updated_controller_bt_node
+      - nav2_is_battery_low_condition_bt_node
+      - nav2_navigate_through_poses_action_bt_node
+      - nav2_navigate_to_pose_action_bt_node
+      - nav2_remove_passed_goals_action_bt_node
+      - nav2_planner_selector_bt_node
+      - nav2_controller_selector_bt_node
+      - nav2_goal_checker_selector_bt_node
+      - nav2_controller_cancel_bt_node
+      - nav2_path_longer_on_approach_bt_node
+      - nav2_wait_cancel_bt_node
+      - nav2_spin_cancel_bt_node
+      - nav2_back_up_cancel_bt_node
+      - nav2_assisted_teleop_cancel_bt_node
+      - nav2_drive_on_heading_cancel_bt_node
+      - nav2_is_battery_charging_condition_bt_node
+
+
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    controller_frequency: 20.0     # 20 Hz. 가속 램프 0.5초 = 10 주기
+    odom_topic: /odometry/local
+
+    # 목표 도달 판정. 순찰 웨이포인트는 정밀할 필요가 없어 넉넉히 잡는다.
+    # 좁히면 마지막 몇 cm에서 미세 조정하느라 시간을 낭비한다.
+    general_goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.15
+      yaw_goal_tolerance: 0.35     # 약 20도. 순찰이라 방향은 느슨해도 된다
+      stateful: true
+    goal_checker_plugins: ["general_goal_checker"]
+
+    # 로봇이 멈춰 있는지 감시. 이 속도 이하로 이 시간 이상이면 실패 처리.
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5      # 차동구동은 횡이동이 없으므로 크게(무시)
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+
+    progress_checker_plugin: "progress_checker"
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.3
+      movement_time_allowance: 15.0    # 0.15 m/s면 15초에 2 m 이상 가야 정상
+
+    # ── 컨트롤러: Regulated Pure Pursuit ──────────────────────────────────
+    #   DWB가 아니라 RPP를 쓰는 이유:
+    #     - 원형 경로 추종이 부드럽다 (순찰이 원이다)
+    #     - 튜닝할 파라미터가 훨씬 적다. 좁은 공간에서 DWB는 튜닝 지옥
+    #     - 곡률·장애물 근접 시 자동 감속(regulated) 기능이 내장
+    controller_plugins: ["FollowPath"]
+    FollowPath:
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+
+      desired_linear_vel: 0.15         # = 담당자 속도 제한
+      # 데드밴드(0.04) 위로 잡는다. 이보다 작으면 모터가 안 돈다.
+      min_approach_linear_velocity: 0.05
+      approach_velocity_scaling_dist: 0.4
+
+      # ── 전방 주시 거리 (lookahead) ─────────────────────────────────────
+      #   순수 추종은 경로 위 "앞의 한 점"을 향해 조향한다.
+      #   짧으면 경로를 바짝 따라가지만 흔들리고, 길면 부드럽지만 코너를
+      #   크게 돌아 안쪽을 잘라 먹는다. 0.15 m/s 에는 0.25~0.6 m 가 맞았다.
+      #
+      #   실제 사용값 = 속도 x lookahead_time 을 [min, max] 로 자른 것
+      #       0.15 m/s x 2.0 = 0.30 m  (평상시)
+      #
+      #   ★ 이 점이 차체 안쪽에 찍히는 것은 정상이다 (2026-08-11 확인)
+      #     실측하면 base_link 로부터 0.13~0.31 m 라 차체 앞 끝(0.332 m)보다
+      #     안쪽이다. RViz 에서 주황 점이 로봇 몸 안에 있는 것처럼 보인다.
+      #     자동차형 로봇이라면 문제지만 **차동구동에는 문제가 없다.**
+      #     제어점이 base_link 이고 제자리 회전이 되므로 곡률식(2y/L^2)이
+      #     그대로 성립한다.
+      #
+      #   ⚠️ 실제로 늘려봤다가 되돌렸다 (2026-08-11)
+      #     "점이 차체 안에 있으면 안 된다"고 판단해 min 0.45 / time 3.0 으로
+      #     늘렸더니 demo_room 에서 **목표 2개 모두 실패**했다. 전방주시가
+      #     길어지자 중앙 블록을 가로지르는 방향으로 조향해 충돌 검사에
+      #     계속 걸린 것이다. 원래 값에서는 둘 다 성공했다.
+      #     -> 좁은 실내에서는 짧은 전방주시가 맞다. 늘리지 말 것.
+      lookahead_dist: 0.4
+      min_lookahead_dist: 0.25
+      max_lookahead_dist: 0.6
+      use_velocity_scaled_lookahead_dist: true
+      lookahead_time: 2.0
+
+      # 곡률 기반 감속 — 원형 순찰에서 특히 유용
+      use_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 0.4
+      regulated_linear_scaling_min_speed: 0.05
+
+      # ★ 코스트 기반 감속은 끈다 (2026-08-11 실측 후 결정)
+      #   이 기능은 "장애물에 가까우면 느려진다"인데, 우리 상황에선 손해만 크다.
+      #
+      #   실측: demo_room(3.7 x 3.6 m)에서 space:=wide 로 주행했더니
+      #         최고 속도는 0.150 이 나왔지만 **주행 중 평균이 0.050** 이었다.
+      #         방이 작아 팽창 영역(0.25 m)이 바닥 거의 전체를 덮는 바람에
+      #         감속이 상시 걸려 계속 최소 속도(0.05)로 기어간 것이다.
+      #
+      #   끄는 것이 맞는 이유:
+      #     - 최고 속도 0.15 m/s 자체가 이미 모터 정격의 19% 인 서행이다.
+      #       여기서 1/3 로 더 줄일 안전상 이유가 없다.
+      #     - 좁은 실내에서는 항상 장애물 근처라 "가까울 때만"이 성립하지 않는다.
+      #     - 실제 충돌 회피는 inflation + 컨트롤러의 footprint 충돌 검사가
+      #       이미 담당한다(use_collision_detection: true).
+      #
+      #   곡률 기반 감속(use_regulated_linear_velocity_scaling)은 그대로 켜둔다.
+      #   그건 급회전에서 미끄러지지 않게 하는 것이라 성격이 다르다.
+      use_cost_regulated_linear_velocity_scaling: false
+
+      # ★ 제자리 회전으로 방향 맞추기 — 켜 둔다. 끄면 더 나빠진다.
+      #
+      #   경로 방향과 40도 이상 어긋나면 전진을 멈추고 제자리에서 방향부터 맞춘다.
+      #   끄면 RPP 는 순수 추종만 하는데, 목표점이 뒤쪽에 있으면 곡률이 발산해
+      #   제자리에서 뱅뱅 돈다. allow_reversing 도 false 라 후진으로 빠져나올
+      #   수단이 없다. 복구 행동 spin 과 달리 이건 **선택 사항이 아니다.**
+      #     spin               : 이미 실패한 뒤 무조건 90도. 없어도 대기·후진이 대체
+      #     rotate_to_heading  : 평상시 경로 추종에 필요한 만큼만. 대체 수단 없음
+      #
+      #   ⚠️ 다만 회전에 필요한 공간을 반드시 확보해야 한다 (Step 6 설계 입력)
+      #
+      #     제자리 회전 외접 반지름 = sqrt(0.352^2 + 0.109^2) = 0.368 m
+      #       (footprint 앞 0.332 + 패딩 0.02, 좌우 0.089 + 패딩 0.02)
+      #     주행 중 좌우로 필요한 공간은 0.109 m 뿐이므로
+      #       -> 회전하려면 **옆으로 0.259 m 가 추가로** 있어야 한다
+      #
+      #     shipyard_map_JG_room_v2(내 방) 실측 순찰 여유는 0.075 m 다.
+      #     즉 그 방에서는 어떤 방식으로도 큰 방향 전환이 불가능하다.
+      #     (rotate_to_heading 을 꺼도 마찬가지다. 각속도 0.6 / 선속도 0.15 면
+      #      최소 선회 반지름이 0.25 m 라 호를 그려도 걸린다)
+      #
+      #     -> 좁은 방 대응은 이 파라미터가 아니라 순찰 경로 설계로 한다.
+      #        1) 로봇을 순찰 원의 접선 방향에 맞춰 출발시킨다
+      #        2) 웨이포인트 간 방향 변화를 40도 미만으로 유지한다
+      #           (원 위 12개 = 30도. 아슬아슬하므로 늘리는 편이 안전)
+      #        회전을 시도조차 하지 않게 만드는 것이 유일한 해법이다.
+      #
+      #   회전을 시도했다가 못 하는 경우에도 부딪히지는 않는다. 컨트롤러가
+      #   충돌을 미리 보고 멈춘다("detected collision ahead"). 대신 그 자리에서
+      #   진행이 막히므로, 경고가 자주 뜨면 공간이 부족하다는 신호로 읽는다.
+      use_rotate_to_heading: true
+      rotate_to_heading_min_angle: 0.7        # 약 40도
+      rotate_to_heading_angular_vel: 0.5
+      max_angular_accel: 1.2                  # = 0.6 / 0.5초
+
+      allow_reversing: false                  # ⚠️ 아래 주석 참고
+      max_robot_pose_search_dist: 5.0
+      use_collision_detection: true
+      transform_tolerance: 0.2
+      # allow_reversing를 false로 두는 이유:
+      #   실물은 laser_filters가 후방 180도를 잘라내 뒤를 보지 못한다.
+      #   후진하면 안 보이는 곳으로 가는 셈이라 금지한다.
+
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom            # 로컬은 odom 기준 (map 끊겨도 회피는 계속)
+      robot_base_frame: base_link
+      rolling_window: true          # 로봇을 따라다니는 창
+
+      # ※ width / height 는 이 파일에 없다 -> space_narrow.yaml / space_wide.yaml
+      #   (narrow 2x2 / wide 5x5)
+
+      resolution: 0.05              # 맵과 동일하게 5 cm/셀
+
+      # ★ 원형 근사 대신 다각형. base_link가 뒷바퀴 축이라 앞뒤 비대칭이다.
+      footprint: "[[0.332, 0.089], [0.332, -0.089], [-0.069, -0.089], [-0.069, 0.089]]"
+      footprint_padding: 0.02
+
+      plugins: ["obstacle_layer", "inflation_layer"]
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          # 시뮬 /scan(360도) / 실물 /scan_filtered(후방 180도 제거).
+          # navigation.launch.py 가 use_sim_time 을 보고 자동으로 치환한다.
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          raytrace_max_range: 12.0     # RPLIDAR A1M8 실측 최대
+          raytrace_min_range: 0.2      # 실측 최소
+          obstacle_max_range: 8.0      # 이 밖은 장애물로 찍지 않음(노이즈 배제)
+          obstacle_min_range: 0.2
+          inf_is_valid: false
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # ※ inflation_radius 는 이 파일에 없다 -> space_*.yaml (0.10 / 0.25)
+        cost_scaling_factor: 3.0
+
+      always_send_full_costmap: true
+
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      resolution: 0.05
+      track_unknown_space: true     # 미탐사 영역으로 경로를 뽑지 않는다
+
+      footprint: "[[0.332, 0.089], [0.332, -0.089], [-0.069, -0.089], [-0.069, 0.089]]"
+      footprint_padding: 0.02
+
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          raytrace_max_range: 12.0
+          raytrace_min_range: 0.2
+          obstacle_max_range: 8.0
+          obstacle_min_range: 0.2
+          inf_is_valid: false
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # ※ inflation_radius 는 이 파일에 없다 -> space_*.yaml (0.10 / 0.25)
+        cost_scaling_factor: 3.0
+
+      always_send_full_costmap: true
+
+
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    expected_planner_frequency: 1.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      # NavFn(다익스트라)을 쓴다. Smac Hybrid는 차량형 조향을 위한 것이라
+      # 제자리 회전이 되는 차동구동에는 과하고 느리다.
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.2                 # 목표에 정확히 못 가면 이 반경 안으로
+      use_astar: false
+      allow_unknown: false           # 미탐사 영역 통과 금지
+
+
+behavior_server:
+  ros__parameters:
+    use_sim_time: false
+    # ⚠️ Humble(nav2 1.1.x) 문법이다. 최신 Nav2 문서를 보고
+    #    local_costmap_topic / global_costmap_topic 처럼 쓰면 조용히 무시된다
+    #    (선언되지 않은 파라미터라 경고도 안 뜬다). 반드시 단수형으로 쓸 것.
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 10.0
+
+    # ★ 복구 행동 3종을 **항상 등록**해둔다. 실제로 무엇을 쓸지는
+    #   행동트리(BT xml)가 정하고, 그 xml 은 space 가 고른다.
+    #
+    #     space:=narrow (navigate_no_spin.xml)   -> backup, wait 만 호출
+    #     space:=wide   (navigate_with_spin.xml) -> spin, backup, wait 호출
+    #
+    #   왜 항상 등록하나: 여기서 spin 을 빼면 /spin 액션 서버가 사라지는데,
+    #   BT 노드는 **생성 시점에** 액션 서버를 찾아 없으면 예외를 던진다
+    #   (nav2_behavior_tree/bt_action_node.hpp 의 createActionClient).
+    #   즉 yaml 과 xml 이 어긋나는 순간 bt_navigator 가 configure 에서 죽는다.
+    #   등록만 해두면 아무도 안 부르는 액션 서버 하나가 놀 뿐이라 비용이 없고,
+    #   어긋나서 죽는 상태 자체가 생기지 않는다.
+    behavior_plugins: ["spin", "backup", "wait"]
+
+    spin:
+      plugin: "nav2_behaviors/Spin"
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+    wait:
+      plugin: "nav2_behaviors/Wait"
+
+    # ⚠️ Humble 에는 local_frame 이 없다. global_frame 하나뿐이고
+    #    그 값은 map 이 아니라 odom 이다. 복구 행동은 지도가 아니라
+    #    현재 위치 기준으로 짧게 움직이는 것이라 odom 프레임에서 동작한다.
+    global_frame: odom
+    robot_base_frame: base_link
+    transform_tolerance: 0.2
+
+    # backup 과 spin 이 공통으로 쓰는 충돌 예측 시간
+    simulate_ahead_time: 2.0
+
+    # spin 전용 속도 값. 우리 로봇 기준으로 맞춰두었다.
+    # (Humble 기본값 1.0 / 0.4 / 3.2 는 우리에겐 너무 빠르다)
+    max_rotational_vel: 0.6          # = 담당자 속도 제한
+    min_rotational_vel: 0.15         # = 모터 데드밴드 (제자리 회전이라 해당됨)
+    rotational_acc_lim: 1.2          # = 0.6 / 0.5초
+
+
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: false
+    smoothing_frequency: 20.0
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+
+    # ★ 이 노드가 로봇으로 나가는 마지막 관문이다.
+    #   navigation.launch.py 가 remapping 으로
+    #       controller -> /cmd_vel_nav -> (여기) -> /cmd_vel -> 로봇
+    #   순서를 만든다. 실물 펌웨어에도 wheel_odom_bridge 에도 클램프가 없어
+    #   속도·가속 제한을 걸 수 있는 곳이 여기뿐이다.
+
+    #            [ x,    y,   theta]
+    max_velocity: [0.15, 0.0, 0.6]     # 담당자 속도 제한
+    min_velocity: [-0.10, 0.0, -0.6]   # 후진은 더 느리게 (뒤를 못 봄)
+
+    max_accel: [0.3, 0.0, 1.2]         # = 속도 / 0.5초
+    max_decel: [-0.5, 0.0, -1.5]       # 감속은 더 빠르게 (정지거리 2.25 cm)
+
+    # ★ deadband_velocity 는 반드시 0으로 둔다 (검토 후 확정, 2026-08-10)
+    #
+    #   motion_controller_node.py 에는 모터 데드밴드 대응이 있다:
+    #       min_linear_speed 0.04 / min_angular_speed 0.15
+    #       "너무 작은 명령은 아예 움직임을 만들지 못해 교착 상태가 된다"
+    #   이걸 그대로 여기 옮기면 안 된다. 이유 두 가지.
+    #
+    #   (1) 방향이 반대다.
+    #       담당자 코드는 작은 명령을 최소값으로 **끌어올린다**.
+    #       velocity_smoother 의 deadband_velocity 는 반대로 **0으로 누른다**.
+    #       옮겨 적으면 정반대 동작이 된다.
+    #
+    #   (2) 순찰이 깨진다.
+    #       반지름 R 원을 v로 돌 때 필요한 각속도는 w = v/R 이다.
+    #           R = 0.95 m -> w = 0.158 rad/s
+    #           R = 2.0  m -> w = 0.075 rad/s   ← 0.15 데드밴드 밑
+    #       시연장이 넓어 순찰 반지름이 커지면 정상적인 선회 명령이 0으로
+    #       눌려 로봇이 직진해버린다.
+    #
+    #   애초에 모터 데드밴드는 **정지 상태에서 출발할 때** 걸리는 현상이다.
+    #   이미 0.15 m/s 로 굴러가는 중이면 양쪽 바퀴가 충분히 회전하고 있어
+    #   (정지마찰이 이미 깨진 상태) 좌우에 작은 차이를 주는 것은 문제없다.
+    #
+    #   목표 근처에서 속도가 0으로 수렴해 교착되는 경우는 Nav2 가 이미
+    #   자체적으로 막는다 -> FollowPath 의 min_approach_linear_velocity 0.05
+    #   (데드밴드 0.04 보다 크게 잡아두었다. 위 controller_server 참고)
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+
+    odom_topic: /odometry/local
+    odom_duration: 0.1
+
+
+map_server:
+  ros__parameters:
+    use_sim_time: false
+    # yaml_filename 은 navigation.launch.py 가 map 인자로 넣어준다.
+    yaml_filename: ""
+
+
+map_saver:
+  ros__parameters:
+    use_sim_time: false
+    save_map_timeout: 5.0
+    free_thresh_default: 0.196     # 미탐사(205)가 자유공간으로 분류되지 않도록
+    occupied_thresh_default: 0.65
