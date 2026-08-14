@@ -138,6 +138,19 @@ ros2 launch ship_ugv_navigation navigation.launch.py \
 
 **끄면 로봇이 자기 위치도 모르고 바퀴도 안 돈다.**
 
+### PR #21 부터 카메라·서버 노드도 여기서 같이 뜬다
+
+```
+yolo_depth_publisher   YOLO 검출 → /event_detection/uvd
+ship_survey_node       배 표면점 누적 → 중심·크기·yaw 측량
+websocket_client       서버 연결 (위치핑·이벤트 송신 / event_ack 수신)
+```
+
+**따로 `ros2 run` 으로 띄우지 말 것** — 두 개가 붙는다 (5-2 참고).
+
+카메라가 없거나 YOLO 가 뜨지 못해도 **launch 전체는 안 죽는다**
+(`on_exit`·`required` 설정 없음). 주행은 카메라 결과를 기다리지 않는다.
+
 ---
 
 ## 4. Step 8 에서 실제로 할 일
@@ -190,6 +203,8 @@ wide 로 두면 통로 전체가 막힌 것으로 판정되어 경로가 아예 
 | **UWB 위치 오차 ±15 cm** | 시뮬은 참값(오차 0)이었다. 실물에서 `inflation_radius` 를 재확인할 것 |
 | **순찰 반지름** | `shipyard_map_JG_room_v2` 는 R 0.30 이라 이 로봇(차체 0.4 m)에게 물리적으로 빡빡하다. 대상 주변을 치우고 재매핑해 **0.45 m 이상**을 확보하는 것이 근본 해결 |
 | **중앙 물체가 모형 배일 때** | 라이다 평면(0.20 m)에 선체가 안 걸려 **맵에도 코스트맵에도 안 잡힌다.** 매핑할 때만 임시 상자를 놓는 방식으로 대응한다 — `재매핑_체크리스트.md` 0단계, 설계 배경은 `nav2_작업_정리.md` 4-1장 |
+| **배 놓는 방향** | **뱃머리를 map `+x`(캘리브레이션 직진 방향)으로.** 어기면 프론트 3D 화면에서 배가 거꾸로 보인다. 주행에는 영향 없다 — `interface.md` ④ 운영 규칙 |
+| **배 윤곽 표시** | 조립 1→4단계를 올리며 배가 밀릴 수 있다. 바닥에 스티커로 원위치 표시. **매핑은 조립 완성 형태로** (마스크가 가장 큰 상태를 덮어야 1~3단계에서도 안전) |
 | **포위된 장애물이 여럿일 때** | `finalize_map.py` 가 가장 큰 것을 고른다. 출력에 `⚠️ 포위된 장애물이 N개다` 가 뜨면 확인할 것. 틀렸으면 **출력에 찍힌 후보 좌표를 그대로 복사해** `--center <X> <Y>` 로 다시 돌린다. 파일을 열어 고치는 방식이 아니고, 대충 찍어도 무게중심을 다시 계산하므로 결과가 같다 |
 | **keepout 필터** | `masks/keepout_<맵>.yaml` 이 있으면 launch 가 자동으로 켠다. 기동 배너의 `keepout :` 줄로 켜졌는지 확인할 수 있다. 없으면 꺼진 채 기존과 동일하게 뜬다 |
 
@@ -223,7 +238,15 @@ edge/ros2_ws/src/ship_ugv_navigation/scripts/stop_all.sh
 
 스크립트가 셋 다 처리한다.
 
-### 5-2. `websocket_client` 는 재연결 루프가 있다
+### 5-2. `websocket_client` 는 재연결 루프가 있다 — 그리고 **실물에선 자동으로 뜬다**
+
+PR #21 부터 `localization.launch.py` 가 `yolo_depth_publisher`·`ship_survey_node`·
+`websocket_client` 를 함께 띄운다. **실물에서 `ros2 run` 으로 또 띄우면 두 개가
+같은 서버에 붙어 위치핑이 두 배로 나간다.**
+
+문서에 나오는 `ros2 run ship_ugv_perception websocket_client ...` 는 전부
+**노트북 시뮬 시험용**이다(그쪽은 `localization.launch.py` 를 안 띄우므로 수동이 맞다).
+
 
 노트북/젯슨에서 시험용으로 띄운 것을 안 끄면, 백엔드를 다시 띄우는 순간
 **알아서 다시 접속한다.** 띄운 적도 없는데 "젯슨 연결됨" 로그가 찍히고,
@@ -340,12 +363,17 @@ kill -9 <자식 PID>
 | `patrol_mission_node` / `event_gate_node` | ✅ |
 | 카메라 좌표계 일치 · UWB SVD 캘리브레이션 | ✅ PR #19 머지 (2026-08-14) |
 | keepout 필터 · 순찰 중심 지정 (Nav2 쪽) | ✅ 구현·시뮬 검증 완료 (2026-08-14) |
+| 배 중심좌표 측량 `ship_survey_node` | ✅ PR #21 머지 (2026-08-14) |
+| 웹소켓 재접속 개선 · `ship_pose` yaw 규약 | ✅ PR #22 (2026-08-14) |
 | **프론트 "확인" 버튼** | ⏳ 대기 중 |
-| **배 중심좌표 측량 `ship_survey_node`** | ⏳ 요청함 — [배_중심좌표_측량_요청.md](../../docs/배_중심좌표_측량_요청.md) |
+| **프론트 3D 배 모델 forward 축 맞추기** | ⏳ 대기 중 — `interface.md` ④ 운영 규칙 참고 |
 
-`ship_survey_node` 가 없어도 **매핑 중 임시 상자 방식으로 동일하게 동작한다.**
-완성되면 상자 없이 배를 그대로 두고 매핑할 수 있게 되며, **Nav2 쪽 변경은 없다**
-(`finalize_map.py` 가 `/tmp/ship_survey_results/*.json` 을 이미 읽는다).
+**배 측량은 YOLO 에 배 클래스(`level*`)가 학습돼야 동작한다.** 학습 전이거나
+폼롤러처럼 라이다에 보이는 대상이면 측량이 안 되고, 그때는 맵에서 자동 탐지로
+조용히 넘어간다 — **아무것도 깨지지 않는다.**
+
+`finalize_map.py` 가 `/tmp/ship_survey_results/*.json` 을 알아서 읽으므로
+**Nav2 쪽에서 손으로 할 일은 없다.**
 
 프론트가 없어도 `backend/tools/fake_send_event_ack.py` 로 전체 경로를 시험할
 수 있다. 프론트가 완성되면 그 스크립트를 실행하지 않으면 그만이다.
@@ -360,6 +388,7 @@ kill -9 <자식 PID>
 | 실행 명령 (매핑~자율주행 전체) | [전체_실행_명령어_요약본](전체_실행_명령어_요약본%20—%20매핑부터_자율주행까지.md) |
 | 매핑 절차 · 문제해결 | [재매핑_체크리스트.md](재매핑_체크리스트.md) |
 | 젯슨↔서버 메시지 규격 | [../../docs/interface.md](../../docs/interface.md) |
+| 배 놓는 방향 규칙 (`yaw` 규약) | [../../docs/interface.md](../../docs/interface.md) ④ 「운영 규칙」 |
 | 하드웨어 실측값 | [설치가이드.md](설치가이드.md) |
 | 배가 라이다에 안 잡히는 문제 · keepout 설계 | [nav2_작업_정리.md](nav2_작업_정리.md) 4-1장 |
 | keepout 마스크가 언제 만들어지나 | [../ros2_ws/src/ship_ugv_navigation/masks/README.md](../ros2_ws/src/ship_ugv_navigation/masks/README.md) |

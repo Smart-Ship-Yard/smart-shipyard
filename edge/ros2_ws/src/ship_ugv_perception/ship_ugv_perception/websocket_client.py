@@ -85,7 +85,11 @@ class WebSocketClient(Node):
         self.declare_parameter('ship_pose_input_topic', '/ship_survey/pose')
         self.declare_parameter('position_ping_interval_s', 0.5)
         self.declare_parameter('min_confidence', 0.5)
-        self.declare_parameter('reconnect_interval_s', 5.0)
+        # ★ 재시도 간격과 로그 주기는 별개다.
+        #   간격을 늘려 로그를 줄이면 서버가 살아난 뒤에도 그만큼 데이터가 끊긴다.
+        #   빠르게 재시도하되(3초) 실패 로그만 묶어서 찍는다(15초).
+        self.declare_parameter('reconnect_interval_s', 3.0)
+        self.declare_parameter('fail_log_interval_s', 15.0)
         self.declare_parameter('block_id', 'B1')
         self.declare_parameter('block_level_stability_s', 3.0)
 
@@ -117,6 +121,9 @@ class WebSocketClient(Node):
         self.ping_interval = self.get_parameter('position_ping_interval_s').value
         self.min_confidence = self.get_parameter('min_confidence').value
         self.reconnect_interval = self.get_parameter('reconnect_interval_s').value
+        self.fail_log_interval = self.get_parameter('fail_log_interval_s').value
+        self._last_fail_log = 0.0    # 0 이면 다음 실패를 즉시 찍는다
+        self._fail_count = 0
         self.block_id = self.get_parameter('block_id').value
         self.block_level_stability = Duration(
             seconds=self.get_parameter('block_level_stability_s').value)
@@ -395,6 +402,9 @@ class WebSocketClient(Node):
                 self.get_logger().info(f"서버 연결 시도: {self.server_url}")
                 ws = ws_connect(self.server_url, open_timeout=5)
                 self.get_logger().info("서버 연결 성공")
+                # 억제 상태를 푼다. 다음 장애 때 첫 실패가 즉시 찍히도록.
+                self._last_fail_log = 0.0
+                self._fail_count = 0
 
                 recv_thread = threading.Thread(
                     target=self._recv_loop, args=(ws,), daemon=True)
@@ -424,8 +434,24 @@ class WebSocketClient(Node):
                         raise
 
             except Exception as e:
-                self.get_logger().warn(
-                    f"WebSocket 오류: {e} - {self.reconnect_interval}초 후 재시도")
+                # ★ 실패 로그는 억제하되 재시도는 늦추지 않는다.
+                #   재시도 간격을 늘려 로그를 줄이면 서버가 살아난 뒤에도 그만큼
+                #   데이터가 끊긴다. 위치핑이 2 Hz 라 대시보드에서 로봇이 멈춘
+                #   것처럼 보인다. 줄여야 할 것은 로그지 가용성이 아니다.
+                #
+                #   첫 실패는 반드시 즉시 찍는다. 억제 때문에 "서버가 꺼져 있다"를
+                #   한참 뒤에 알게 되면 안 된다.
+                now = time.time()
+                self._fail_count += 1
+                if now - self._last_fail_log >= self.fail_log_interval:
+                    extra = (f" (최근 {self.fail_log_interval:.0f}초간 "
+                             f"{self._fail_count}회 실패)"
+                             if self._fail_count > 1 else "")
+                    self.get_logger().warn(
+                        f"WebSocket 오류: {e} - "
+                        f"{self.reconnect_interval}초 후 재시도{extra}")
+                    self._last_fail_log = now
+                    self._fail_count = 0
             finally:
                 if ws is not None:
                     try:

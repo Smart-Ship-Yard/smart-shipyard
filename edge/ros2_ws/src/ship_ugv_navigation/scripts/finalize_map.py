@@ -89,11 +89,16 @@ def fmt_time(path):
         os.path.getmtime(path)).strftime('%m-%d %H:%M:%S')
 
 
-def pick_survey_center(survey_dir, records, name):
-    """배 중심좌표 측량 기록(ship_pose_*.json)이 있으면 읽어서 (x, y) 를 준다.
+def pick_survey_center(survey_dir, records, name, pgm_mtime):
+    """배 중심좌표 측량 기록(ship_pose_*.json)이 있으면 읽어서 중심·크기·yaw 를 준다.
 
     젯슨의 ship_survey_node 가 매핑 주행 중 뎁스카메라로 배 표면점을 모아
     중심을 계산하고 남기는 파일이다. 형식은 docs/interface.md ④번과 같다.
+
+    선택 규칙은 pick_align 과 같다 — **맵 저장 시각 이전의 것 중 가장 최신**.
+    번호가 아니라 시각으로 고르는 이유는 /tmp 가 지워지면 카운터가 001 로
+    되돌아가 번호가 최신을 보장하지 않기 때문이다. 그리고 맵보다 나중에 만들어진
+    측량 기록은 그 맵의 것일 수 없다 (배를 옮기고 다시 측량했을 수 있다).
 
     라이다에 안 잡히는 낮은 대상(모형 배)을 위한 것이라 없는 것이 정상이며,
     없으면 맵에서 자동 탐지한다. 그래서 실패해도 중단하지 않는다.
@@ -104,7 +109,22 @@ def pick_survey_center(survey_dir, records, name):
         print(f'  측량    기록 없음 ({survey_dir}) — 맵에서 자동 탐지한다')
         return None
 
-    src = files[-1]
+    before = [f for f in files if os.path.getmtime(f) <= pgm_mtime + SAVE_TOLERANCE_S]
+    if not before:
+        print(f'  ⚠️ 측량 기록 {len(files)}개가 모두 맵 저장보다 나중이다 '
+              f'— 이 맵의 것이 아닐 가능성이 높다')
+        for f in files:
+            print(f'       {fmt_time(f)}  {os.path.basename(f)}')
+        print('     맵에서 자동 탐지로 진행한다')
+        return None
+
+    src = before[-1]
+    if len(files) > 1:
+        print(f'  측량 기록 {len(files)}개 중 맵 저장 이전의 최신 것을 고른다:')
+        for f in files:
+            rel = '이전' if f in before else '이후'
+            mark = '  <-- 선택' if f == src else ''
+            print(f'       {fmt_time(f)}  [{rel}]  {os.path.basename(f)}{mark}')
     try:
         with open(src) as f:
             d = json.load(f)
@@ -282,7 +302,7 @@ def main():
     # 배 중심좌표 측량 기록 (젯슨의 ship_survey_node 가 남긴다).
     # 라이다에 안 잡히는 낮은 대상을 뎁스카메라로 측량한 결과다.
     # 없으면 맵에서 자동 탐지하므로 필수는 아니다.
-    survey = pick_survey_center(a.survey_dir, records, name)
+    survey = pick_survey_center(a.survey_dir, records, name, pgm_mtime)
 
     # ---- 2·3. origin 보정 + free_thresh 교정 ----
     step(2, 'origin 보정 (slam_map -> map) + free_thresh 교정')
