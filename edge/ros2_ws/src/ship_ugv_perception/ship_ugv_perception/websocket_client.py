@@ -39,7 +39,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.time import Time
-from std_msgs.msg import String
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
+from std_msgs.msg import String, Int32
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PointStamped
 from tf2_ros import Buffer, TransformListener
@@ -102,6 +103,13 @@ class WebSocketClient(Node):
         self.declare_parameter('inbound_topic', '/server/inbound')
         self.declare_parameter('recv_timeout_s', 1.0)
 
+        # ★ 확정된 조립 단계를 ROS 토픽으로도 내보낸다.
+        #   ship_survey_node가 "단계 바뀌었으니 배를 다시 측량하라"는 신호로 쓴다.
+        #   같은 판정 로직을 저쪽에 또 짜지 않는 이유: 프레임마다 흔들리는 YOLO를
+        #   3초 안정화로 거르는 로직(_handle_block_level)이 이미 여기 있고, 두 벌이
+        #   되면 서버가 아는 단계와 측량이 아는 단계가 어긋나는 순간이 생긴다.
+        self.declare_parameter('block_level_topic', '/block_level/confirmed')
+
         self.server_url = self.get_parameter('server_ws_url').value
         uvd_topic = self.get_parameter('uvd_topic').value
         ekf_topic = self.get_parameter('ekf_odom_topic').value
@@ -146,9 +154,29 @@ class WebSocketClient(Node):
         # ★ 서버 -> 젯슨 수신 메시지를 그대로 중계할 퍼블리셔 (해석하지 않음)
         self.inbound_pub = self.create_publisher(String, inbound_topic, 10)
 
+        # ★ 확정된 조립 단계 퍼블리셔. 단계가 바뀔 때만 발행하므로 latched로 둬야
+        #   나중에 뜨는 ship_survey_node가 현재 단계를 즉시 알 수 있다.
+        level_qos = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+        )
+        self.block_level_pub = self.create_publisher(
+            Int32, self.get_parameter('block_level_topic').value, level_qos)
+
         self.create_subscription(String, uvd_topic, self._uvd_cb, 10)
         self.create_subscription(Odometry, ekf_topic, self._ekf_cb, 10)
-        self.create_subscription(String, ship_pose_topic, self._ship_pose_cb, 10)
+        # ★ ship_pose는 ship_survey_node가 측량 끝날 때 딱 1번만 발행하고, 그 시점은
+        #   매핑 랩 도중이라 이 노드보다 먼저 끝나 있을 수 있다. 기본 QoS(VOLATILE)로
+        #   구독하면 나중에 떠서 그 1회를 통째로 놓치고, 배 위치가 서버에 영영 안 간다.
+        #   (발행자만 TRANSIENT_LOCAL이면 부족하고, 구독자도 맞춰야 과거 값을 받는다.)
+        ship_pose_qos = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+        )
+        self.create_subscription(
+            String, ship_pose_topic, self._ship_pose_cb, ship_pose_qos)
 
         self.create_timer(self.ping_interval, self._position_ping_cb)
 
@@ -306,7 +334,12 @@ class WebSocketClient(Node):
             'level': level,
         }
         self._enqueue(payload)
-        self.get_logger().info(f"[조립단계 확정] level={level} -> 전송")
+
+        # ★ ship_survey_node의 재측량 트리거 (interface.md ④: 조립 단계가 바뀌면
+        #   조립 과정에서 배가 밀리거나 돌아갔을 수 있으므로 다시 측량해야 함)
+        self.block_level_pub.publish(Int32(data=level))
+
+        self.get_logger().info(f"[조립단계 확정] level={level} -> 전송 + 재측량 트리거")
 
     def _ship_pose_cb(self, msg: String):
         try:
