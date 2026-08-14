@@ -25,6 +25,10 @@ setup(
         #   calibration_records는 맵 제작 기록이라 런타임에 읽지 않으므로 설치 제외.
         (os.path.join('share', package_name, 'maps'),
             glob('maps/*.yaml') + glob('maps/*.pgm')),
+        # keepout 마스크. finalize_map.py 가 맵마다 만들며, 없을 수도 있다
+        # (라이다에 잡히는 대상만 있는 맵). glob 이 빈 목록이어도 문제없다.
+        (os.path.join('share', package_name, 'masks'),
+            glob('masks/*.yaml') + glob('masks/*.pgm')),
         (os.path.join('share', package_name, 'worlds'), glob('worlds/*.world')),
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
         # 행동트리(BT). navigation.launch.py가 절대경로로 bt_navigator에 넘긴다.

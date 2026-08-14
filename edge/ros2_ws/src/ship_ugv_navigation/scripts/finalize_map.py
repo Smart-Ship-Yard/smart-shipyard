@@ -33,6 +33,7 @@ finalize_map.py
 
 import argparse
 import glob
+import json
 import os
 import shutil
 import subprocess
@@ -88,6 +89,56 @@ def fmt_time(path):
         os.path.getmtime(path)).strftime('%m-%d %H:%M:%S')
 
 
+def pick_survey_center(survey_dir, records, name):
+    """배 중심좌표 측량 기록(ship_pose_*.json)이 있으면 읽어서 (x, y) 를 준다.
+
+    젯슨의 ship_survey_node 가 매핑 주행 중 뎁스카메라로 배 표면점을 모아
+    중심을 계산하고 남기는 파일이다. 형식은 docs/interface.md ④번과 같다.
+
+    라이다에 안 잡히는 낮은 대상(모형 배)을 위한 것이라 없는 것이 정상이며,
+    없으면 맵에서 자동 탐지한다. 그래서 실패해도 중단하지 않는다.
+    """
+    files = sorted(glob.glob(os.path.join(survey_dir, 'ship_pose_*.json')),
+                   key=os.path.getmtime)
+    if not files:
+        print(f'  측량    기록 없음 ({survey_dir}) — 맵에서 자동 탐지한다')
+        return None
+
+    src = files[-1]
+    try:
+        with open(src) as f:
+            d = json.load(f)
+        xy = d['map_xy']
+        cx, cy = float(xy[0]), float(xy[1])
+    except Exception as e:
+        print(f'  ⚠️ 측량 기록을 읽지 못했다 ({src}): {e}')
+        print('     맵에서 자동 탐지로 진행한다')
+        return None
+
+    dst = os.path.join(records, f'survey_{name}.json')
+    shutil.copy2(src, dst)
+
+    yaw = d.get('yaw')
+    yaw = float(yaw) if isinstance(yaw, (int, float)) else 0.0
+
+    # size_xy 는 keepout 마스크를 그리는 데 쓴다. 대상이 라이다에 안 잡히면
+    # 맵에서 크기를 알아낼 수 없으므로, 이 값이 없으면 마스크를 못 만든다.
+    size = d.get('size_xy')
+    if isinstance(size, (list, tuple)) and len(size) == 2:
+        size = (float(size[0]), float(size[1]))
+    else:
+        size = None
+
+    print(f'  측량    {src}\n       -> {dst}')
+    print(f'          배 중심 ({cx:.3f}, {cy:.3f}), yaw {yaw:.3f} rad')
+    if size:
+        print(f'          배 크기 {size[0]:.2f} x {size[1]:.2f} m — keepout 마스크에 사용')
+    else:
+        print('          ⚠️ size_xy 가 없다 — 맵의 장애물에서 크기를 찾아본다.')
+        print('             배가 라이다에 안 잡히는 경우라면 마스크가 안 만들어진다')
+    return {'center': (cx, cy), 'yaw': yaw, 'size': size}
+
+
 def step(n, title):
     print(f'\n[{n}/4] {title}')
     print('-' * 60)
@@ -103,6 +154,22 @@ def main():
     ap.add_argument('--align-file',
                     help='쓸 정합 기록을 직접 지정 (자동 선택을 건너뜀)')
     ap.add_argument('--calib-dir', default='/tmp/uwb_calibration_results')
+    ap.add_argument('--survey-dir', default='/tmp/ship_survey_results',
+                    help='배 중심좌표 측량 기록(ship_pose_*.json) 위치. '
+                         '있으면 순찰 중심으로 쓴다. 없으면 맵에서 자동 탐지')
+    ap.add_argument('--center', nargs=2, type=float, metavar=('X', 'Y'),
+                    help='순찰 중심을 직접 지정 (map 좌표). 맵에 포위된 장애물이 '
+                         '여럿이라 자동 선택이 틀렸을 때 쓴다. 정확히 찍을 필요 없다 '
+                         '— 가장 가까운 장애물을 지목한 것으로 보고 그 무게중심을 쓴다')
+    ap.add_argument('--ship-size', nargs=2, type=float, metavar=('W', 'H'),
+                    help='순찰 대상의 크기(m). keepout 마스크를 그리는 데 쓴다. '
+                         '대상이 라이다에 안 잡혀(모형 배 등) 맵에서 크기를 '
+                         '알 수 없을 때 --center 와 함께 준다. 측량 기록에 '
+                         'size_xy 가 있으면 그것보다 이 값이 우선한다')
+    ap.add_argument('--no-mask', action='store_true',
+                    help='keepout 마스크를 만들지 않는다. 순찰 대상이 라이다에 '
+                         '잡히는 물체라면(코스트맵이 이미 안다) 마스크는 중복이며, '
+                         '좁은 맵에서는 순찰 여유만 깎는다')
     ap.add_argument('--skip-check', action='store_true')
     ap.add_argument('--force', action='store_true',
                     help='정합 기록과 맵의 시각 차이 검사를 무시하고 진행')
@@ -212,6 +279,11 @@ def main():
     else:
         print(f'  ⚠️ 캘리브레이션 기록 없음 ({a.calib_dir}) — 보정에는 영향 없음')
 
+    # 배 중심좌표 측량 기록 (젯슨의 ship_survey_node 가 남긴다).
+    # 라이다에 안 잡히는 낮은 대상을 뎁스카메라로 측량한 결과다.
+    # 없으면 맵에서 자동 탐지하므로 필수는 아니다.
+    survey = pick_survey_center(a.survey_dir, records, name)
+
     # ---- 2·3. origin 보정 + free_thresh 교정 ----
     step(2, 'origin 보정 (slam_map -> map) + free_thresh 교정')
     r = subprocess.run(
@@ -235,9 +307,50 @@ def main():
     #   손으로 옮겨 적는 단계를 없애기 위함이다(오타·누락 방지).
     #   순찰 불가 맵이면 파일을 만들지 않는다.
     patrol_out = os.path.join(PKG_ROOT, 'config', f'patrol_{name}.yaml')
-    r = subprocess.run(
-        [sys.executable, os.path.join(SCRIPTS, 'check_patrol_space.py'),
-         '--map', yaml_path, '--emit-patrol', patrol_out])
+
+    # ★ --emit-mask 는 Nav2 KeepoutFilter 용 마스크를 만든다.
+    #   라이다 스캔 평면보다 낮은 대상은 코스트맵에 안 잡히므로, 대상 자리를
+    #   코스트맵에 직접 박아 로봇이 가로지르지 못하게 한다.
+    #   순찰 대상의 크기를 알 수 없으면 만들지 않고 그 이유를 출력한다.
+    mask_out = os.path.join(PKG_ROOT, 'masks', f'keepout_{name}.yaml')
+
+    cmd = [sys.executable, os.path.join(SCRIPTS, 'check_patrol_space.py'),
+           '--map', yaml_path,
+           '--emit-patrol', patrol_out]
+    if a.no_mask:
+        # 오래된 마스크가 남아 있으면 launch 가 그것을 켜 버린다. 같이 지운다.
+        for p in (mask_out, os.path.splitext(mask_out)[0] + '.pgm'):
+            if os.path.exists(p):
+                os.remove(p)
+                print(f'  기존 마스크 삭제: {p}')
+        print('  keepout 마스크: 만들지 않음 (--no-mask)')
+    else:
+        cmd += ['--emit-mask', mask_out]
+
+    # 중심 결정 우선순위: 사람이 직접 지정 > 측량 기록 > 맵에서 자동 탐지.
+    # 사람이 준 값을 가장 위에 두는 이유는, 자동 선택이 틀렸을 때
+    # 되돌릴 방법이 그것뿐이기 때문이다.
+    if a.center:
+        cmd += ['--center', str(a.center[0]), str(a.center[1])]
+        print(f'  순찰 중심: --center 로 지정됨 ({a.center[0]}, {a.center[1]})')
+        if a.ship_size:
+            cmd += ['--mask-size', str(a.ship_size[0]), str(a.ship_size[1])]
+            print(f'  대상 크기: --ship-size {a.ship_size[0]} x {a.ship_size[1]} m')
+    elif survey:
+        cx, cy = survey['center']
+        cmd += ['--center', str(cx), str(cy)]
+        print(f'  순찰 중심: 측량 기록에서 가져옴 ({cx:.3f}, {cy:.3f})')
+        size = a.ship_size or survey['size']
+        if size:
+            cmd += ['--mask-size', str(size[0]), str(size[1]),
+                    '--mask-yaw', str(survey['yaw'])]
+            src_label = '--ship-size' if a.ship_size else '측량 기록'
+            print(f'  대상 크기: {src_label} {size[0]:.2f} x {size[1]:.2f} m')
+    else:
+        print('  순찰 중심: 맵에서 자동 탐지')
+    print()
+
+    r = subprocess.run(cmd)
 
     print()
     print('=' * 60)

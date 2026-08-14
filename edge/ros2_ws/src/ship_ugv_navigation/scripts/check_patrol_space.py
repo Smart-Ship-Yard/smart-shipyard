@@ -44,6 +44,16 @@ from collections import deque
 FRONT, REAR, HALF_W = 0.332, -0.069, 0.089
 DEFAULT_MARGIN = 0.10          # 안팎 최소 안전여유 (m)
 
+# --center 로 준 좌표에서 이 거리 안에 있는 장애물을 "그것을 가리킨 것"으로 본다.
+# 사람이 RViz 에서 눈대중으로 찍어도 되게 하려는 값. 중심 좌표 자체는 찍은
+# 좌표가 아니라 그 장애물의 픽셀 무게중심을 쓰므로 정확도는 떨어지지 않는다.
+SNAP_RADIUS = 1.0              # m
+
+# keepout 마스크를 대상 외곽에서 얼마나 더 부풀릴지.
+# 라이다에 안 잡히는 대상이라 실측 오차를 흡수할 여유를 둔다.
+# 이 값이 크면 순찰 원이 좁아지므로 무작정 키우면 안 된다.
+MASK_PAD = 0.05                # m
+
 FREE, OCCUPIED, UNKNOWN = 254, 0, 205
 
 
@@ -314,6 +324,68 @@ def emit_patrol_yaml(path, map_name, cx, cy, radius, margin_val, tight):
     return n
 
 
+def emit_keepout_mask(path, m, bbox, map_name):
+    """Nav2 KeepoutFilter 용 마스크(.pgm + .yaml)를 만든다.
+
+    왜 필요한가:
+      라이다 스캔 평면(지면 약 0.20 m)보다 낮은 대상은 코스트맵에 안 잡힌다.
+      맵의 static_layer 는 글로벌 코스트맵에만 있어 컨트롤러 단에서는 여전히
+      대상을 모른다. KeepoutFilter 는 센서와 무관하게 코스트맵에 영역을 직접
+      박고 글로벌·로컬 양쪽에 붙일 수 있어 이 구멍을 메운다.
+
+    마스크는 맵과 **같은 해상도·원점·크기**여야 정확히 겹친다.
+    검은색(0) = 진입 금지, 흰색(FREE) = 제약 없음. mode: trinary 로 읽으면
+    검은 픽셀이 lethal 로 들어간다.
+    """
+    w, h, res = m['w'], m['h'], m['res']
+    r0, r1, c0, c1 = bbox
+    pad = int(round(MASK_PAD / res))
+    r0 = max(0, r0 - pad)
+    r1 = min(h - 1, r1 + pad)
+    c0 = max(0, c0 - pad)
+    c1 = min(w - 1, c1 + pad)
+
+    px = bytearray([FREE]) * (w * h)
+    for r in range(r0, r1 + 1):
+        base = r * w
+        for c in range(c0, c1 + 1):
+            px[base + c] = OCCUPIED
+
+    pgm_path = os.path.splitext(path)[0] + '.pgm'
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(pgm_path, 'wb') as f:
+        f.write(b'P5\n')
+        f.write(f'# keepout mask for {map_name} '
+                f'(check_patrol_space.py 자동 생성)\n'.encode())
+        f.write(f'{w} {h}\n255\n'.encode())
+        f.write(bytes(px))
+
+    with open(path, 'w') as f:
+        f.write('\n'.join([
+            f'# keepout 마스크 — {map_name}',
+            '#',
+            '# ⚠️ 자동 생성 파일. 손으로 고치지 말 것.',
+            '#    맵을 다시 만들면 finalize_map.py 가 이 파일도 다시 쓴다.',
+            '#',
+            '# 검은 사각형 = 로봇이 들어가면 안 되는 영역(순찰 대상이 놓인 자리).',
+            '# 라이다에 안 잡히는 낮은 대상을 코스트맵에 알려주기 위한 것이다.',
+            '# 해상도·원점은 맵과 반드시 같아야 한다.',
+            '#',
+            f'image: {os.path.basename(pgm_path)}',
+            'mode: trinary',
+            f'resolution: {res}',
+            f'origin: [{m["ox"]:.3f}, {m["oy"]:.3f}, 0.0]',
+            'negate: 0',
+            'occupied_thresh: 0.65',
+            'free_thresh: 0.196',
+            '',
+        ]))
+
+    print(f'   🧱 keepout 마스크 생성: {path}')
+    print(f'      금지 영역 {(c1 - c0 + 1) * res:.2f} x {(r1 - r0 + 1) * res:.2f} m '
+          f'(대상 외곽 + 여유 {MASK_PAD} m)')
+
+
 def _wrap(text, width):
     out, cur = [], ''
     for word in text.split():
@@ -327,7 +399,29 @@ def _wrap(text, width):
 
 
 # ======================================================================
-def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None):
+def rect_bbox(m, cx, cy, sx, sy, yaw):
+    """map 좌표의 (중심, 크기, 회전각) 을 픽셀 bbox 로 바꾼다.
+
+    회전된 사각형을 그대로 그리는 대신 그것을 감싸는 축정렬 사각형을 쓴다.
+    조금 더 커지지만 안전한 쪽이고, 마스크는 대상보다 넉넉한 편이 낫다.
+    """
+    hx, hy = sx / 2.0, sy / 2.0
+    c, s = math.cos(yaw), math.sin(yaw)
+    xs, ys = [], []
+    for dx, dy in ((hx, hy), (hx, -hy), (-hx, hy), (-hx, -hy)):
+        xs.append(cx + dx * c - dy * s)
+        ys.append(cy + dx * s + dy * c)
+    res, h = m['res'], m['h']
+    # 바깥으로 확장(floor/ceil)한다. round 를 쓰면 경계 셀이 잘려 대상의 끝부분이
+    # 마스크 밖으로 삐져나올 수 있다. keepout 은 모자란 것보다 넘치는 편이 안전하다.
+    cols = [(x - m['ox']) / res for x in xs]
+    rows = [(h - 1) - (y - m['oy']) / res for y in ys]
+    return (max(0, int(math.floor(min(rows)))), min(h - 1, int(math.ceil(max(rows)))),
+            max(0, int(math.floor(min(cols)))), min(m['w'] - 1, int(math.ceil(max(cols)))))
+
+
+def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
+                emit_mask=None, mask_size=None, mask_yaw=0.0):
     m = load_map(yaml_path)
     res, w, h = m['res'], m['w'], m['h']
     n_free = sum(sum(row) for row in m['free'])
@@ -344,25 +438,96 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None)
         print(f'     0.196 으로 고칠 것. 안 그러면 Nav2가 매핑 안 된 곳으로 경로를 뽑는다.')
     print()
 
+    # 순찰 대상의 픽셀 범위(행/열 min·max). keepout 마스크 사각형을 그릴 때 쓴다.
+    # 중심 좌표만으로는 대상 크기를 알 수 없어 따로 들고 다닌다.
+    #
+    # 크기를 얻는 경로는 둘이다.
+    #   ① 맵의 섬에서        — 대상이 라이다에 잡히는 경우
+    #   ② --mask-size 로 직접 — 라이다에 안 잡히는 낮은 대상(모형 배).
+    #                          이때는 맵에 아무것도 없으므로 ①이 불가능하다.
+    bbox = None
+
+    islands = find_islands(m)
+    cands = []
+    for comp in islands:
+        rs = [a for a, b in comp]
+        cs = [b for a, b in comp]
+        cands.append({
+            'cx': m['ox'] + (sum(cs) / len(cs)) * res,
+            'cy': m['oy'] + ((h - 1) - (sum(rs) / len(rs))) * res,
+            'sx': (max(cs) - min(cs) + 1) * res,
+            'sy': (max(rs) - min(rs) + 1) * res,
+            'bbox': (min(rs), max(rs), min(cs), max(cs)),
+        })
+    cands.sort(key=lambda c: c['sx'] * c['sy'], reverse=True)
+
     if center is None:
-        islands = find_islands(m)
-        if not islands:
+        if not cands:
             print('❌ 자유공간에 완전히 포위된 장애물이 없음.')
             print('   = 무언가의 주위를 한 바퀴 도는 경로 자체가 존재하지 않는다.')
             print('   매핑할 때 대상 주위를 완전히 한 바퀴 돌지 않았을 가능성이 높음.')
+            print()
+            print('   ※ 대상이 라이다 스캔 평면(지면 약 0.20 m)보다 낮으면 맵에 안 찍힌다.')
+            print('     모형 배처럼 낮은 대상은 매핑하는 동안만 높은 상자를 놓을 것')
+            print('     (재매핑_체크리스트.md 0단계). 좌표를 아는 경우에는')
+            print('     --center <X> <Y> 로 직접 지정할 수도 있다.')
             return False
-        islands.sort(key=len, reverse=True)
-        comp = islands[0]
-        rs = [a for a, b in comp]
-        cs = [b for a, b in comp]
-        cx = m['ox'] + (sum(cs) / len(cs)) * res
-        cy = m['oy'] + ((h - 1) - (sum(rs) / len(rs))) * res
-        size_x, size_y = (max(cs) - min(cs) + 1) * res, (max(rs) - min(rs) + 1) * res
-        print(f'포위된 장애물 {len(islands)}개 발견. 가장 큰 것을 순찰 대상으로 봄:')
-        print(f'  중심 map ({cx:.2f}, {cy:.2f}), 크기 약 {size_x:.2f} x {size_y:.2f} m')
+
+        pick = cands[0]
+        cx, cy, bbox = pick['cx'], pick['cy'], pick['bbox']
+
+        if len(cands) == 1:
+            print('포위된 장애물 1개 발견. 이것을 순찰 대상으로 본다:')
+            print(f'  중심 map ({cx:.2f}, {cy:.2f}), '
+                  f'크기 약 {pick["sx"]:.2f} x {pick["sy"]:.2f} m')
+        else:
+            # 후보가 여럿이면 사람이 확인해야 한다. 크기로 고르는 것은
+            # 기본값일 뿐, 가장 큰 것이 순찰 대상이라는 보장은 없다.
+            print('=' * 68)
+            print(f'⚠️  포위된 장애물이 {len(cands)}개다 — 자동 선택이 맞는지 확인할 것')
+            print('=' * 68)
+            for i, c in enumerate(cands):
+                mark = '   <-- 선택됨 (가장 큼)' if i == 0 else ''
+                print(f'  [{i + 1}] 중심 ({c["cx"]:7.2f}, {c["cy"]:7.2f})  '
+                      f'크기 {c["sx"]:.2f} x {c["sy"]:.2f} m{mark}')
+            print()
+            print('  의도한 대상이 아니면 위 목록의 중심 좌표를 그대로 복사해 다시 돌린다:')
+            print(f'    python3 scripts/finalize_map.py <맵이름> '
+                  f'--center {cands[-1]["cx"]:.2f} {cands[-1]["cy"]:.2f}')
+            print('  정확히 맞출 필요 없다 — 가장 가까운 것을 지목한 것으로 보고')
+            print('  그 장애물의 무게중심을 다시 계산해서 쓴다.')
+            print('=' * 68)
     else:
         cx, cy = center
-        print(f'지정된 순찰 중심: map ({cx:.2f}, {cy:.2f})')
+        print(f'지정된 좌표: map ({cx:.2f}, {cy:.2f})')
+
+        if mask_size:
+            # 대상 크기를 직접 받은 경우. 라이다에 안 잡히는 대상(모형 배)은
+            # 맵에 섬이 없으므로 이 경로로만 마스크를 만들 수 있다.
+            bbox = rect_bbox(m, cx, cy, mask_size[0], mask_size[1], mask_yaw)
+            print(f'  대상 크기 {mask_size[0]:.2f} x {mask_size[1]:.2f} m '
+                  f'(yaw {math.degrees(mask_yaw):.0f}도) 를 함께 받았다 — 마스크에 사용')
+            print('  좌표도 지정값을 그대로 쓴다 (맵의 장애물로 스냅하지 않음)')
+
+        # 크기를 못 받았으면 "어느 물체냐"를 고르는 용도로만 좌표를 쓴다.
+        # 중심 좌표 자체는 그 물체의 픽셀 무게중심으로 바꾼다 — 사람이 눈대중으로
+        # 찍은 점보다 훨씬 정확하다. 사람은 지목만 하고 계산은 기계가 한다.
+        elif cands:
+            near = min(cands, key=lambda c: math.hypot(c['cx'] - cx, c['cy'] - cy))
+            d = math.hypot(near['cx'] - cx, near['cy'] - cy)
+            if d <= SNAP_RADIUS:
+                cx, cy, bbox = near['cx'], near['cy'], near['bbox']
+                print(f'  → {d:.2f} m 거리의 장애물'
+                      f'({near["sx"]:.2f} x {near["sy"]:.2f} m)을 지목한 것으로 본다')
+                print(f'  순찰 중심은 그 장애물의 무게중심 ({cx:.3f}, {cy:.3f}) 을 쓴다')
+            else:
+                print(f'  ⚠️ {SNAP_RADIUS} m 안에 포위된 장애물이 없다 '
+                      f'(가장 가까운 것 {d:.2f} m).')
+                print(f'     지정한 좌표를 그대로 순찰 중심으로 쓰고, '
+                      f'마스크는 만들지 않는다')
+        else:
+            print('  ⚠️ 맵에 포위된 장애물이 없다.')
+            print('     지정한 좌표를 그대로 순찰 중심으로 쓰고, 마스크는 만들지 않는다')
     print()
 
     print(' 반지름 | 완주 | 최소여유 | 판정')
@@ -391,6 +556,30 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None)
         if emit_patrol:
             map_name = os.path.splitext(os.path.basename(yaml_path))[0]
             emit_patrol_yaml(emit_patrol, map_name, cx, cy, best[0], best[1], tight)
+            if emit_mask:
+                if bbox is not None:
+                    emit_keepout_mask(emit_mask, m, bbox, map_name)
+                    # 마스크는 대상 외곽에 MASK_PAD 만큼 더 부풀린다. 좁은 맵에서는
+                    # 그 여유가 순찰 여유를 거의 다 먹어 경로가 금지영역에 닿는다.
+                    # 조용히 두면 "왜 갑자기 경로가 안 나오지" 로 헤매게 된다.
+                    if MASK_PAD >= best[1] - 0.03:
+                        print()
+                        print('   ' + '=' * 62)
+                        print(f'   ⚠️ 마스크 여유({MASK_PAD} m)가 순찰 여유'
+                              f'({best[1]:.3f} m)를 거의 다 먹는다')
+                        print(f'      남는 폭 {best[1] - MASK_PAD:.3f} m — '
+                              f'순찰 경로가 금지영역에 닿을 수 있다.')
+                        print('      대상이 라이다에 잡히는 물체라면(코스트맵이 이미 안다)')
+                        print('      마스크가 필요 없으므로 --no-mask 로 끄는 편이 낫다.')
+                        print('      배처럼 라이다에 안 잡히는 대상이면 주변을 더 치우고')
+                        print('      재매핑해 반지름을 키울 것.')
+                        print('   ' + '=' * 62)
+                else:
+                    # 조용히 넘어가면 나중에 "왜 keepout 이 안 먹지" 로 헤맨다.
+                    print('   ⚠️ keepout 마스크를 만들지 못했다 — 대상의 크기를 '
+                          '알 수 없다.')
+                    print('      맵에 포위된 장애물이 없거나, --center 좌표가 '
+                          f'어느 장애물과도 {SNAP_RADIUS} m 안에서 만나지 않는다.')
         else:
             n, warn = pick_num_waypoints(best[0])
             print('   patrol_mission_node 파라미터에 넣을 값:')
@@ -440,6 +629,16 @@ def main():
     ap.add_argument('--emit-patrol', metavar='PATH',
                     help='순찰 가능하면 이 경로에 patrol_<맵이름>.yaml 을 만든다. '
                          '순찰 불가 맵이면 만들지 않는다')
+    ap.add_argument('--emit-mask', metavar='PATH',
+                    help='Nav2 KeepoutFilter 용 마스크(.pgm + .yaml)를 만든다. '
+                         '--emit-patrol 과 함께 쓴다. 라이다에 안 잡히는 낮은 '
+                         '대상을 코스트맵에 알려주기 위한 것')
+    ap.add_argument('--mask-size', nargs=2, type=float, metavar=('W', 'H'),
+                    help='마스크에 그릴 대상 크기(m). 대상이 라이다에 안 잡혀 '
+                         '맵에서 크기를 알 수 없을 때 쓴다. --center 와 함께 준다')
+    ap.add_argument('--mask-yaw', type=float, default=0.0, metavar='RAD',
+                    help='대상 방향각(라디안). --mask-size 와 함께 쓴다. '
+                         '회전 사각형을 감싸는 축정렬 사각형으로 그린다')
     a = ap.parse_args()
 
     if a.obstacle:
@@ -447,7 +646,12 @@ def main():
         return 0
     if a.map:
         # 종료 코드: 0 = 여유 충분, 2 = 완주되나 여유 부족(사용 가능), 1 = 순찰 불가
-        return analyze_map(a.map, a.center, a.margin, a.emit_patrol)
+        if a.mask_size and not a.center:
+            print('❌ --mask-size 는 --center 와 함께 줘야 한다 '
+                  '(어디에 그릴지 알 수 없음)')
+            return 3
+        return analyze_map(a.map, a.center, a.margin, a.emit_patrol, a.emit_mask,
+                           a.mask_size, a.mask_yaw)
     ap.print_help()
     return 3
 
