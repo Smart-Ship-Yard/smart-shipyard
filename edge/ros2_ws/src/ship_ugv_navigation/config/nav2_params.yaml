@@ -348,6 +348,24 @@ local_costmap:
 
       plugins: ["obstacle_layer", "inflation_layer"]
 
+      # ★ keepout 필터 — 라이다에 안 잡히는 대상(모형 배)을 코스트맵에 직접 박는다.
+      #   정의만 여기 두고 **켜는 것은 config/keepout_on.yaml 오버레이**가 한다.
+      #   masks/keepout_<맵이름>.yaml 이 있을 때만 navigation.launch.py 가
+      #   그 오버레이를 얹는다.
+      #
+      #   왜 여기서 바로 켜지 않나: filters 를 켜 두면 KeepoutFilter 가
+      #   /costmap_filter_info 를 기다리는데, 마스크 서버가 없으면 코스트맵이
+      #   활성화되지 못해 Nav2 전체가 안 뜬다. 마스크 없는 맵(demo_room 등)으로
+      #   돌릴 때 깨지면 안 되므로 기본은 꺼진 상태다.
+      #
+      #   로컬 코스트맵에도 붙이는 이유: static_layer 는 글로벌에만 있어서
+      #   컨트롤러 단에서는 대상의 존재를 모른다. 경로를 벗어나거나 복구 동작을
+      #   할 때 막아줄 것이 없어진다.
+      keepout_filter:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: true
+        filter_info_topic: "/costmap_filter_info"
+
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
@@ -389,6 +407,13 @@ global_costmap:
       footprint_padding: 0.02
 
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+
+      # ★ keepout 필터 (로컬 코스트맵과 동일). 상세 설명은 local_costmap 쪽 참고.
+      #   켜는 것은 config/keepout_on.yaml 오버레이가 한다.
+      keepout_filter:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: true
+        filter_info_topic: "/costmap_filter_info"
 
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"

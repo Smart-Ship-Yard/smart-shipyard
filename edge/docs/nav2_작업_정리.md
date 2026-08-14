@@ -368,7 +368,7 @@ ros2 topic pub --once /event/ack std_msgs/msg/Empty "{}"
 배의 존재를 모른다. 경로는 피해서 짜이지만, 경로를 벗어나거나 복구
 동작을 할 때 막아줄 것이 없다.
 
-**2단계 (예정): 뎁스 측량 + Keepout Filter**
+**2단계 (2026-08-14 구현 완료): 뎁스 측량 + Keepout Filter**
 
 ```
 매핑 랩 1회
@@ -404,7 +404,44 @@ navigation.launch.py
 - **keepout 영역에도 inflation 이 붙는다.** "배 사각형 + inflation" 이 순찰 원을
   잡아먹지 않는지 확인해야 한다.
 - 순찰 자체(원 위 웨이포인트 생성·주행)는 `patrol_mission_node` 로 이미 구현·검증
-  완료다. 중심 입력을 yaml 대신 토픽에서 받게 하는 소폭 수정만 남는다.
+  완료다. 측량이 매핑 시점에 끝나고 `finalize_map.py` 가 yaml 에 구우므로
+  순찰 노드는 지금처럼 yaml 만 읽으면 된다 — **수정할 것이 없다.**
+
+### 구현 상태 (2026-08-14)
+
+우리 쪽은 전부 끝났다. 남은 것은 젯슨의 `ship_survey_node` 하나뿐이고,
+그것이 없어도 임시 상자 방식으로 동일하게 동작한다.
+
+| 파일 | 한 일 |
+|---|---|
+| `check_patrol_space.py` | `--emit-mask` 로 마스크 생성. 섬이 여럿이면 후보 목록 출력. `--center` 는 무게중심으로 스냅(사람은 지목만, 계산은 기계). `--mask-size` 로 크기를 직접 받을 수 있음 |
+| `finalize_map.py` | `--center` / `--ship-size` 통로. `/tmp/ship_survey_results/*.json` 을 있으면 읽어 중심·크기·yaw 사용. 마스크 생성 호출 |
+| `config/keepout_on.yaml` | 필터를 켜는 오버레이 (신규) |
+| `config/nav2_params.yaml` | `keepout_filter` 정의. **기본은 꺼짐** |
+| `navigation.launch.py` | 마스크가 있으면 `filter_mask_server` + `costmap_filter_info_server` 기동 + lifecycle 등록 + 오버레이 적용. 없으면 배너로 알리고 건너뜀 |
+| `masks/README.md` | 마스크 폴더 설명 (신규) |
+
+**중심 결정 우선순위:** `--center` > 측량 기록 > 맵에서 자동 탐지.
+사람이 준 값을 가장 위에 두는 이유는, 자동 선택이 틀렸을 때 되돌릴 방법이
+그것뿐이기 때문이다.
+
+**시뮬 검증 결과** (`demo_room`, 마스크 생성 후):
+
+```
+keepout      : 사용 — masks/keepout_demo_room.yaml
+KeepoutFilter: 글로벌·로컬 코스트맵 양쪽에 Initialized
+/keepout_mask 74x72 @ 0.05, origin (-1.85, -1.80)  ← 맵과 완전히 일치
+/costmap_filter_info  type 0, base 0.0, multiplier 1.0
+
+글로벌 코스트맵 실측
+  금지영역 중심 (0.00, 0.00)   254   ← 치명적
+  금지영역 안   (0.20, 0.00)   254
+  금지영역 밖   (0.40, 0.00)     0
+  순찰 원 위    (0.93, 0.00)     0   ← 순찰을 막지 않는다
+```
+
+마스크가 없는 경우도 확인했다 — 배너에
+`keepout : 사용 안 함 — ... 없음` 이 찍히고 Nav2 는 기존과 동일하게 뜬다.
 
 ### 명령어 영향
 

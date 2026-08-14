@@ -215,9 +215,30 @@ def launch_setup(context, *args, **kwargs):
         convert_types=True,
     )
 
+    # ---- keepout 마스크 -------------------------------------------------
+    # 라이다 스캔 평면보다 낮은 대상(모형 배)은 코스트맵에 안 잡혀 로봇이
+    # 가로질러 갈 수 있다. finalize_map.py 가 만들어 둔 마스크가 있으면
+    # KeepoutFilter 로 그 자리를 코스트맵에 직접 박는다.
+    #
+    # 마스크가 없으면 필터를 켜지 않는다. 켜 두면 KeepoutFilter 가
+    # /costmap_filter_info 를 기다리다 코스트맵이 활성화되지 못해 Nav2 가 안 뜬다.
+    map_name = os.path.splitext(os.path.basename(map_yaml))[0]
+    mask_yaml = os.path.join(pkg_share, 'masks', f'keepout_{map_name}.yaml')
+    keepout_on = os.path.isfile(mask_yaml)
+
+    # 있든 없든 반드시 로그로 알린다. 조용히 건너뛰면 나중에 마스크를 만들어 두고도
+    # "왜 keepout 이 안 먹지" 하며 원인을 못 찾는다.
+    if keepout_on:
+        banner_keepout = f'사용 — masks/keepout_{map_name}.yaml'
+    else:
+        banner_keepout = (f'사용 안 함 — masks/keepout_{map_name}.yaml 없음. '
+                          f'라이다에 잡히는 대상만 회피한다')
+
     # ★ 순서가 중요하다. 공통 -> 장소별 순으로 줘야 장소별이 이긴다.
     #   overlay 에 적힌 값만 덮어써지고 나머지는 공통 파일 값이 그대로 남는다.
     node_params = [configured_params, overlay_file]
+    if keepout_on:
+        node_params.append(os.path.join(pkg_share, 'config', 'keepout_on.yaml'))
 
     common = dict(output='screen',
                   arguments=['--ros-args', '--log-level', log_level])
@@ -247,12 +268,41 @@ def launch_setup(context, *args, **kwargs):
              remappings=[('cmd_vel', 'cmd_vel_nav'),
                          ('cmd_vel_smoothed', 'cmd_vel')], **common),
 
+    ]
+
+    # keepout 을 쓸 때만 서버 두 개를 띄운다.
+    #   filter_mask_server        마스크 이미지를 OccupancyGrid 로 발행 (map_server 재사용)
+    #   costmap_filter_info_server 그 마스크를 어떻게 해석할지 알려줌
+    # 둘 다 lifecycle 노드라 관리 목록에도 넣어야 activate 된다.
+    lifecycle_nodes = list(LIFECYCLE_NODES)
+    if keepout_on:
+        lifecycle_nodes = (['filter_mask_server', 'costmap_filter_info_server']
+                           + lifecycle_nodes)
+        nodes += [
+            Node(package='nav2_map_server', executable='map_server',
+                 name='filter_mask_server',
+                 parameters=[{'use_sim_time': is_sim,
+                              'yaml_filename': mask_yaml,
+                              'topic_name': 'keepout_mask',
+                              'frame_id': 'map'}], **common),
+            Node(package='nav2_map_server', executable='costmap_filter_info_server',
+                 name='costmap_filter_info_server',
+                 parameters=[{'use_sim_time': is_sim,
+                              # type 0 = keepout. base/multiplier 는 마스크 값을
+                              # 코스트로 바꾸는 1차식이며 keepout 은 그대로 쓴다.
+                              'type': 0,
+                              'filter_info_topic': '/costmap_filter_info',
+                              'mask_topic': 'keepout_mask',
+                              'base': 0.0,
+                              'multiplier': 1.0}], **common),
+        ]
+
+    nodes.append(
         Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
              name='lifecycle_manager_navigation',
              parameters=[{'use_sim_time': is_sim,
                           'autostart': autostart.lower() in ('true', '1', 'yes'),
-                          'node_names': LIFECYCLE_NODES}], **common),
-    ]
+                          'node_names': lifecycle_nodes}], **common))
 
     # ---- 순찰 노드 (Step 6) ---------------------------------------------
     # 순찰 원의 중심·반지름은 **맵마다 다르다.** 그래서 맵 이름에 묶어
@@ -261,7 +311,6 @@ def launch_setup(context, *args, **kwargs):
     patrol_on = LaunchConfiguration('patrol').perform(context).lower() in (
         'true', '1', 'yes')
     if patrol_on:
-        map_name = os.path.splitext(os.path.basename(map_yaml))[0]
         patrol_cfg = os.path.join(pkg_share, 'config', f'patrol_{map_name}.yaml')
         if os.path.isfile(patrol_cfg):
             patrol_params = [patrol_cfg, {'use_sim_time': is_sim}]
@@ -315,6 +364,7 @@ def launch_setup(context, *args, **kwargs):
         LogInfo(msg=f'  행동트리     : {preset["bt"]}'),
         LogInfo(msg=f'  순찰         : {banner_patrol}'),
         LogInfo(msg=f'  이벤트 정지  : {banner_events}'),
+        LogInfo(msg=f'  keepout      : {banner_keepout}'),
         LogInfo(msg='  cmd_vel 경로 : controller -> /cmd_vel_nav -> smoother -> /cmd_vel'),
         LogInfo(msg='─' * 60),
     ]

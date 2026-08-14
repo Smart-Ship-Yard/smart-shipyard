@@ -1,0 +1,29 @@
+# ==========================================================================
+#  keepout_on.yaml — keepout 필터를 켜는 오버레이
+# ==========================================================================
+#  navigation.launch.py 가 masks/keepout_<맵이름>.yaml 이 있을 때만
+#  이 파일을 nav2_params.yaml 위에 얹는다. 없으면 얹지 않아 필터가 꺼진 채 뜬다.
+#
+#  왜 오버레이로 분리했나
+#  ----------------------
+#  filters 를 nav2_params.yaml 에 켜 두면 KeepoutFilter 가 기동 시
+#  /costmap_filter_info 를 기다린다. 마스크 서버가 없으면 코스트맵이
+#  활성화되지 못하고 Nav2 전체가 안 뜬다. 마스크 없는 맵(demo_room 등)으로
+#  돌릴 일이 계속 있으므로, 기본은 꺼진 상태여야 한다.
+#
+#  space_narrow.yaml / space_wide.yaml 과 같은 방식이다
+#  (나중에 준 파일이 이긴다).
+#
+#  필터 자체의 설정(plugin, filter_info_topic)은 nav2_params.yaml 에 있다.
+#  여기서는 "쓴다"는 선언만 한다.
+# ==========================================================================
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      filters: ["keepout_filter"]
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      filters: ["keepout_filter"]
