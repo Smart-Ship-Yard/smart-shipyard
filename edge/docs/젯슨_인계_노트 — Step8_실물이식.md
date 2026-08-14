@@ -223,7 +223,15 @@ edge/ros2_ws/src/ship_ugv_navigation/scripts/stop_all.sh
 
 스크립트가 셋 다 처리한다.
 
-### 5-2. `websocket_client` 는 재연결 루프가 있다
+### 5-2. `websocket_client` 는 재연결 루프가 있다 — 그리고 **실물에선 자동으로 뜬다**
+
+PR #21 부터 `localization.launch.py` 가 `yolo_depth_publisher`·`ship_survey_node`·
+`websocket_client` 를 함께 띄운다. **실물에서 `ros2 run` 으로 또 띄우면 두 개가
+같은 서버에 붙어 위치핑이 두 배로 나간다.**
+
+문서에 나오는 `ros2 run ship_ugv_perception websocket_client ...` 는 전부
+**노트북 시뮬 시험용**이다(그쪽은 `localization.launch.py` 를 안 띄우므로 수동이 맞다).
+
 
 노트북/젯슨에서 시험용으로 띄운 것을 안 끄면, 백엔드를 다시 띄우는 순간
 **알아서 다시 접속한다.** 띄운 적도 없는데 "젯슨 연결됨" 로그가 찍히고,
