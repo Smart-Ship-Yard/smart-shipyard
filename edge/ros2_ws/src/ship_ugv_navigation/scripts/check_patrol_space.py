@@ -491,10 +491,11 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
                 print(f'  [{i + 1}] 중심 ({c["cx"]:7.2f}, {c["cy"]:7.2f})  '
                       f'크기 {c["sx"]:.2f} x {c["sy"]:.2f} m{mark}')
             print()
-            print('  의도한 대상이 아니면 중심 좌표를 직접 지정한다:')
-            print('    python3 scripts/finalize_map.py <맵이름> --center <X> <Y>')
-            print('  좌표는 RViz 의 Publish Point 도구로 대상을 찍으면 터미널에 나온다.')
-            print('  정확히 찍을 필요는 없다 — 가장 가까운 장애물을 알아서 고른다.')
+            print('  의도한 대상이 아니면 위 목록의 중심 좌표를 그대로 복사해 다시 돌린다:')
+            print(f'    python3 scripts/finalize_map.py <맵이름> '
+                  f'--center {cands[-1]["cx"]:.2f} {cands[-1]["cy"]:.2f}')
+            print('  정확히 맞출 필요 없다 — 가장 가까운 것을 지목한 것으로 보고')
+            print('  그 장애물의 무게중심을 다시 계산해서 쓴다.')
             print('=' * 68)
     else:
         cx, cy = center
@@ -558,6 +559,21 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
             if emit_mask:
                 if bbox is not None:
                     emit_keepout_mask(emit_mask, m, bbox, map_name)
+                    # 마스크는 대상 외곽에 MASK_PAD 만큼 더 부풀린다. 좁은 맵에서는
+                    # 그 여유가 순찰 여유를 거의 다 먹어 경로가 금지영역에 닿는다.
+                    # 조용히 두면 "왜 갑자기 경로가 안 나오지" 로 헤매게 된다.
+                    if MASK_PAD >= best[1] - 0.03:
+                        print()
+                        print('   ' + '=' * 62)
+                        print(f'   ⚠️ 마스크 여유({MASK_PAD} m)가 순찰 여유'
+                              f'({best[1]:.3f} m)를 거의 다 먹는다')
+                        print(f'      남는 폭 {best[1] - MASK_PAD:.3f} m — '
+                              f'순찰 경로가 금지영역에 닿을 수 있다.')
+                        print('      대상이 라이다에 잡히는 물체라면(코스트맵이 이미 안다)')
+                        print('      마스크가 필요 없으므로 --no-mask 로 끄는 편이 낫다.')
+                        print('      배처럼 라이다에 안 잡히는 대상이면 주변을 더 치우고')
+                        print('      재매핑해 반지름을 키울 것.')
+                        print('   ' + '=' * 62)
                 else:
                     # 조용히 넘어가면 나중에 "왜 keepout 이 안 먹지" 로 헤맨다.
                     print('   ⚠️ keepout 마스크를 만들지 못했다 — 대상의 크기를 '

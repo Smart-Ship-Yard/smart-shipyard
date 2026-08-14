@@ -166,6 +166,10 @@ def main():
                          '대상이 라이다에 안 잡혀(모형 배 등) 맵에서 크기를 '
                          '알 수 없을 때 --center 와 함께 준다. 측량 기록에 '
                          'size_xy 가 있으면 그것보다 이 값이 우선한다')
+    ap.add_argument('--no-mask', action='store_true',
+                    help='keepout 마스크를 만들지 않는다. 순찰 대상이 라이다에 '
+                         '잡히는 물체라면(코스트맵이 이미 안다) 마스크는 중복이며, '
+                         '좁은 맵에서는 순찰 여유만 깎는다')
     ap.add_argument('--skip-check', action='store_true')
     ap.add_argument('--force', action='store_true',
                     help='정합 기록과 맵의 시각 차이 검사를 무시하고 진행')
@@ -312,8 +316,16 @@ def main():
 
     cmd = [sys.executable, os.path.join(SCRIPTS, 'check_patrol_space.py'),
            '--map', yaml_path,
-           '--emit-patrol', patrol_out,
-           '--emit-mask', mask_out]
+           '--emit-patrol', patrol_out]
+    if a.no_mask:
+        # 오래된 마스크가 남아 있으면 launch 가 그것을 켜 버린다. 같이 지운다.
+        for p in (mask_out, os.path.splitext(mask_out)[0] + '.pgm'):
+            if os.path.exists(p):
+                os.remove(p)
+                print(f'  기존 마스크 삭제: {p}')
+        print('  keepout 마스크: 만들지 않음 (--no-mask)')
+    else:
+        cmd += ['--emit-mask', mask_out]
 
     # 중심 결정 우선순위: 사람이 직접 지정 > 측량 기록 > 맵에서 자동 탐지.
     # 사람이 준 값을 가장 위에 두는 이유는, 자동 선택이 틀렸을 때
