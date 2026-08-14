@@ -26,10 +26,17 @@
   <!-- <depend>nav2_simple_commander</depend> -->
   <depend>nav2_behaviors</depend>       <!-- 복구 행동 플러그인 (BT 가 호출) -->
 
-  <!-- launch에서 기동하는 것들 (빌드 의존 아님, 런타임 의존) -->
+  <!-- launch에서 기동하는 것들 (빌드 의존 아님, 런타임 의존).
+       nav2 를 통째로 설치하면 다 딸려 오므로 지금까지 선언이 없어도 동작했지만,
+       깨끗한 기계에서 rosdep install 할 때 빠지지 않도록 명시한다. -->
   <exec_depend>nav2_bringup</exec_depend>
-  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>       <!-- map_server, filter_mask_server, costmap_filter_info_server -->
   <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>nav2_controller</exec_depend>       <!-- controller_server -->
+  <exec_depend>nav2_planner</exec_depend>          <!-- planner_server -->
+  <exec_depend>nav2_bt_navigator</exec_depend>     <!-- bt_navigator -->
+  <exec_depend>nav2_velocity_smoother</exec_depend><!-- velocity_smoother -->
+  <exec_depend>nav2_costmap_2d</exec_depend>       <!-- 코스트맵 레이어·KeepoutFilter 플러그인 -->
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>xacro</exec_depend>
   <exec_depend>rviz2</exec_depend>
@@ -37,6 +44,7 @@
 
   <!-- 시뮬 전용 (실물 젯슨에는 설치 불필요) -->
   <exec_depend>gazebo_ros</exec_depend>
+  <exec_depend>robot_localization</exec_depend>    <!-- sim_bringup 의 ekf_local (실물은 슬램 쪽 launch 가 띄운다) -->
 
   <export>
     <build_type>ament_python</build_type>
