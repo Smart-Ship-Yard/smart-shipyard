@@ -351,8 +351,11 @@ ros2 topic pub --once /event/ack std_msgs/msg/Empty "{}"
 
 중심 좌표 자체는 **섬 픽셀 전체의 무게중심**이라 사람이 RViz에서 클릭하는
 것보다 정확하다. 즉 부족한 것은 정확도가 아니라 **"어느 물체냐"는 판단**이다.
-`check_patrol_space.py --center X Y` 로 지정할 수 있으나
-`finalize_map.py` 에 그 인자를 넘기는 통로가 없다 — 필요해지면 추가한다.
+
+→ **해결 (2026-08-14):** 후보가 여럿이면 목록을 출력하고, `--center` 로
+지목할 수 있게 했다. 지정 좌표는 "어느 것이냐"를 고르는 데만 쓰고 중심은
+그 장애물의 무게중심을 다시 계산하므로 **대충 찍어도 결과가 같다.**
+출력에 복붙 가능한 명령이 실제 좌표까지 채워져 나온다.
 
 ### 대응 — 2단계
 
@@ -715,8 +718,8 @@ ros2 topic pub --once /event/active std_msgs/msg/Bool "{data: true}"   # ❌ 이
 | `ship_ugv_navigation/patrol_mission_node.py` | 원형 순찰, 이벤트 정지/재개, 실패 처리 |
 | `config/patrol_demo_room.yaml` | **자동 생성** — demo_room 순찰 원 |
 | `config/patrol_shipyard_map_JG_room_v2.yaml` | **자동 생성** — 내 방 순찰 원 |
-| `scripts/check_patrol_space.py` | `--emit-patrol` 추가 (순찰 설정 파일 생성) |
-| `scripts/finalize_map.py` | 위 옵션을 붙여 호출 |
+| `scripts/check_patrol_space.py` | `--emit-patrol` 추가 (순찰 설정 파일 생성). 이후 `--emit-mask`·`--center` 스냅·`--mask-size` 추가 → 4-1장 |
+| `scripts/finalize_map.py` | 위 옵션을 붙여 호출. 이후 `--center`·`--ship-size`·`--no-mask`·측량 기록 읽기 추가 → 4-1장 |
 | `launch/navigation.launch.py` | `patrol:=true` 인자 |
 
 **순찰 설정을 손으로 적지 않게 만들었다**
