@@ -54,15 +54,38 @@
 cd ~/smart-shipyard
 git status                          # 로컬 변경 없는지 먼저 확인
 git pull
+
+# ★ main 에서 바로 작업하지 말 것. Step 8 은 반드시 파일이 바뀐다
+git switch -c nav2/step8-sim-to-real
+
 cd edge/ros2_ws
 colcon build --symlink-install
 source install/setup.bash
 ```
 
+### 왜 브랜치를 만드나 — Step 8 은 "돌려보기만" 하는 단계가 아니다
+
+아래가 전부 바뀐다. `main` 에서 하면 되돌리기가 번거롭고, 팀 규칙상으로도
+`main` 직접 작업은 하지 않는다.
+
+| 바뀌는 것 | 언제 |
+|---|---|
+| `maps/shipyard_map_<장소>_v3.pgm` / `.yaml` | 재매핑 |
+| `config/patrol_<맵이름>.yaml` | `finalize_map.py` 가 자동 생성 |
+| `masks/keepout_<맵이름>.*` | 위와 같음 (`--no-mask` 면 생성 안 함) |
+| `maps/calibration_records/*.json` | 캘리브레이션·정합 기록 보존 |
+| `config/nav2_params.yaml` | **실물 튜닝** — `footprint_padding`, `inflation_radius` 등 (4-3 참고) |
+| `edge/docs/*` | 실측값·결과 기록 |
+
+브랜치가 며칠 이상 가면 중간에 `git merge main` 으로 최신 상태를 따라간다.
+
 ### ⚠️ 젯슨에서 `git add .` 금지
 
 `wit_ros2_imu` 가 서브모듈이라 항상 `M` 으로 보인다. `git add .` 하면 그게
 같이 커밋되어 **다른 사람 환경이 바뀐다.** 파일을 하나씩 지정해 스테이징할 것.
+
+매핑 결과를 커밋할 때 **`maps/` 만 올리면 안 된다** — 위 표대로 `config/` 와
+`masks/` 에도 파일이 생긴다. 명령은 `재매핑_체크리스트.md` 10단계에 있다.
 
 ---
 
