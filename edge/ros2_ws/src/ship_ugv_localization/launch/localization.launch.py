@@ -74,6 +74,50 @@ def generate_launch_description():
         output='screen',
     )
 
+    # ★ 배 측량은 매핑 랩과 같은 주행에서 이뤄져야 한다.
+    #   Nav2 순찰을 돌리려면 배 중심이 이미 있어야 하는데, 중심을 구하려고
+    #   도는 것이라 Nav2를 켠 뒤에 측량하면 닭-달걀이 되기 때문.
+    #   mapping.launch.py가 이 launch를 전제로 돌므로 여기 두면 매핑 시 항상 켜진다.
+    #   측량 입력(/event_detection/uvd)을 yolo_depth_publisher가 만들므로 같이 띄운다.
+    yolo_depth_publisher_node = Node(
+        package='ship_ugv_perception',
+        executable='yolo_depth_publisher',
+        name='yolo_depth_publisher',
+        output='screen',
+    )
+
+    ship_survey_node = Node(
+        package='ship_ugv_perception',
+        executable='ship_survey_node',
+        name='ship_survey_node',
+        output='screen',
+        parameters=[{
+            # 배를 반대 방향으로 놓았으면 이 값만 3.14159로 바꿀 것.
+            # 최소외접사각형의 180도 모호성(앞뒤 구분 불가)만 푸는 용도라
+            # 대충 실측한 값이면 충분하다.
+            'yaw_hint_rad': 0.0,
+        }],
+    )
+
+    # ★ ship_survey_node의 재측량 트리거(/block_level/confirmed)를 이 노드가
+    #   발행하므로, 얘가 안 떠 있으면 조립 단계가 바뀌어도 재측량이 영영 안 된다.
+    #   그래서 측량 노드와 같은 launch에 둔다.
+    websocket_client_node = Node(
+        package='ship_ugv_perception',
+        executable='websocket_client',
+        name='websocket_client',
+        output='screen',
+        parameters=[{
+            # ★ 서버 IP는 같은 공유기 내부 IP라 바뀔 수 있다 (edge/docs/설치가이드.md 참고).
+            #   서버가 안 붙으면 제일 먼저 여기부터 확인할 것.
+            'server_ws_url': 'ws://192.168.0.5:8000/ws/jetson',
+            # 서버가 아직 안 떠 있으면 이 주기로 재접속을 계속 시도하는데,
+            # 기본 5초면 매핑 중에 로그가 시끄러워서 10초로 늘렸다.
+            # 대가: 서버가 켜진 뒤 붙기까지 최대 10초 걸린다 (위치 핑은 0.5초라 무관).
+            'reconnect_interval_s': 10.0,
+        }],
+    )
+
     im10a_yaml = os.path.join(
         get_package_share_directory('witmotion_ros'),
         'config', 'im10a.yml')
@@ -164,6 +208,9 @@ def generate_launch_description():
         ekf_local_node,
         ekf_global_node,
         change_point_node,
+        yolo_depth_publisher_node,
+        ship_survey_node,
+        websocket_client_node,
         laser_static_tf_node,
         rplidar_node,
         laser_filter_node,

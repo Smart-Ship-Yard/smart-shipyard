@@ -21,13 +21,15 @@ setup(
     maintainer_email='you@example.com',
     description='Depth camera event to map-point conversion via TF (change_point.py)'
                 ' + YOLO/Depth publisher (yolo_depth_publisher.py)'
-                ' + WebSocket backend client (websocket_client.py)',
+                ' + WebSocket backend client (websocket_client.py)'
+                ' + ship pose survey via minAreaRect (ship_survey_node.py)',
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
             'change_point = ship_ugv_perception.change_point:main',
             'yolo_depth_publisher = ship_ugv_perception.yolo_depth_publisher:main',
             'websocket_client = ship_ugv_perception.websocket_client:main',
+            'ship_survey_node = ship_ugv_perception.ship_survey_node:main',
         ],
     },
 )
