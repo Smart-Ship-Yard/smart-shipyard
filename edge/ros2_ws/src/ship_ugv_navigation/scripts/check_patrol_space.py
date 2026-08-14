@@ -530,11 +530,37 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
             print('     지정한 좌표를 그대로 순찰 중심으로 쓰고, 마스크는 만들지 않는다')
     print()
 
-    print(' 반지름 | 완주 | 최소여유 | 판정')
-    print('--------+------+----------+---------------------------')
     good = []       # 완주 + 여유 충분
     passable = []   # 완주는 되나 여유 부족
     r = 0.20
+
+    # ★ 대상이 라이다에 안 잡히면 맵에는 아무것도 없다. 그러면 check_circle 이
+    #   "빈 공간이니 아무 반지름이나 된다"고 판정해 **대상을 관통하는 원**이 뽑힌다.
+    #   (실제로 0.79 m 짜리 배에 반지름 0.20 m 가 나온 적이 있다 — 배 속을 도는 셈)
+    #   크기를 아는 경우에는 차체 안쪽 끝이 대상 모서리를 넘지 않도록 직접 막는다.
+    if mask_size:
+        reach = math.hypot(mask_size[0] / 2.0, mask_size[1] / 2.0)
+        need_inner = reach + margin
+        min_r = None
+        rr = 0.20
+        while rr <= 1.60:
+            if sweep_bounds(rr)[0] >= need_inner:
+                min_r = rr
+                break
+            rr += 0.05
+        print(f'대상이 맵에 없어 크기로 최소 반지름을 정한다: '
+              f'중심에서 모서리까지 {reach:.3f} m + 여유 {margin} m '
+              f'= 차체 안쪽이 {need_inner:.3f} m 밖에 있어야 함')
+        if min_r is None:
+            print('❌ 1.60 m 까지 봐도 차체 안쪽이 대상을 비켜가지 못한다 — 대상이 너무 크다')
+            return 1
+        print(f'  -> {min_r:.2f} m 부터 검사한다 (그 미만은 대상을 관통하므로 제외)')
+        print()
+        r = min_r
+
+    print(' 반지름 | 완주 | 최소여유 | 판정')
+    print('--------+------+----------+---------------------------')
+
     while r <= 1.60:
         bad, worst = check_circle(m, cx, cy, r)
         if bad == 0:
