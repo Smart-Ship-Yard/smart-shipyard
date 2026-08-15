@@ -13,6 +13,9 @@ venv/
 build/
 install/
 log/
+# ROS 2 view_frames(tf2_tools)가 실행할 때마다 생성하는 TF 트리 디버그 파일
+frames_*.gv
+frames_*.pdf
 # Node.js 의존성 폴더 (npm install로 각자 재생성)
 node_modules/
 # Orbbec SDK 런타임 로그 (실행 위치에 자동 생성됨)

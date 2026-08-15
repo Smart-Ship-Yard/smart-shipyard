@@ -47,6 +47,15 @@ def generate_launch_description():
         executable='complementary_filter_node',
         name='heading_complementary_filter',
         output='screen',
+        parameters=[{
+            # ★ 2026-08-15 실측 반영: 노드 기본값 0.01(rad^2)은 "yaw 오차 5.7도"라는
+            #   주장인데, 좁은 방 앵커 기하에서 실제로는 25도 이상 틀어지는 것을
+            #   여러 번 확인했다(180도 뒤집힌 경우도 있었다). 과신한 공분산은
+            #   ekf_global 에서 AMCL(라이다-맵 매칭)의 정확한 yaw 를 눌러버린다.
+            #   실측에 맞춰 0.15(약 22도)로 낮춘다 — 여전히 AMCL 이 수렴하기 전이나
+            #   AMCL 이 실패했을 때의 fallback 역할은 한다.
+            'yaw_variance': 0.15,
+        }],
     )
 
     ekf_local_node = Node(

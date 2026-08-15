@@ -4,8 +4,11 @@
       name: angle_filter_back
       type: laser_filters/LaserScanAngularBoundsFilterInPlace
       params:
-        lower_angle: -1.1990   # -68.7도
-        upper_angle: 1.9425    # 111.3도 (이 사이, 즉 후방 180도가 지워짐)
+        # ★ 2026-08-15 재조정: base_link_to_laser_tf가 yaw 180도라 라이다 원점(0도)이
+        #   로봇 정후방과 일치한다. 공유기/UWB 판이 좌우 대칭으로 가리므로 원점 기준
+        #   대칭 ±75도(총 150도)만 지운다 — 기존 비대칭 180도 값보다 좌우 15도씩 더 본다.
+        lower_angle: -1.3090   # -75도
+        upper_angle: 1.3090    # 75도 (이 사이, 즉 정후방 150도가 지워짐)
 
     filter2:
       name: range_filter

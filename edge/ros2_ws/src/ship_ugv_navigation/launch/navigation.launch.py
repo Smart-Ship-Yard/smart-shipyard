@@ -211,6 +211,7 @@ def launch_setup(context, *args, **kwargs):
             'yaml_filename': map_yaml,
             'default_nav_to_pose_bt_xml': bt_xml,
             'topic': scan_topic,
+            'scan_topic': scan_topic,   # amcl 은 'topic' 이 아니라 'scan_topic' 키를 쓴다
         },
         convert_types=True,
     )
@@ -297,6 +298,36 @@ def launch_setup(context, *args, **kwargs):
                               'multiplier': 1.0}], **common),
         ]
 
+    # ---- AMCL 라이다 로컬라이제이션 (2026-08-15 추가) --------------------
+    # ★ TF 는 발행하지 않는다 (nav2_params.yaml 의 tf_broadcast: false).
+    #   /amcl_pose 만 내고, ekf_global 이 그것을 pose1 센서 입력으로 먹는다.
+    #   map->odom 발행자는 계속 ekf_global 하나뿐이라 TF 이중 발행이 없다.
+    #   근거와 배경은 nav2_params.yaml 의 amcl 블록 주석 참고.
+    #
+    # 시뮬에서는 켜지 않는다 — fake_global_localization 이 참값을 주므로
+    # AMCL 이 할 일이 없고, 오히려 실물과 다른 구조가 되어 이식이 어긋난다.
+    amcl_arg = LaunchConfiguration('amcl').perform(context).strip().lower()
+    if amcl_arg == '':
+        amcl_on = not is_sim          # 기본값: 실물이면 켠다
+        amcl_how = '(실물이라 자동으로 켬)'
+    else:
+        amcl_on = amcl_arg in ('true', '1', 'yes')
+        amcl_how = '(amcl 인자로 지정)'
+
+    if amcl_on:
+        # map_server 다음, controller_server 앞에 둔다 — 맵을 받아야 초기화된다.
+        lifecycle_nodes.insert(lifecycle_nodes.index('map_server') + 1, 'amcl')
+        nodes.append(Node(package='nav2_amcl', executable='amcl', name='amcl',
+                          parameters=node_params, **common))
+        # AMCL 은 초기 위치를 모르면 수렴하지 못한다. ekf_global(UWB) 추정치를
+        # 씨앗으로 한 번 넣어 주고 스스로 종료하는 노드.
+        nodes.append(Node(package='ship_ugv_navigation', executable='amcl_seed_node',
+                          name='amcl_seed_node',
+                          parameters=[{'use_sim_time': is_sim}], **common))
+        banner_amcl = f'사용 {amcl_how} — TF 미발행, /amcl_pose -> ekf_global pose1'
+    else:
+        banner_amcl = f'사용 안 함 {amcl_how}'
+
     nodes.append(
         Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
              name='lifecycle_manager_navigation',
@@ -365,6 +396,7 @@ def launch_setup(context, *args, **kwargs):
         LogInfo(msg=f'  순찰         : {banner_patrol}'),
         LogInfo(msg=f'  이벤트 정지  : {banner_events}'),
         LogInfo(msg=f'  keepout      : {banner_keepout}'),
+        LogInfo(msg=f'  amcl         : {banner_amcl}'),
         LogInfo(msg='  cmd_vel 경로 : controller -> /cmd_vel_nav -> smoother -> /cmd_vel'),
         LogInfo(msg='─' * 60),
     ]
@@ -406,6 +438,10 @@ def generate_launch_description():
             'events', default_value='',
             description='이벤트 정지 노드(event_gate_node) 실행. '
                         '비우면 patrol 값을 따라간다. 튜닝 중 끄려면 events:=false'),
+        DeclareLaunchArgument(
+            'amcl', default_value='',
+            description='AMCL 라이다 로컬라이제이션(TF 미발행, /amcl_pose 를 '
+                        'ekf_global 에 공급). 비우면 실물에서만 자동으로 켠다'),
         DeclareLaunchArgument(
             'use_rviz', default_value='false',
             description='Nav2 전용 RViz(nav.rviz) 동시 실행'),

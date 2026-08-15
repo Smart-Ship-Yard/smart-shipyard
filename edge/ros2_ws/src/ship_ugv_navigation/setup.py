@@ -61,6 +61,12 @@ setup(
             'ship_ugv_navigation.patrol_mission_node:main',
             'event_gate_node = '
             'ship_ugv_navigation.event_gate_node:main',
+
+            # ── [실물 전용] AMCL 에 초기 위치를 한 번 넣고 스스로 종료한다 ──
+            #   시뮬은 fake_global_localization 이 참값을 주므로 AMCL 자체를
+            #   띄우지 않는다 (navigation.launch.py 가 실물에서만 켠다).
+            'amcl_seed_node = '
+            'ship_ugv_navigation.amcl_seed_node:main',
         ],
     },
 )
