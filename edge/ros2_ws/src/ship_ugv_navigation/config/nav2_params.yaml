@@ -571,3 +571,85 @@ map_saver:
     save_map_timeout: 5.0
     free_thresh_default: 0.196     # 미탐사(205)가 자유공간으로 분류되지 않도록
     occupied_thresh_default: 0.65
+
+
+# ============================================================================
+#  amcl — 라이다-맵 스캔매칭 (2026-08-15 추가)
+# ============================================================================
+#  ★★ 이 노드는 TF 를 발행하지 않는다 (tf_broadcast: false) ★★
+#
+#  왜 이런 이상한 구성인가
+#  ------------------------
+#  보통 Nav2 는 AMCL 이 map->odom TF 를 소유한다. 이 프로젝트는 그 구조를
+#  쓰지 않는다 — TF 의 최종 권위자는 언제나 EKF 하나여야 한다는 원칙이 있고,
+#  실물에서는 ekf_global 이 그 역할을 한다 (설치가이드 7장).
+#  AMCL 이 TF 를 같이 쏘면 map->odom 이중 발행이 되어 TF 트리가 깨진다.
+#
+#  그래서 AMCL 을 "TF 주인"이 아니라 "센서 하나"로 쓴다.
+#      AMCL -> /amcl_pose -> ekf_global 의 pose1 입력 -> EKF 가 UWB 와 융합
+#  이러면 map->odom 발행자는 여전히 ekf_global 하나뿐이라 충돌이 없다.
+#
+#  무엇을 해결하려고 넣었나 (2026-08-15 실측)
+#  --------------------------------------------
+#  UWB 만으로 yaw 를 잡으면(heading_complementary_filter 의 course-over-ground)
+#  앵커 기하가 좁은 방에서 오차가 커서, 저장된 맵과 실시간 스캔이 수십 도씩
+#  틀어진 채 주행했다. 여유 0.075 m 짜리 순찰 원에서는 그만큼만 틀어져도
+#  통로가 막힌 것으로 판정되어 `Failed to make progress` 가 난다.
+#  라이다는 벽 모양을 직접 보므로 cm 급으로 정확하다. 둘을 EKF 에서 섞으면
+#  UWB(드리프트 없음) + 라이다(정밀) 의 장점만 남는다.
+#
+#  주의
+#  ----
+#  - 초기 위치 추정값이 있어야 수렴한다. amcl_seed_node 가 ekf_global 의
+#    현재 추정치를 /initialpose 로 한 번 넣어 준다 (UWB 가 AMCL 의 씨앗).
+#  - 후방 150도가 필터로 잘려 있어(공유기·UWB 판이 가림) 스캔이 210도뿐이다.
+#    360도일 때보다 매칭이 약하므로 update_min_* 를 작게 두어 자주 갱신한다.
+amcl:
+  ros__parameters:
+    use_sim_time: false
+
+    tf_broadcast: false          # ★ 절대 true 로 바꾸지 말 것 (ekf_global 과 이중 발행)
+    set_initial_pose: false      # amcl_seed_node 가 /initialpose 로 넣어 준다
+
+    global_frame_id: map
+    odom_frame_id: odom
+    base_frame_id: base_link
+    scan_topic: /scan_filtered   # navigation.launch.py 가 시뮬이면 /scan 으로 바꾼다
+
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
+    laser_model_type: "likelihood_field"
+
+    # 좁은 방 + 느린 로봇(0.15 m/s) 이라 자주 갱신해야 따라온다.
+    # 기본값(0.25 m / 0.2 rad)은 우리 순찰 반지름(0.30 m)에 비해 너무 크다.
+    update_min_d: 0.10
+    update_min_a: 0.10
+    resample_interval: 1
+
+    min_particles: 500
+    max_particles: 2000
+
+    laser_min_range: 0.15        # laser_filter.yaml 의 range_filter 와 맞춤
+    laser_max_range: 12.0
+    max_beams: 60
+
+    # 오도메트리 노이즈 모델 (JGB37-520 + 캐스터, 실측 튜닝 여지 있음)
+    alpha1: 0.2
+    alpha2: 0.2
+    alpha3: 0.2
+    alpha4: 0.2
+    alpha5: 0.2
+
+    z_hit: 0.5
+    z_rand: 0.5
+    z_max: 0.05
+    z_short: 0.05
+    sigma_hit: 0.2
+    lambda_short: 0.1
+
+    pf_err: 0.05
+    pf_z: 0.99
+    recovery_alpha_fast: 0.0
+    recovery_alpha_slow: 0.0
+    save_pose_rate: 0.5
+    transform_tolerance: 1.0
+    always_reset_initial_pose: false

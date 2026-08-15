@@ -49,36 +49,57 @@ ekf_global:
     pose0_rejection_threshold: 3.0   # 마할라노비스 거리 기반 - 실측 후 튜닝 필요 (TODO)
 
     # ---- heading_complementary_filter 융합 yaw (orientation-only IMU 메시지) ----
-    imu1: /heading/imu_uwb_fused
-    imu1_config: [false, false, false,
+    # ★ 2026-08-15 버그 수정: robot_localization은 센서 인덱스를 0부터 끊김없이
+    #   읽는다. ekf_global.yaml에는 imu0가 없어서(ekf_local과는 별개 노드/네임스페이스)
+    #   imu1 블록 전체가 조용히 무시되고 있었다 (실측: ekf_global의 실제 구독자
+    #   목록에 /heading/imu_uwb_fused가 없었음 — `ros2 node info /ekf_global`).
+    #   그 결과 yaw가 절대 보정 없이 순수 오도메트리(vyaw) 적분에만 의존했다.
+    imu0: /heading/imu_uwb_fused
+    imu0_config: [false, false, false,
                   false, false, true,     # yaw만
                   false, false, false,
                   false, false, false,
                   false, false, false]
-    imu1_differential: false
-    imu1_relative: false
-    imu1_remove_gravitational_acceleration: false
-    imu1_queue_size: 10
+    imu0_differential: false
+    imu0_relative: false
+    imu0_remove_gravitational_acceleration: false
+    imu0_queue_size: 10
 
-    # ---- [운영 모드 전용] slam_toolbox localization의 /pose를 두 번째 절대위치 소스로 ----
-    # 매핑 모드에서는 반드시 주석 상태 유지! (매핑 중 slam pose는 slam_map 프레임이고
-    # map->slam_map 정합 TF가 아직 없어 EKF가 변환 불가 → 오염 위험)
-    # 운영 모드 launch에서 아래 3블록의 주석을 해제하거나, 별도 yaml 오버레이로 켤 것.
-    # 사전 확인: (1) slam_toolbox는 자기 네임스페이스 기준 'pose'로 발행하므로
-    #   실제 토픽명이 /pose 일 수 있음. `ros2 topic list | grep -i pose`로 확인 후
-    #   launch에서 remappings=[('pose', '/slam_toolbox/pose')]로 통일하거나 아래 pose1 값을 맞출 것.
-    #   타입은 geometry_msgs/PoseWithCovarianceStamped여야 함 (PoseStamped면 릴레이 노드 필요)
-    # (2) covariance가 현실적인 값인지 확인 (과소 covariance면 LiDAR 과신)
-    # pose1: /slam_toolbox/pose
-    # pose1_config: [true,  true,  false,   # x, y
-    #                false, false, true,    # yaw
-    #                false, false, false,
-    #                false, false, false,
-    #                false, false, false]
-    # pose1_differential: false
-    # pose1_relative: false
-    # pose1_queue_size: 10
-    # pose1_rejection_threshold: 3.0   # 마할라노비스 거리 - 실측 튜닝 필요 (TODO)
+    # ---- AMCL 라이다-맵 스캔매칭 결과 (2026-08-15 활성화) ----
+    # ★ AMCL 은 TF 를 발행하지 않는다 (nav2_params.yaml 의 tf_broadcast: false).
+    #   map->odom 발행자는 이 노드(ekf_global) 하나뿐이라는 원칙을 지키기 위해,
+    #   AMCL 을 "TF 주인"이 아니라 "절대 위치 센서 하나"로 쓴다.
+    #
+    # 왜 넣었나 (2026-08-15 실측)
+    #   UWB course-over-ground 만으로 yaw 를 잡으니 좁은 방 앵커 기하에서
+    #   오차가 커서, 저장된 맵과 실시간 스캔이 수십 도씩 틀어진 채 주행했다.
+    #   여유 0.075 m 짜리 순찰 원에서는 그 정도만 틀어져도 통로가 막힌 것으로
+    #   판정되어 controller_server 가 `Failed to make progress` 를 낸다.
+    #   라이다는 벽 모양을 직접 보므로 cm 급이라, UWB(드리프트 없음)와 섞으면
+    #   서로의 약점을 덮는다.
+    #
+    # 매핑 중에는 AMCL 이 아예 안 뜬다 (navigation.launch.py 에서만 띄운다).
+    # 그동안 이 입력은 그냥 안 들어올 뿐이고 EKF 는 정상 동작한다.
+    #
+    # ⚠️ 라이다 과신 방지: rejection_threshold 로 마할라노비스 거리가 큰
+    #    (= UWB 추정과 크게 어긋나는) 측정은 버린다. AMCL 이 엉뚱한 곳으로
+    #    수렴했을 때 EKF 전체가 끌려가는 것을 막는 안전장치다.
+    pose1: /amcl_pose
+    pose1_config: [true,  true,  false,   # x, y
+                   false, false, true,    # yaw
+                   false, false, false,
+                   false, false, false,
+                   false, false, false]
+    pose1_differential: false
+    pose1_relative: false
+    pose1_queue_size: 10
+    # ⚠️ rejection_threshold 를 일부러 걸지 않았다 (2026-08-15 실측).
+    #   3.0 으로 두었더니 정반대 함정에 빠졌다 — EKF 가 (엉터리 heading 때문에)
+    #   확신을 가진 채 75도 틀어져 있으면, 정답인 AMCL 측정이 마할라노비스 거리가
+    #   커서 "이상치"로 기각되고 EKF 가 영영 못 빠져나온다. 틀린 상태를 스스로
+    #   지키는 셈이다.
+    #   AMCL 은 자기 공분산을 정직하게 내므로(수렴 전 크게, 수렴 후 작게)
+    #   그 값만으로 영향력이 적절히 조절된다. 별도 게이트가 없는 편이 낫다.
 
     process_noise_covariance: [0.05, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,     0.0,     0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
                                 0.0,    0.05, 0.0,    0.0,    0.0,    0.0,    0.0,     0.0,     0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,

@@ -81,6 +81,9 @@ class HeadingComplementaryFilter(Node):
         # ---- 파라미터 ----
         self.declare_parameter('alpha', 0.98)  # 자이로(빠름) 가중치, (1-alpha)는 UWB course
         self.declare_parameter('min_move_distance_m', 0.30)  # 최소 이동거리 임계값
+        # 이 속도 미만이면 "정지"로 보고 UWB course 를 아예 받지 않는다.
+        # 정지 중 UWB 노이즈로 heading 이 랜덤 초기화되는 것을 막는다 (_uwb_cb 참고).
+        self.declare_parameter('min_speed_mps', 0.03)
         self.declare_parameter('imu_topic', '/imu/data')
         self.declare_parameter('uwb_pose_topic', '/uwb/pose')
         self.declare_parameter('local_odom_topic', '/odometry/local')  # ekf_local 출력
@@ -97,6 +100,7 @@ class HeadingComplementaryFilter(Node):
 
         self.alpha = self.get_parameter('alpha').value
         self.min_move = self.get_parameter('min_move_distance_m').value
+        self.min_speed = self.get_parameter('min_speed_mps').value
         self.output_frame_id = self.get_parameter('output_frame_id').value
         self.map_frame_id = self.get_parameter('map_frame_id').value
         self.recalib_threshold = self.get_parameter('recalib_yaw_reset_threshold_rad').value
@@ -108,6 +112,7 @@ class HeadingComplementaryFilter(Node):
         self.last_uwb_xy = None        # map 프레임으로 변환된 좌표 저장
         self.last_uwb_stamp = None
         self.is_reverse = False        # ekf_local 선속도 부호로 판별
+        self.speed = 0.0               # |vx| — 정지 중 노이즈 오초기화 방지용
         self.last_tf_yaw = None        # 마지막으로 사용한 map<-uwb_frame TF의 회전각
         self._tf_warn_logged = False   # TF 실패 경고 도배 방지
 
@@ -143,6 +148,7 @@ class HeadingComplementaryFilter(Node):
         elif vx < -0.02:
             self.is_reverse = True
         # |vx| <= 0.02 이면 이전 상태 유지
+        self.speed = abs(vx)
 
     # ------------------------------------------------------------------
     def _imu_cb(self, msg: Imu):
@@ -234,6 +240,18 @@ class HeadingComplementaryFilter(Node):
         self.last_tf_yaw = tf_yaw
 
         if self.last_uwb_xy is None:
+            self.last_uwb_xy = (x, y)
+            self.last_uwb_stamp = now
+            return
+
+        # ★ 2026-08-15 실측으로 잡은 버그: 정지 중인데 heading 이 초기화된다.
+        #   UWB 노이즈(±0.15 m)가 누적되면 로봇이 가만히 있어도 아래 min_move(0.30 m)
+        #   조건이 우연히 충족되고, 그때의 "이동 방향"은 노이즈의 랜덤 방향이라
+        #   전혀 엉뚱한 yaw 로 초기화된다(실측: 정지 상태에서 105.8도로 초기화됨).
+        #   그 값이 ekf_global 에 10 Hz 로 계속 주입되어 위치추정 전체를 망친다.
+        #   -> 바퀴 오도메트리가 "실제로 움직이고 있다"고 말할 때만 받아들인다.
+        if self.speed < self.min_speed:
+            # 정지 중에는 기준점만 갱신해 노이즈가 누적되지 않게 한다.
             self.last_uwb_xy = (x, y)
             self.last_uwb_stamp = now
             return

@@ -1,0 +1,8 @@
+image: shipyard_map_JG_room_v4.pgm
+mode: trinary
+resolution: 0.05
+origin: [2.9203, 0.8567, 2.9265]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+# baked: map<-slam_map applied tx=-3.9575 ty=-0.9672 yaw=2.9265

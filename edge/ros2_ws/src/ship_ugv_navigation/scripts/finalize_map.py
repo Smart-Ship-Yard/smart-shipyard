@@ -395,6 +395,10 @@ def main():
         print()
         print('  바닥을 더 치우고 재매핑할 것. 필요한 공터 크기:')
         print('    python3 scripts/check_patrol_space.py --obstacle 0.127 0.127')
+    print()
+    print('  ⚠️  방금 만든 파일은 src/ 에만 있다. navigation.launch.py 로 켜기 전에:')
+    print('        cd ~/smart-shipyard/edge/ros2_ws && colcon build --symlink-install')
+    print('      안 하면 install/ 에 안 복사돼서 "맵을 못 찾는다" 에러가 난다.')
     print('=' * 60)
     # 0 / 2 는 사용 가능이므로 성공으로 취급
     return 0 if r.returncode in (0, 2) else 1
