@@ -100,7 +100,9 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction, ExecuteProcess
+from launch.actions import (DeclareLaunchArgument, LogInfo, OpaqueFunction,
+                            ExecuteProcess, RegisterEventHandler)
+from launch.event_handlers import OnShutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from nav2_common.launch import RewrittenYaml
@@ -346,6 +348,22 @@ def launch_setup(context, *args, **kwargs):
         cmd=['ros2', 'param', 'set', '/wheel_odom_bridge',
              'enable_heading_hold', 'false'],
         output='screen'))
+
+    # ★ 그리고 Nav2 가 꺼질 때 반드시 되돌린다 (2026-08-17).
+    #   되돌리지 않으면 이런 함정이 생긴다:
+    #     Nav2 를 한 번 켰다 끔 -> heading_hold 가 false 로 남음
+    #     -> 그 상태로 재캘리브레이션하면 직진 보정 없이 주행해 크게 휨
+    #     -> 원인을 찾기 매우 어렵다 (아무 에러도 안 나고 조용히 휜다)
+    #   wheel_odom_bridge 는 localization.launch.py 소속이라 이 launch 를
+    #   껐다고 재시작되지 않는다. 그래서 여기서 명시적으로 복원해야 한다.
+    nodes.append(RegisterEventHandler(OnShutdown(on_shutdown=[
+        LogInfo(msg='Nav2 종료 — wheel_odom_bridge 의 heading_hold 를 다시 켠다 '
+                    '(teleop·캘리브레이션 직진 보정용)'),
+        ExecuteProcess(
+            cmd=['ros2', 'param', 'set', '/wheel_odom_bridge',
+                 'enable_heading_hold', 'true'],
+            output='screen'),
+    ])))
 
     nodes.append(
         Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
