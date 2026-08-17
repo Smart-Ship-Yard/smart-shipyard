@@ -351,7 +351,17 @@ class WheelOdomBridge(Node):
     def _resend_cmd(self):
         """Arduino의 CMD_TIMEOUT_MS(500ms) 워치독을 충족시키기 위해 주기적으로
         마지막 명령을 재전송한다. 단, ROS 레벨에서도 cmd_vel_timeout_s 동안
-        새 /cmd_vel이 없으면 0으로 간주해 전송한다 (이중 안전장치)."""
+        새 /cmd_vel이 없으면 0으로 간주해 전송한다 (이중 안전장치).
+
+        ★ 2026-08-17: 폭주로 잠긴 상태에서는 **아무것도 보내지 않는다.**
+        엔코더가 거짓 값을 주는 상황에서는 "0 속도 명령"으로 모터를 못 세운다
+        (목표 0, 측정 -1250 -> 오차 +1250 -> 비례항만으로 PWM 최대).
+        오히려 0을 계속 재전송하면 아두이노 워치독(500ms)이 갱신되어
+        **하드스톱이 영영 발동하지 못한다.** 실제로 그래서 안 멈췄다.
+        전송을 끊어야 워치독이 떠서 PWM 을 직접 0 으로 쓴다.
+        """
+        if self._runaway_latched:
+            return
         l_tps, r_tps = self.last_cmd_l_tps, self.last_cmd_r_tps
 
         if self.last_cmd_vel_time is not None:
@@ -504,7 +514,8 @@ class WheelOdomBridge(Node):
         self._runaway_latched = True
         self.last_cmd_l_tps = 0
         self.last_cmd_r_tps = 0
-        self._send_velocity_cmd(0, 0)
+        # ★ 0 을 보내지 않는다. 전송을 끊어야 아두이노 워치독(500ms)이 떠서
+        #   PID 를 우회해 PWM 을 직접 0 으로 쓴다 (_resend_cmd 주석 참고).
         which = ('왼쪽' if bad_l else '') + ('/' if bad_l and bad_r else '') + ('오른쪽' if bad_r else '')
         self.get_logger().error(
             f'🛑 바퀴 폭주 감지 — {which} 바퀴가 명령과 반대로 돌고 있다 '

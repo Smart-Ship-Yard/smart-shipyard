@@ -83,6 +83,14 @@ float integral_l = 0.0f, integral_r = 0.0f;
 long prev_err_l = 0, prev_err_r = 0;
 unsigned long last_cmd_time = 0;
 
+// ★ 하드 스톱 (2026-08-17). true 면 PID 를 건너뛰고 PWM 을 직접 0 으로 쓴다.
+//   엔코더가 거짓말을 해도 모터를 확실히 멈추기 위한 마지막 방어선.
+//   켜지는 경우 두 가지:
+//     ① 워치독 (CMD_TIMEOUT_MS 동안 명령 없음)
+//     ② 상위(ROS)에서 "H,1" 명령을 받았을 때 — 폭주 감지기가 쓴다
+//   해제는 "H,0" 또는 정상 속도명령("V,...") 수신이다.
+bool hard_stop = false;
+
 // ---------------- 보고 상태 ----------------
 long last_report_enc_l = 0;
 long last_report_enc_r = 0;
@@ -170,6 +178,14 @@ void handleLine(const String& line) {
   target_r_tps = r;
   last_cmd_time = millis();
 
+  // ★ hard_stop 해제는 "0이 아닌 속도 명령"이 왔을 때만 (2026-08-17).
+  //   V,0,0 으로도 풀리게 하면, 상위가 0을 계속 재전송하는 동안 하드스톱이
+  //   즉시 풀려 PID 가 되살아난다. 그러면 엔코더가 거짓말하는 상황에서
+  //   또 폭주한다 — 하드스톱을 넣은 의미가 없어진다.
+  if (is_now_moving) {
+    hard_stop = false;
+  }
+
   // ★ 목표 속도가 0(정지 명령)이면, 이전에 쌓인 PID 적분값을 즉시 비운다.
   //   안 그러면 오래 돈 뒤 갑자기 멈추라는 명령이 와도, 남아있던 integral
   //   때문에 몇 초간 계속 낮은 속도로 밀리는 현상이 생긴다
@@ -210,6 +226,27 @@ int pidUpdate(long target_tps, long measured_tps, float& integral, long& prev_er
 }
 
 void controlLoop(float dt_s, long measured_l_tps, long measured_r_tps) {
+  // ★★ 2026-08-17 안전 수정 — PID 를 우회하는 하드 스톱 ★★
+  //
+  // 왜 필요한가 (실제로 두 번 겪은 사고):
+  //   왼쪽 엔코더가 배선 문제로 방향을 거꾸로 보고하면(바퀴는 앞으로 도는데
+  //   -1250 tps 로 보고), PID 는 이렇게 반응한다.
+  //       목표 0, 측정 -1250 -> 오차 +1250 -> 비례항만으로 0.4*1250=500
+  //       -> PWM 255 (최대). 바퀴는 더 빨리 돌고 측정은 더 큰 음수가 된다.
+  //   **정지 명령(목표 0)으로도, 워치독으로도 멈출 수 없다.** 워치독은
+  //   target 을 0 으로 바꿀 뿐이고 PID 는 계속 돌기 때문이다. 실제로 사람이
+  //   배터리를 뽑기 전까지 멈추지 않았다.
+  //
+  // 그래서 hard_stop 이 걸리면 PID 계산 자체를 건너뛰고 PWM 을 0으로 직접 쓴다.
+  // 센서가 거짓말을 해도 모터는 확실히 멈춘다 — 이것이 마지막 방어선이다.
+  if (hard_stop) {
+    integral_l = 0.0f;  integral_r = 0.0f;
+    prev_err_l = 0;     prev_err_r = 0;
+    setMotorPWM(PIN_L_PWM, PIN_L_DIR, 0);
+    setMotorPWM(PIN_R_PWM, PIN_R_DIR, 0);
+    return;
+  }
+
   int pwm_l = pidUpdate(target_l_tps, measured_l_tps, integral_l, prev_err_l,
                         dt_s, KP_L, KI_L, KD_L);
   int pwm_r = pidUpdate(target_r_tps, measured_r_tps, integral_r, prev_err_r,
@@ -240,6 +277,9 @@ void loop() {
     integral_r = 0.0f;
     prev_err_l = 0;
     prev_err_r = 0;
+    // ★ 목표를 0 으로 두는 것만으로는 부족하다. 엔코더가 거짓 값을 주면
+    //   PID 가 그 오차를 없애려고 계속 구동한다. PWM 을 직접 끊는다.
+    hard_stop = true;
   }
 
   unsigned long now = millis();
