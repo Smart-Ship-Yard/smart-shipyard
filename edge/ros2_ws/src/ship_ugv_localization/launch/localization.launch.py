@@ -14,6 +14,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import LogInfo
 from launch_ros.actions import Node
 
 
@@ -207,7 +208,44 @@ def generate_launch_description():
         ],
     )
 
-    return LaunchDescription([
+    # ------------------------------------------------------------------
+    # ★ 기동 배너 — 센서 장치 파일이 있는지 먼저 눈으로 알려준다 (2026-08-17 추가)
+    #
+    # 왜 필요한가: 라이다 USB 커넥터가 헐거워져 /dev/lidar 가 사라진 채로
+    # 이 launch 를 띄웠더니, rplidar_node 만 1초 만에 조용히 죽고 나머지는
+    # 정상 기동했다. 이 launch 는 노드 하나가 죽어도 전체가 안 죽으므로
+    # (required 미설정 — 카메라가 없어도 주행은 되어야 하니 의도된 설계다)
+    # 아무도 눈치채지 못했고, 그 상태로 13분을 매핑했지만 스캔이 없어
+    # 지도가 한 장도 안 만들어졌다. align 을 부르고 나서야 알았다.
+    #
+    # 그래서 "없으면 크게 알린다". 죽이지는 않는다 — 장치 하나가 없어도
+    # 나머지로 할 수 있는 일이 있고, 그 판단은 사람이 한다.
+    DEVICES = [
+        ('/dev/lidar',     'RPLIDAR',      '스캔 없음 -> 매핑·Nav2 불가'),
+        ('/dev/uwb_tag',   'UWB 태그',     '위치추정 불가 (캘리브레이션 실패)'),
+        ('/dev/imu',       'IMU',          'yaw 추정 열화'),
+        ('/dev/wheel_mcu', 'Arduino Mega', '바퀴가 안 돈다 (/cmd_vel 소비자 없음)'),
+    ]
+    missing = [(p, name, impact) for p, name, impact in DEVICES if not os.path.exists(p)]
+
+    banner = [LogInfo(msg='─── 센서 장치 확인 ' + '─' * 41)]
+    for path, name, _ in DEVICES:
+        mark = '✅' if os.path.exists(path) else '❌'
+        banner.append(LogInfo(msg=f'  {mark} {name:<14} {path}'))
+    if missing:
+        banner.append(LogInfo(msg='━' * 60))
+        for path, name, impact in missing:
+            banner.append(LogInfo(msg=f'  ⚠️  {name} 없음 ({path}) — {impact}'))
+        banner.append(LogInfo(
+            msg='  ⚠️  USB 를 다시 꽂고 이 launch 를 재시작할 것. '
+                '이 상태로 진행하면 조용히 실패한다'))
+        banner.append(LogInfo(msg='━' * 60))
+    else:
+        banner.append(LogInfo(msg='  네 장치 모두 정상 — 그래도 매핑 전에 '
+                                  '/scan_filtered 가 실제로 흐르는지 한 번 볼 것'))
+    banner.append(LogInfo(msg='─' * 60))
+
+    return LaunchDescription(banner + [
         uwb_driver_node,
         uwb_calibration_node,
         imu_static_tf_node,
