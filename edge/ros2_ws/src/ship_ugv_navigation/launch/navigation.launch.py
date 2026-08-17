@@ -100,7 +100,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction, ExecuteProcess
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from nav2_common.launch import RewrittenYaml
@@ -327,6 +327,25 @@ def launch_setup(context, *args, **kwargs):
         banner_amcl = f'사용 {amcl_how} — TF 미발행, /amcl_pose -> ekf_global pose1'
     else:
         banner_amcl = f'사용 안 함 {amcl_how}'
+
+    # ---- wheel_odom_bridge 의 heading_hold 끄기 (2026-08-17) --------------
+    # ★ 왜: wheel_odom_bridge 는 /cmd_vel 의 w 가 0 근처(|w| < 0.02)면
+    #   "직진 의도"로 보고 **발행자의 조향을 버리고 자기 PI 제어로 덮어쓴다.**
+    #   teleop·motion_controller 에게는 유용한 기능이지만(직진이 안 휘게 해준다),
+    #   Nav2 는 자기 컨트롤러가 이미 조향을 닫은 루프로 제어하고 있다.
+    #   그 위에 두 번째 제어 루프가 얹히면
+    #     ① Nav2 의 미세 조향(w=0.015 같은 값)이 통째로 버려져 경로 추종이 나빠지고
+    #     ② 두 루프가 서로 싸운다.
+    #   실제로 2026-08-17 에 이 heading_hold 가 상한 없는 w 를 만들어
+    #   **모터가 두 번 폭주했다** (wheel_odom_node.py 의 안전 수정 주석 참고).
+    #
+    # 노드를 재시작하지 않고 파라미터만 바꾸는 이유: wheel_odom_bridge 는
+    # localization.launch.py 소속이라 재시작하면 UWB 캘리브레이션까지 날아간다.
+    # 그래서 bridge 쪽에서 이 파라미터를 매 콜백마다 다시 읽도록 해 두었다.
+    nodes.append(ExecuteProcess(
+        cmd=['ros2', 'param', 'set', '/wheel_odom_bridge',
+             'enable_heading_hold', 'false'],
+        output='screen'))
 
     nodes.append(
         Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
