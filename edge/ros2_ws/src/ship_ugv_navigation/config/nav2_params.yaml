@@ -335,7 +335,38 @@ controller_server:
       use_rotate_to_heading: true
       rotate_to_heading_min_angle: 0.7        # 약 40도
       rotate_to_heading_angular_vel: 0.5
-      max_angular_accel: 1.2                  # = 0.6 / 0.5초
+      # ★★ 이 값은 "가속 제한"이 아니라 **제자리 회전을 시작할 수 있느냐**를 결정한다.
+      #     (2026-08-18, 로봇이 순찰 중 제자리에서 꿈틀대기만 하던 문제의 원인)
+      #
+      #  RPP 의 rotateToHeading() 은 목표 각속도(rotate_to_heading_angular_vel)를
+      #  그냥 내보내지 않고, **오도메트리가 알려주는 현재 각속도**를 기준으로
+      #  한 주기치만큼만 올려서 내보낸다:
+      #
+      #      angular_vel = clamp(0.5,
+      #                          측정각속도 - max_angular_accel * dt,
+      #                          측정각속도 + max_angular_accel * dt)
+      #
+      #  dt = 1 / controller_frequency = 1/20 = 0.05 초.
+      #  1.2 였을 때 첫 주기 출력은 0 + 1.2*0.05 = **0.06 rad/s**.
+      #  바퀴 속도로 환산하면 초당 9 mm 로, 우리 모터의 사구간보다 훨씬 작다.
+      #  -> 로봇이 안 돈다 -> 오도메트리가 계속 0 을 보고한다
+      #  -> 다음 주기도 또 0.06 -> **영원히 못 벗어나는 데드락**.
+      #  (실측: /odometry/local 의 angular.z 평균 0.003 rad/s, cmd 는 0.06 고정)
+      #
+      #  6.0 이면 첫 주기에 0 + 6.0*0.05 = 0.3 rad/s 를 요구한다. 이 값은
+      #  사구간을 넘으므로 로봇이 실제로 돌기 시작하고, 그때부터 오도메트리가
+      #  0 이 아닌 값을 돌려주면서 정상적으로 0.5 까지 올라간다.
+      #
+      #  ⚠️ 그렇다고 로봇이 급가속하지는 않는다. **실제 가속 제한은
+      #     velocity_smoother 가 담당**하기 때문이다 (max_accel 각속도 1.2 rad/s²).
+      #     smoother 는 측정값이 아니라 **자기 직전 출력**을 기준으로 램프하므로
+      #     같은 데드락에 빠지지 않는다. 그래서 여기서 족쇄를 푸는 것이 맞다.
+      #
+      #  ⚠️ 이 버그는 오랫동안 heading_hold 에 가려져 있었다. heading_hold 가
+      #     켜져 있으면 wheel_odom_bridge 가 RPP 의 각속도를 통째로 버리고
+      #     자기 값으로 덮어썼기 때문에 증상이 안 보였다. Nav2 실행 시
+      #     heading_hold 를 확실히 끄도록 고치자마자 드러났다.
+      max_angular_accel: 6.0
 
       allow_reversing: false                  # ⚠️ 아래 주석 참고
       max_robot_pose_search_dist: 5.0

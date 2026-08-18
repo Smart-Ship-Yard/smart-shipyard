@@ -344,10 +344,17 @@ def launch_setup(context, *args, **kwargs):
     # 노드를 재시작하지 않고 파라미터만 바꾸는 이유: wheel_odom_bridge 는
     # localization.launch.py 소속이라 재시작하면 UWB 캘리브레이션까지 날아간다.
     # 그래서 bridge 쪽에서 이 파라미터를 매 콜백마다 다시 읽도록 해 두었다.
-    nodes.append(ExecuteProcess(
-        cmd=['ros2', 'param', 'set', '/wheel_odom_bridge',
-             'enable_heading_hold', 'false'],
-        output='screen'))
+    #
+    # ⚠️ 반드시 재시도해야 한다 (2026-08-18 실측).
+    #   그냥 `ros2 param set` 을 한 번만 쏘면 **DDS 디스커버리가 끝나기 전에**
+    #   실행돼서 조용히 실패한다. 실제로 Nav2 시작 7초 뒤
+    #     [ERROR] process has died [exit code 1,
+    #             cmd 'ros2 param set /wheel_odom_bridge enable_heading_hold false']
+    #   가 찍혔고, heading_hold 가 true 로 남은 채 순찰이 돌아
+    #   **경로 추종이 통째로 망가졌다** (Nav2 조향과 bridge 조향이 서로 싸움).
+    #   런치 로그가 워낙 길어 이 ERROR 한 줄은 눈에 띄지도 않는다.
+    #   그래서 성공할 때까지 재시도하고, 끝내 실패하면 크게 찍는다.
+    nodes.append(_set_heading_hold('false', 'Nav2 시작', tries=30))
 
     # ★ 그리고 Nav2 가 꺼질 때 반드시 되돌린다 (2026-08-17).
     #   되돌리지 않으면 이런 함정이 생긴다:
@@ -359,10 +366,7 @@ def launch_setup(context, *args, **kwargs):
     nodes.append(RegisterEventHandler(OnShutdown(on_shutdown=[
         LogInfo(msg='Nav2 종료 — wheel_odom_bridge 의 heading_hold 를 다시 켠다 '
                     '(teleop·캘리브레이션 직진 보정용)'),
-        ExecuteProcess(
-            cmd=['ros2', 'param', 'set', '/wheel_odom_bridge',
-                 'enable_heading_hold', 'true'],
-            output='screen'),
+        _set_heading_hold('true', 'Nav2 종료', tries=10),
     ])))
 
     nodes.append(
@@ -440,6 +444,35 @@ def launch_setup(context, *args, **kwargs):
     banner += [LogInfo(msg=f'  ⚠️  {p}') for p in problems]
 
     return banner + nodes
+
+
+
+def _set_heading_hold(value: str, label: str, tries: int = 30):
+    """wheel_odom_bridge 의 enable_heading_hold 를 확실하게 바꾼다.
+
+    `ros2 param set` 은 상대 노드를 아직 디스커버리하지 못했으면 그냥 실패하고
+    끝난다. 런치 직후엔 이게 꽤 자주 일어난다 (2026-08-18 실측). 한 번 실패하면
+    heading_hold 가 의도와 반대로 남아 조용히 주행이 망가지므로, 성공을
+    확인할 때까지 1초 간격으로 재시도한다.
+    """
+    return ExecuteProcess(
+        cmd=['bash', '-c',
+             'for i in $(seq 1 %d); do '
+             '  if ros2 param set /wheel_odom_bridge enable_heading_hold %s '
+             '       2>/dev/null | grep -q successful; then '
+             '    echo "[heading_hold] %s: -> %s (${i}번째 시도에서 성공)"; '
+             '    exit 0; '
+             '  fi; '
+             '  sleep 1; '
+             'done; '
+             'echo "[heading_hold] ================================================"; '
+             'echo "[heading_hold] ❌ %s 를 %s 로 바꾸지 못했다."; '
+             'echo "[heading_hold]    wheel_odom_bridge 가 떠 있는지 확인할 것:"; '
+             'echo "[heading_hold]    ros2 node list | grep wheel_odom_bridge"; '
+             'echo "[heading_hold] ================================================"; '
+             'exit 1'
+             % (tries, value, label, value, 'enable_heading_hold', value)],
+        output='screen')
 
 
 def generate_launch_description():
