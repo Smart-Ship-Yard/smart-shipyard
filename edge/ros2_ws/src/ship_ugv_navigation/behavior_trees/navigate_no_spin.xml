@@ -41,7 +41,7 @@
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+    <RecoveryNode number_of_retries="3" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
         <RateController hz="1.0">
           <RecoveryNode number_of_retries="1" name="ComputePathToPose">
@@ -64,7 +64,7 @@
 
           <!-- navigate_with_spin.xml 은 여기에 <Spin spin_dist="1.57"/> 이 들어간다 -->
 
-          <Wait wait_duration="5"/>
+          <Wait wait_duration="3"/>
 
           <!-- ★ 후진 거리를 기본 0.30 -> 0.15 로 줄였다.
                실물은 laser_filters 가 후방 180도를 잘라내 뒤를 보지 못한다.
