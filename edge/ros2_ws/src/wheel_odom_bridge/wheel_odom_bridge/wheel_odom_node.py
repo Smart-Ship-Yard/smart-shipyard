@@ -183,6 +183,16 @@ class WheelOdomBridge(Node):
         self.y = 0.0
         self.yaw = 0.0
 
+        # ★ 2026-08-18: heading_hold 가 쓸 yaw. ekf_local(/odometry/local)이 준다.
+        #   self.yaw(바로 위)는 **바퀴 엔코더만으로** 적분한 값이라 슬립에 취약하다.
+        #   바닥이 미끄러우면 좌우 바퀴가 똑같이 돌아도(=오도메트리는 "직진 중")
+        #   로봇은 실제로 돌아간다. 그러면 heading_hold 는 오차를 0 으로 보고
+        #   아무 보정도 하지 않는다 — 정작 필요한 순간에 손을 놓는 것이다.
+        #   /odometry/local 은 ekf_local 이 IMU 자이로(vyaw)까지 융합한 값이라
+        #   실제 회전을 반영한다 (ekf_local.yaml 의 imu0_config 참고).
+        #   아직 안 왔으면 None 이고, 그때는 self.yaw 로 대체한다.
+        self.fused_yaw = None
+
         self.last_cmd_l_tps = 0
         self.last_cmd_r_tps = 0
         self.last_cmd_vel_time = None
@@ -192,6 +202,7 @@ class WheelOdomBridge(Node):
 
         # ---- 통신 ----
         self.create_subscription(Twist, cmd_vel_topic, self._cmd_vel_cb, 10)
+        self.create_subscription(Odometry, '/odometry/local', self._local_odom_cb, 20)
         self.create_service(Trigger, '~/reset_runaway', self._reset_runaway_cb)
         self.odom_pub = self.create_publisher(Odometry, odom_topic, 20)
         # ★ 진단용: 좌우 raw 엔코더 델타를 그대로 발행 (PID/trim 튜닝 데이터 수집용)
@@ -243,6 +254,18 @@ class WheelOdomBridge(Node):
 
     # ------------------------------------------------------------------
     # /cmd_vel 수신 -> 목표 바퀴속도(ticks/sec) 계산 -> 즉시 1회 전송
+    def _local_odom_cb(self, msg: Odometry):
+        """ekf_local 의 융합 yaw 를 받아 둔다 (heading_hold 전용).
+
+        이 노드는 오도메트리를 스스로 적분해 /wheel/odom 으로 내보내지만,
+        그 값(self.yaw)은 바퀴만 본 것이라 슬립에 약하다. heading_hold 처럼
+        "실제로 방향이 틀어졌는가"를 판단해야 하는 곳에서는 IMU 자이로가
+        섞인 ekf_local 출력을 쓰는 편이 옳다.
+        """
+        q = msg.pose.pose.orientation
+        self.fused_yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                    1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
     def _cmd_vel_cb(self, msg: Twist):
         # 폭주로 잠긴 상태면 어떤 명령도 받지 않는다 (사람이 풀어줘야 한다)
         if self._runaway_latched:
@@ -262,9 +285,12 @@ class WheelOdomBridge(Node):
 
         enable_heading_hold = self.get_parameter('enable_heading_hold').value
         if enable_heading_hold and is_straight_intent:
+            # IMU 융합 yaw 를 쓰되, 아직 안 왔으면 자체 적분값으로 대체한다.
+            cur_yaw = self.fused_yaw if self.fused_yaw is not None else self.yaw
+
             if self._drive_mode != 'straight':
                 # 새로 직진을 시작하는 순간 -> 지금 방향을 기준선으로 새로 잡음
-                self._straight_start_yaw = self.yaw
+                self._straight_start_yaw = cur_yaw
                 self._heading_error_integral = 0.0
                 self._last_heading_hold_time = None
                 self._drive_mode = 'straight'
@@ -277,7 +303,7 @@ class WheelOdomBridge(Node):
                 dt = max(0.001, min(0.2, dt))  # 비정상적으로 크거나 작은 dt 방지
             self._last_heading_hold_time = now
 
-            yaw_error = wrap_to_pi(self._straight_start_yaw - self.yaw)
+            yaw_error = wrap_to_pi(self._straight_start_yaw - cur_yaw)
 
             # ★★ 2026-08-17 안전 수정 — 실제로 모터가 폭주해서 넣은 것 ★★
             #
@@ -296,7 +322,7 @@ class WheelOdomBridge(Node):
                     f'heading_hold: yaw 오차가 {math.degrees(yaw_error):.0f}도로 너무 크다 '
                     f'({math.degrees(self.heading_hold_max_error):.0f}도 초과) — '
                     '보정을 포기하고 기준선을 다시 잡는다')
-                self._straight_start_yaw = self.yaw
+                self._straight_start_yaw = cur_yaw
                 self._heading_error_integral = 0.0
                 yaw_error = 0.0
 
