@@ -44,3 +44,6 @@ lerna-debug.log*
 *.sw?
 # Claude Code 등 AI 도구의 개인 로컬 설정
 .claude/
+graphify-out/cache/
+graphify-out/cost.json
+graphify-out/manifest.json
