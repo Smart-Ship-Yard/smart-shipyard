@@ -67,18 +67,41 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 | GET | `/api/init-data` | 대시보드 초기 3D 맵 정보 |
 | GET | `/api/history` | 과거 이벤트 로그 조회 (최근 50건) |
 
-## 젯슨 → 서버 메시지 형식 (협의 중)
+## 젯슨 → 서버 메시지 형식 (v1.5 확정)
+
+> **정본은 [`docs/interface.md`](../docs/interface.md) 입니다.** 아래는 발췌이며,
+> 키 이름·타입이 이 문서와 다르면 `docs/interface.md` 쪽이 맞습니다.
+
+위험 이벤트 (② — DB 저장 대상):
 
 ```json
 {
   "event_type": "fire",
   "confidence": 0.92,
-  "uwb_xy": [1.2, 3.4],
-  "depth_xyz": [1.1, 2.2, 0.8]
+  "depth_xyz": [1.1, 2.2, 0.8],
+  "ekf_global": [3.2, 7.8]
 }
 ```
 
-> 정식 스키마는 AI팀·프론트팀과 합의 후 이 문서에 확정본을 반영할 예정입니다.
+위치 핑 (① — DB 저장 안 함, 0.5초 주기):
+
+```json
+{"event_type": "position", "ekf_global": [3.2, 7.8]}
+```
+
+- `event_type` — 위험 이벤트 허용 값 4개: `fallen_person` · `fire` · `no_helmet` · `ship_defect`
+- `confidence` — YOLO conf 그대로 (0.5~1.0)
+- `depth_xyz` — **카메라 기준** 객체 3D 좌표 `[X, Y, Z]`, 미터
+- `ekf_global` — **map 기준** 차체 절대좌표 `[x, y]`, 미터. ekf_global(EKF 융합) 출력값이다.
+  UWB 원시좌표(`uwb_frame`)가 아니라 EKF가 map으로 변환·융합한 뒤의 값이므로,
+  서버·프론트는 추가 좌표변환 없이 그대로 쓰면 됩니다.
+- `timestamp` — 서버가 붙이므로 젯슨은 보내지 않습니다.
+
+나머지 메시지(③ block_level, ④ ship_pose, ⑥ stream_boost, ⑦ webrtc_signal,
+⑧ event_ack)와 전체 필드 표는 `docs/interface.md`를 참고하세요.
+
+> ⚠️ 서버는 모르는 `event_type`을 에러 없이 조용히 무시합니다. 철자를 반드시 위 표에서
+> 복사해 쓰세요 — 오타가 나면 아무 일도 일어나지 않아 디버깅이 어렵습니다.
 
 ## 주의사항
 
