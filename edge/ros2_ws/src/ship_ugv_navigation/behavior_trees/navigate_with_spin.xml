@@ -27,11 +27,28 @@
       2. 제자리 90도 회전  ← 이 파일에만 있다
       3. 5초 대기
       4. 15 cm 후진
-  바깥 RecoveryNode 가 number_of_retries="6" 이므로 위 4개를 한 바퀴 반 돈다.
+  바깥 RecoveryNode 가 number_of_retries="3" 이므로 RoundRobin 은
+  1) 코스트맵 비우기 2) 회전 3) 대기 까지만 돈다. **BackUp 차례는 오지 않는다.**
+
+  ★ 왜 6 -> 3 인가 (2026-08-18 실측)
+    6 이면 위 4개를 한 바퀴 반 돌아 **한 목표에 90초 넘게 매달린다.**
+    사람이 순찰 경로에 서 있으면 로봇이 그 자리에서 "회전 -> 대기 -> 후진"을
+    수십 초간 반복하다가, 순찰 노드의 goal_timeout_s 가 터져야 겨우 다음
+    웨이포인트로 넘어갔다. 실제로 60초를 지켜봤는데 웨이포인트가 하나도
+    안 넘어갔다.
+    3 이면 약 20~25초 만에 FAILURE 를 반환하고, 순찰 노드가 이 웨이포인트를
+    포기하고 **다음 웨이포인트로 건너뛴다**(patrol_mission_node._on_failure).
+    그게 원래 설계한 동작이다 — 막히면 기다리는 게 아니라 건너뛴다.
+
+  ★ 후진(BackUp)을 굳이 남겨둔 이유
+    지우지 않고 4번째에 둔 것은, 정말로 끼어서 못 빠져나올 때를 위한
+    최후 수단으로 남겨두기 위해서다. retries 를 4 이상으로 올리면 되살아난다.
+    평소에 안 쓰는 이유는 **라이다가 정후방 150도를 못 보기 때문**이다
+    (설치가이드 6-3절). 안 보이는 방향으로 가는 동작은 최소화한다.
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+    <RecoveryNode number_of_retries="3" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
         <RateController hz="1.0">
           <RecoveryNode number_of_retries="1" name="ComputePathToPose">
@@ -55,7 +72,7 @@
           <!-- ★ navigate_no_spin.xml 과의 유일한 차이. 90도(1.57 rad) 회전 -->
           <Spin spin_dist="1.57"/>
 
-          <Wait wait_duration="5"/>
+          <Wait wait_duration="3"/>
 
           <!-- ★ 후진 거리를 기본 0.30 -> 0.15 로 줄였다.
                실물은 laser_filters 가 후방 180도를 잘라내 뒤를 보지 못한다.

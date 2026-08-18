@@ -112,7 +112,14 @@ class PatrolMissionNode(Node):
             ('retry_delay_s', 2.0),
             ('max_consecutive_fails', 4),
             ('wait_retry_interval_s', 5.0),
-            ('goal_timeout_s', 60.0),
+            # ★ 60 -> 30 (2026-08-18 실측). 사람이 순찰 경로에 서 있을 때
+            #   60초는 너무 길었다 — 로봇이 회전/대기/후진을 반복하는 동안
+            #   웨이포인트가 하나도 안 넘어갔다.
+            #   BT(navigate_with_spin.xml)의 재시도를 3회로 줄여 20~25초면
+            #   FAILURE 가 돌아오므로, 이 값은 그게 안 돌아올 때를 위한
+            #   **안전망**이다. BT 보다 살짝 길게 둬서 정상 실패 경로를
+            #   가로채지 않도록 한다.
+            ('goal_timeout_s', 30.0),
             ('map_frame', 'map'),
             ('base_frame', 'base_link'),
             ('nav2_lifecycle_node', 'bt_navigator'),
