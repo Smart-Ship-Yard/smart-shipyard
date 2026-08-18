@@ -63,10 +63,30 @@ npm run dev
 - 현재 데이터는 실제 서버가 아니라 `connectEventSource()`(약 114행)의 **mock 피드**입니다.
 - 실제 연동 시 이 함수 내부만 `new WebSocket("ws://<서버주소>:8000/ws/frontend")` 로
   교체하면 됩니다 (주석으로 교체 지점 표시되어 있음).
-- **주의: 프론트가 가정한 이벤트 스키마(`cls`, `blockId`, `local`, `conf`)와 백엔드의
-  실제 스키마(`event_type`, `confidence`, `uwb_xy`, `depth_xyz`)가 아직 다릅니다.**
-  팀 스키마 확정 후 `CLASS_META`·좌표 매핑·`connectEventSource()`를 함께 수정해야 합니다.
-  (스키마 확정본은 `backend/README.md`에 반영 예정)
+- **주의: 프론트가 가정한 이벤트 스키마(`cls`, `blockId`, `local`, `conf`)와 서버가
+  실제로 중계하는 스키마가 아직 다릅니다.** 정본은 [`docs/interface.md`](../docs/interface.md)
+  (v1.5)이며, 위험 이벤트는 `event_type` · `confidence` · `depth_xyz` · `ekf_global` 4개 키로 옵니다.
+
+  | 프론트 (`ShipyardTwinDashboard.jsx`) | 서버 (`docs/interface.md` ②) | 상태 |
+  |---|---|---|
+  | `cls` | `event_type` | 이름만 다름, 값은 동일 (`fallen_person`·`fire`·`no_helmet`·`ship_defect`) |
+  | `conf` | `confidence` | 이름만 다름, 범위 동일 (0.5~1.0) |
+  | `blockId` | — | **대응 키 없음.** 위험 이벤트에는 `block_id`가 없고 ③ `block_level` / ④ `ship_pose`에만 있음 |
+  | `local {x,y,z}` | — | **대응 키 없음.** `local`은 블록 내부 0~1 정규화 좌표(`serverToWorld()` 약 84행)인데, 서버는 `ekf_global`(map 미터)과 `depth_xyz`(카메라 미터)만 보냄 |
+
+  > 예전 `backend/README.md`에 있던 `uwb_xy` 키는 v1.5 이전 초안의 잔재이며 폐기됐습니다.
+  > 젯슨은 `ekf_global`만 보냅니다 (`websocket_client.py` 약 220·307행).
+  > 연동 시 `uwb_xy`를 찾도록 짜면 `undefined`를 받게 되니 주의하세요.
+
+  참고: 위 불일치는 **아직 실제 문제를 일으키지 않습니다.** 현재 대시보드는 mock 피드로만
+  돌고 있어(`new WebSocket`은 약 118행에 주석 처리) 백엔드와 연결된 적이 없습니다.
+  매핑·자율주행·백엔드 중계는 이 스키마를 쓰지 않으므로 영향받지 않습니다.
+  이 표는 실제 연동을 시작할 때 할 일 목록으로 보시면 됩니다.
+
+- **남은 작업:** `ekf_global`(map 좌표계 절대 미터) → 블록 판정 + 블록 내부 0~1 좌표로
+  바꾸는 변환이 필요합니다. 배 중심·크기·yaw는 ④ `ship_pose`(`map_xy`, `yaw`)로 오므로,
+  이 값과 `ekf_global`을 함께 써서 `blockId`와 `local`을 계산하는 방식이 자연스럽습니다.
+  구현 시 `CLASS_META`·좌표 매핑·`connectEventSource()`를 함께 수정해야 합니다.
 
 ## 주의사항
 
