@@ -227,7 +227,15 @@ class YoloDepthPublisher(Node):
 
         num_boxes = 0 if results.boxes is None else len(results.boxes)
         if self.debug_log:
-            self.get_logger().info(f"[디버그] 검출 개수: {num_boxes}")
+            # ★ 5초에 한 번만 찍는다 (2026-08-18).
+            #   프레임마다(약 10 Hz) 찍으면 터미널이 이 한 줄로 도배돼
+            #   같은 창에 뜨는 다른 노드의 경고·에러가 전부 묻힌다.
+            #   실제로 라이다가 죽은 것도, Nav2 브링업이 실패한 것도
+            #   이런 도배 때문에 못 보고 지나갔다.
+            #   검출이 있을 때는 어차피 아래에서 따로 로그가 나가므로
+            #   여기서 매 프레임 찍을 이유가 없다.
+            self.get_logger().info(f"[디버그] 검출 개수: {num_boxes}",
+                                   throttle_duration_sec=5.0)
 
         if results.boxes is None:
             self._encode_and_publish(self.annotated_image_pub, display_image)

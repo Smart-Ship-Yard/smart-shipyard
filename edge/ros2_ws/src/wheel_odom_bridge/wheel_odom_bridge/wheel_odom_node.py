@@ -105,8 +105,12 @@ class WheelOdomBridge(Node):
         #   heading_hold_max_error: 이 각도를 넘는 오차는 "미세 편향"이 아니라
         #     이상 상황으로 보고 보정을 포기한다 (기본 30도).
         self.declare_parameter('max_abs_w', 0.6)
-        #   max_wheel_speed_mps: 최종 바퀴 속도 상한. max_vel_x(0.15) 에 회전분
-        #     (0.6 * track/2 = 0.068) 을 더한 0.22 보다 약간 여유를 둔 값.
+        #   max_wheel_speed_mps: 최종 바퀴 속도 상한.
+        #     ⚠️ 2026-08-18 기준 nav2 는 max_vel_x 0.25 / max_vel_theta 0.6 이라
+        #        최고속 선회 시 바깥 바퀴가 0.25 + 0.6*0.10 = 0.31 m/s 를 요구해
+        #        이 한계(0.30)를 1 cm/s 넘는다. 그때는 좌우를 **같은 비율로**
+        #        줄여 궤적을 유지한다(아래 _cmd_vel_cb 참고). 3% 느려질 뿐이라
+        #        실주행에 지장은 없다. 거슬리면 이 값을 0.35 로 올리면 된다.
         self.declare_parameter('max_wheel_speed_mps', 0.30)
         # ★ 폭주 감지기 (2026-08-17) — _check_runaway 주석 참고
         self.declare_parameter('runaway_guard_enabled', True)
@@ -355,13 +359,26 @@ class WheelOdomBridge(Node):
             # 위쪽 로직이 아무리 잘못 계산해도 여기서 잘린다 — 폭주는 결국
             # "말도 안 되는 값이 그대로 모터까지 갔다" 는 문제이므로,
             # 마지막 관문을 하나 두는 편이 개별 로직을 믿는 것보다 안전하다.
-            if abs(v_l) > self.max_wheel_speed or abs(v_r) > self.max_wheel_speed:
+            # ★ 2026-08-18: 좌우를 **각각** 자르지 않고 **같은 비율로 줄인다.**
+            #   각각 자르면 (v, w) 비율이 깨져서 로봇이 명령과 다른 궤적을 그린다:
+            #       명령   좌 0.31 우 0.19  -> v=0.250 w=0.60
+            #       각각자름 좌 0.30 우 0.19 -> v=0.245 w=0.55   (회전이 8% 덜 됨)
+            #       비례축소 좌 0.30 우 0.184 -> v=0.242 w=0.58  (궤적 유지, 3% 느림)
+            #   Nav2 는 자기가 명령한 곡률대로 로봇이 움직인다고 가정하고 다음
+            #   주기를 계산하므로, 곡률을 왜곡하는 편이 느려지는 것보다 나쁘다.
+            peak = max(abs(v_l), abs(v_r))
+            if peak > self.max_wheel_speed:
+                scale = self.max_wheel_speed / peak
+                # 5초에 한 번만 찍는다. 최고속 선회에서는 매 주기 걸리므로
+                # 그대로 두면 로그가 도배되어 진짜 경고를 덮는다.
                 self.get_logger().warn(
                     f'바퀴 속도 명령이 한계를 넘었다 (좌 {v_l:+.2f} 우 {v_r:+.2f} m/s, '
-                    f'한계 {self.max_wheel_speed:.2f}) — 잘라서 보낸다. '
-                    'cmd_vel 발행자나 heading_hold 를 의심할 것')
-                v_l = max(-self.max_wheel_speed, min(self.max_wheel_speed, v_l))
-                v_r = max(-self.max_wheel_speed, min(self.max_wheel_speed, v_r))
+                    f'한계 {self.max_wheel_speed:.2f}) — 궤적을 유지한 채 '
+                    f'{scale:.2f}배로 줄여 보낸다. 상시로 뜨면 nav2_params.yaml 의 '
+                    'max_vel_x 와 max_vel_theta 조합이 이 한계를 넘는다는 뜻이다',
+                    throttle_duration_sec=5.0)
+                v_l *= scale
+                v_r *= scale
 
             wheel_circumference = 2.0 * math.pi * self.wheel_radius
             l_tps = int(round((v_l / wheel_circumference) * self.ticks_per_rev))
