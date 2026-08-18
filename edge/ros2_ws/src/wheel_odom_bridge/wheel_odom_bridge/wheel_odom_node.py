@@ -105,13 +105,22 @@ class WheelOdomBridge(Node):
         #   heading_hold_max_error: 이 각도를 넘는 오차는 "미세 편향"이 아니라
         #     이상 상황으로 보고 보정을 포기한다 (기본 30도).
         self.declare_parameter('max_abs_w', 0.6)
-        #   max_wheel_speed_mps: 최종 바퀴 속도 상한.
-        #     ⚠️ 2026-08-18 기준 nav2 는 max_vel_x 0.25 / max_vel_theta 0.6 이라
-        #        최고속 선회 시 바깥 바퀴가 0.25 + 0.6*0.10 = 0.31 m/s 를 요구해
-        #        이 한계(0.30)를 1 cm/s 넘는다. 그때는 좌우를 **같은 비율로**
-        #        줄여 궤적을 유지한다(아래 _cmd_vel_cb 참고). 3% 느려질 뿐이라
-        #        실주행에 지장은 없다. 거슬리면 이 값을 0.35 로 올리면 된다.
-        self.declare_parameter('max_wheel_speed_mps', 0.30)
+        #   max_wheel_speed_mps: 최종 바퀴 속도 상한. **폭주를 잡기 위한 값이지
+        #     정상 명령을 깎기 위한 값이 아니다.**
+        #
+        #     0.30 -> 0.35 (2026-08-18). 0.30 은 max_vel_x 가 0.15 이던 시절에
+        #     정한 값인데, 지금 nav2 는 max_vel_x 0.25 / max_vel_theta 0.6 이라
+        #     최고속 선회에서 바깥 바퀴가 0.25 + 0.6*0.10 = 0.31 m/s 를 요구한다.
+        #     그래서 정상 주행 중에 5초마다 경고가 떴다(실측). 경고가 상시로
+        #     뜨면 사람이 경고를 무시하게 되고, 그러면 진짜 이상을 놓친다.
+        #     실제로 오늘 로그 도배 때문에 라이다 사망과 Nav2 브링업 실패를
+        #     둘 다 놓쳤다.
+        #
+        #     0.35 는 정상 최대치(0.31)에 13% 여유를 준 값이다. 폭주는 이보다
+        #     몇 배 큰 값으로 나타나므로(실측 1250 tps 수준) 여전히 잡힌다.
+        #     nav2 의 max_vel_x / max_vel_theta 를 올리면 이 값도 같이 올릴 것:
+        #         필요값 = max_vel_x + max_vel_theta * track_width/2
+        self.declare_parameter('max_wheel_speed_mps', 0.35)
         # ★ 폭주 감지기 (2026-08-17) — _check_runaway 주석 참고
         self.declare_parameter('runaway_guard_enabled', True)
         self.declare_parameter('runaway_grace_s', 0.4)        # 이 시간 이상 지속돼야 확정
