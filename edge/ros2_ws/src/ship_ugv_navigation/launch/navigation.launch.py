@@ -295,7 +295,19 @@ def launch_setup(context, *args, **kwargs):
                               # 코스트로 바꾸는 1차식이며 keepout 은 그대로 쓴다.
                               'type': 0,
                               'filter_info_topic': '/costmap_filter_info',
-                              'mask_topic': 'keepout_mask',
+                              # ★ 앞의 '/' 를 빼면 안 된다 (2026-08-19 실측 버그).
+                              #   이 문자열은 CostmapFilterInfo 메시지에 그대로 실려
+                              #   코스트맵으로 가고, 코스트맵이 그 이름으로 구독한다.
+                              #   그런데 코스트맵 노드는 /global_costmap, /local_costmap
+                              #   네임스페이스 안에 있어서, 상대 이름이면
+                              #       /global_costmap/keepout_mask
+                              #   로 풀린다. filter_mask_server 는 / 네임스페이스라
+                              #   /keepout_mask 로 발행하므로 **영영 안 만난다.**
+                              #   증상: 노드는 전부 active 인데 계속 이 경고만 뜬다
+                              #       KeepoutFilter: Filter mask was not received
+                              #   그리고 마스크가 코스트맵에 반영되지 않아 로봇이
+                              #   금지 영역(모형 배) 위를 그냥 지나간다. 조용한 실패다.
+                              'mask_topic': '/keepout_mask',
                               'base': 0.0,
                               'multiplier': 1.0}], **common),
         ]

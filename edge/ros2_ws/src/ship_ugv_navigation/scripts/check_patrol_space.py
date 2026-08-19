@@ -324,7 +324,7 @@ def emit_patrol_yaml(path, map_name, cx, cy, radius, margin_val, tight):
     return n
 
 
-def emit_keepout_mask(path, m, bbox, map_name):
+def emit_keepout_mask(path, m, bbox, map_name, rect=None, pad_m=None):
     """Nav2 KeepoutFilter 용 마스크(.pgm + .yaml)를 만든다.
 
     왜 필요한가:
@@ -339,17 +339,48 @@ def emit_keepout_mask(path, m, bbox, map_name):
     """
     w, h, res = m['w'], m['h'], m['res']
     r0, r1, c0, c1 = bbox
-    pad = int(round(MASK_PAD / res))
+    pad_m = MASK_PAD if pad_m is None else pad_m
+    pad = int(round(pad_m / res))
     r0 = max(0, r0 - pad)
     r1 = min(h - 1, r1 + pad)
     c0 = max(0, c0 - pad)
     c1 = min(w - 1, c1 + pad)
 
     px = bytearray([FREE]) * (w * h)
-    for r in range(r0, r1 + 1):
-        base = r * w
-        for c in range(c0, c1 + 1):
-            px[base + c] = OCCUPIED
+
+    if rect is not None:
+        # ★ 기울어진 사각형을 **그대로** 칠한다 (2026-08-19).
+        #   예전에는 회전 사각형을 감싸는 축정렬 사각형(bbox)을 통째로 칠했다.
+        #   "넉넉한 편이 안전하다"는 이유였는데, 길쭉한 대상이 비스듬히 놓이면
+        #   낭비가 급격히 커진다. 실측:
+        #       배 0.80 x 0.18 m, yaw -15도
+        #       축정렬 방식 -> 마스크 0.95 x 0.55 m  (폭이 실제의 3배)
+        #       회전 방식   -> 마스크 0.90 x 0.28 m
+        #   그 0.27 m 차이 때문에 **캘리브레이션 시작 위치가 금지영역에 물려**
+        #   Nav2 가 "로봇이 충돌 상태"로 판단해 복구 동작만 반복했다.
+        #   좁은 방에서는 이 낭비가 곧 순찰 여유를 깎아먹는다.
+        rcx, rcy, rsx, rsy, ryaw = rect
+        hx = rsx / 2.0 + pad_m
+        hy = rsy / 2.0 + pad_m
+        cs, sn = math.cos(ryaw), math.sin(ryaw)
+        for r in range(r0, r1 + 1):
+            base = r * w
+            wy = m['oy'] + ((h - 1) - r) * res + res / 2.0
+            for c in range(c0, c1 + 1):
+                wx = m['ox'] + c * res + res / 2.0
+                dx, dy = wx - rcx, wy - rcy
+                # 사각형 로컬 좌표로 회전시켜 안에 드는지만 본다
+                lx = dx * cs + dy * sn
+                ly = -dx * sn + dy * cs
+                if abs(lx) <= hx and abs(ly) <= hy:
+                    px[base + c] = OCCUPIED
+    else:
+        # 맵의 장애물 섬으로 스냅한 경우. 그 bbox 는 이미 축정렬이라
+        # 회전 정보가 없다. 예전 방식 그대로 채운다.
+        for r in range(r0, r1 + 1):
+            base = r * w
+            for c in range(c0, c1 + 1):
+                px[base + c] = OCCUPIED
 
     pgm_path = os.path.splitext(path)[0] + '.pgm'
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -382,8 +413,20 @@ def emit_keepout_mask(path, m, bbox, map_name):
         ]))
 
     print(f'   🧱 keepout 마스크 생성: {path}')
-    print(f'      금지 영역 {(c1 - c0 + 1) * res:.2f} x {(r1 - r0 + 1) * res:.2f} m '
-          f'(대상 외곽 + 여유 {MASK_PAD} m)')
+    # ★ 실제로 칠한 면적을 찍는다 (2026-08-19).
+    #   예전에는 축정렬 범위(c1-c0, r1-r0)를 찍었는데, 회전 사각형을 칠하게 된
+    #   뒤로는 그 값이 실제보다 크다. 실측 예: 실제 0.90 x 0.40 인데 1.00 x 0.60
+    #   으로 찍혔다. "문구는 이렇게 말하는데 코드는 다르게 한다" 는 오늘 여러 번
+    #   사람을 헤매게 만들었다. 숫자는 실제와 같아야 한다.
+    filled = sum(1 for v in px if v == OCCUPIED)
+    if rect is not None:
+        print(f'      금지 영역 {rsx + 2 * pad_m:.2f} x {rsy + 2 * pad_m:.2f} m '
+              f'({math.degrees(ryaw):.0f}도 기울어진 사각형, '
+              f'대상 {rsx:.2f} x {rsy:.2f} + 여유 {pad_m} m 사방)')
+        print(f'      칠한 셀 {filled}개 = {filled * res * res:.3f} m^2')
+    else:
+        print(f'      금지 영역 {(c1 - c0 + 1) * res:.2f} x {(r1 - r0 + 1) * res:.2f} m '
+              f'(대상 외곽 + 여유 {pad_m} m)')
 
 
 def _wrap(text, width):
@@ -421,7 +464,9 @@ def rect_bbox(m, cx, cy, sx, sy, yaw):
 
 
 def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
-                emit_mask=None, mask_size=None, mask_yaw=0.0):
+                emit_mask=None, mask_size=None, mask_yaw=0.0, mask_pad=None):
+    mask_pad = MASK_PAD if mask_pad is None else mask_pad
+    mask_rect = None   # (cx, cy, sx, sy, yaw) — 회전 사각형으로 칠할 때만 채워진다
     m = load_map(yaml_path)
     res, w, h = m['res'], m['w'], m['h']
     n_free = sum(sum(row) for row in m['free'])
@@ -505,6 +550,7 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
             # 대상 크기를 직접 받은 경우. 라이다에 안 잡히는 대상(모형 배)은
             # 맵에 섬이 없으므로 이 경로로만 마스크를 만들 수 있다.
             bbox = rect_bbox(m, cx, cy, mask_size[0], mask_size[1], mask_yaw)
+            mask_rect = (cx, cy, mask_size[0], mask_size[1], mask_yaw)
             print(f'  대상 크기 {mask_size[0]:.2f} x {mask_size[1]:.2f} m '
                   f'(yaw {math.degrees(mask_yaw):.0f}도) 를 함께 받았다 — 마스크에 사용')
             print('  좌표도 지정값을 그대로 쓴다 (맵의 장애물로 스냅하지 않음)')
@@ -584,14 +630,15 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
             emit_patrol_yaml(emit_patrol, map_name, cx, cy, best[0], best[1], tight)
             if emit_mask:
                 if bbox is not None:
-                    emit_keepout_mask(emit_mask, m, bbox, map_name)
+                    emit_keepout_mask(emit_mask, m, bbox, map_name,
+                                      rect=mask_rect, pad_m=mask_pad)
                     # 마스크는 대상 외곽에 MASK_PAD 만큼 더 부풀린다. 좁은 맵에서는
                     # 그 여유가 순찰 여유를 거의 다 먹어 경로가 금지영역에 닿는다.
                     # 조용히 두면 "왜 갑자기 경로가 안 나오지" 로 헤매게 된다.
-                    if MASK_PAD >= best[1] - 0.03:
+                    if mask_pad >= best[1] - 0.03:
                         print()
                         print('   ' + '=' * 62)
-                        print(f'   ⚠️ 마스크 여유({MASK_PAD} m)가 순찰 여유'
+                        print(f'   ⚠️ 마스크 여유({mask_pad} m)가 순찰 여유'
                               f'({best[1]:.3f} m)를 거의 다 먹는다')
                         print(f'      남는 폭 {best[1] - MASK_PAD:.3f} m — '
                               f'순찰 경로가 금지영역에 닿을 수 있다.')
@@ -662,6 +709,11 @@ def main():
     ap.add_argument('--mask-size', nargs=2, type=float, metavar=('W', 'H'),
                     help='마스크에 그릴 대상 크기(m). 대상이 라이다에 안 잡혀 '
                          '맵에서 크기를 알 수 없을 때 쓴다. --center 와 함께 준다')
+    ap.add_argument('--mask-pad', type=float, default=None, metavar='M',
+                    help=f'마스크를 대상 외곽에서 이만큼 더 부풀린다(m). '
+                         f'기본 {MASK_PAD}. 측량 중심에 오차가 있을 때 그만큼 키워서 '
+                         f'덮는 용도다. 키울수록 순찰 여유를 깎아먹으니 '
+                         f'경고가 뜨면 줄일 것.')
     ap.add_argument('--mask-yaw', type=float, default=0.0, metavar='RAD',
                     help='대상 방향각(라디안). --mask-size 와 함께 쓴다. '
                          '회전 사각형을 감싸는 축정렬 사각형으로 그린다')
@@ -677,7 +729,7 @@ def main():
                   '(어디에 그릴지 알 수 없음)')
             return 3
         return analyze_map(a.map, a.center, a.margin, a.emit_patrol, a.emit_mask,
-                           a.mask_size, a.mask_yaw)
+                           a.mask_size, a.mask_yaw, a.mask_pad)
     ap.print_help()
     return 3
 

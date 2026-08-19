@@ -76,7 +76,17 @@ class EventGateNode(Node):
 
         self.declare_parameters('', [
             ('trigger_classes', ['fire', 'fallen_person', 'no_helmet']),
-            ('min_confidence', 0.2),
+            # ★ 0.2 -> 0.5 (2026-08-19). 새 YOLO 모델(fire/fallen_person/no_helmet
+            #   포함)로 바꾼 뒤, **주변에 아무것도 없는데** conf 0.24~0.32 짜리
+            #   fallen_person 오검출이 계속 떠서 순찰이 반복 정지했다.
+            #   실측 오검출: 0.2369 / 0.2511 / 0.3209 — 0.2 로는 전부 통과한다.
+            #   진짜 검출은 실측 0.55~0.83 이었으므로 0.5 면 충분히 구분된다.
+            ('min_confidence', 0.5),
+            # ★ 신설 (2026-08-19). 이 거리보다 먼 검출은 정지 사유로 보지 않는다.
+            #   오검출들이 전부 4.0~4.2 m 에서 떴다. 순찰 반경이 0.6 m 인데
+            #   4 m 밖의 물체 때문에 멈추면 시연이 진행되지 않는다.
+            #   0 이하면 거리 제한을 끈다.
+            ('max_trigger_depth_m', 2.5),
             ('republish_period_s', 1.0),
             ('fallback_auto_resume_s', 0.0),
             ('detection_topic', '/event_detection/uvd'),
@@ -85,6 +95,7 @@ class EventGateNode(Node):
         g = self.get_parameter
         self.trigger = set(g('trigger_classes').value)
         self.min_conf = float(g('min_confidence').value)
+        self.max_depth = float(g('max_trigger_depth_m').value)
         self.auto_resume_s = float(g('fallback_auto_resume_s').value)
         det_topic = g('detection_topic').value
         inbound_topic = g('server_inbound_topic').value
@@ -109,7 +120,8 @@ class EventGateNode(Node):
         self._publish()
 
         self.get_logger().info(
-            f'이벤트 게이트 시작 — 정지 대상 {sorted(self.trigger)}')
+            f'이벤트 게이트 시작 — 정지 대상 {sorted(self.trigger)}, '
+            f'conf>={self.min_conf}, 거리<={self.max_depth}m')
         self.get_logger().info(
             f'  감지 입력 {det_topic} / 서버 입력 {inbound_topic} / 수동 재개 /event/ack')
         if self.auto_resume_s > 0:
@@ -183,6 +195,17 @@ class EventGateNode(Node):
             pass
 
         depth = d.get('depth')
+
+        # ★ 너무 먼 검출은 무시한다 (2026-08-19 추가).
+        #   순찰 반경이 0.6 m 인데 4 m 밖 오검출로 멈추면 시연이 안 된다.
+        #   진짜 위험이라면 로봇이 다가가면서 다시, 더 높은 확신도로 잡힌다.
+        if (self.max_depth > 0 and isinstance(depth, (int, float))
+                and depth > self.max_depth):
+            self.get_logger().info(
+                f'감지 {cls} {depth:.2f} m — {self.max_depth:.1f} m 밖이라 무시',
+                throttle_duration_sec=5.0)
+            return
+
         where = f' {depth:.2f} m 앞' if isinstance(depth, (int, float)) else ''
         self._stop(f'{cls} 감지{where} (conf {conf})')
 

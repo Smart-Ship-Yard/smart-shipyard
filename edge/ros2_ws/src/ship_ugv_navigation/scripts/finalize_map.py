@@ -34,6 +34,7 @@ finalize_map.py
 import argparse
 import glob
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -181,6 +182,20 @@ def main():
                     help='순찰 중심을 직접 지정 (map 좌표). 맵에 포위된 장애물이 '
                          '여럿이라 자동 선택이 틀렸을 때 쓴다. 정확히 찍을 필요 없다 '
                          '— 가장 가까운 장애물을 지목한 것으로 보고 그 무게중심을 쓴다')
+    ap.add_argument('--mask-pad', type=float, metavar='M',
+                    help='마스크를 대상 외곽에서 이만큼 더 부풀린다(m). 기본 0.05. '
+                         '측량 중심에 오차가 있을 때 그만큼 키워 덮는 용도다. '
+                         '예: 배 실측 0.80 x 0.17 m 에 사방 0.10 m 를 주면 '
+                         '마스크가 1.00 x 0.37 m 가 된다. '
+                         '키울수록 순찰 여유를 깎으니 경고가 뜨면 줄일 것.')
+    ap.add_argument('--ship-yaw', dest='ship_yaw_deg', type=float, metavar='DEG',
+                    help='순찰 대상의 방향(도). --center 와 --ship-size 를 손으로 줄 때 '
+                         '함께 준다. 안 주면 0도로 그려서, 길쭉한 대상은 마스크가 '
+                         '엉뚱한 방향으로 눕는다. '
+                         '재는 법: 로봇을 대상과 나란히 세우고 '
+                         '`ros2 topic echo /odometry/global` 의 heading 을 읽으면 된다 '
+                         '(정지 상태 실측 흔들림 0.05도). '
+                         '측량 기록이 있으면 그쪽 yaw 가 자동으로 쓰이므로 불필요하다.')
     ap.add_argument('--ship-size', nargs=2, type=float, metavar=('W', 'H'),
                     help='순찰 대상의 크기(m). keepout 마스크를 그리는 데 쓴다. '
                          '대상이 라이다에 안 잡혀(모형 배 등) 맵에서 크기를 '
@@ -356,6 +371,19 @@ def main():
         if a.ship_size:
             cmd += ['--mask-size', str(a.ship_size[0]), str(a.ship_size[1])]
             print(f'  대상 크기: --ship-size {a.ship_size[0]} x {a.ship_size[1]} m')
+            # ★ 방향까지 받는다 (2026-08-19 추가). 예전에는 --center 로 손수
+            #   지정하면 마스크 방향이 무조건 0도로 그려졌다. 정사각형에 가까운
+            #   대상이면 티가 안 나지만, 우리 모형 배처럼 0.80 x 0.18 m 로
+            #   길쭉하면 90도 틀어진 마스크가 배를 절반도 못 덮는다.
+            if a.ship_yaw_deg is not None:
+                cmd += ['--mask-yaw', str(math.radians(a.ship_yaw_deg))]
+                print(f'  대상 방향: --ship-yaw {a.ship_yaw_deg:.2f}도')
+            if a.mask_pad is not None:
+                cmd += ['--mask-pad', str(a.mask_pad)]
+                print(f'  마스크 여유: --mask-pad {a.mask_pad} m (사방)')
+            else:
+                print('  대상 방향: 지정 안 됨 -> 0도로 그린다. '
+                      '길쭉한 대상이면 --ship-yaw 를 줄 것')
     elif survey:
         cx, cy = survey['center']
         cmd += ['--center', str(cx), str(cy)]
@@ -366,6 +394,9 @@ def main():
                     '--mask-yaw', str(survey['yaw'])]
             src_label = '--ship-size' if a.ship_size else '측량 기록'
             print(f'  대상 크기: {src_label} {size[0]:.2f} x {size[1]:.2f} m')
+            if a.mask_pad is not None:
+                cmd += ['--mask-pad', str(a.mask_pad)]
+                print(f'  마스크 여유: --mask-pad {a.mask_pad} m (사방)')
     else:
         print('  순찰 중심: 맵에서 자동 탐지')
     print()
