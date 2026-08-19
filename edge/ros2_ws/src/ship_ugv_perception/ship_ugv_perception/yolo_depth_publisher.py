@@ -28,6 +28,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rcl_interfaces.msg import SetParametersResult
 from ament_index_python.packages import get_package_share_directory
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from std_msgs.msg import String
@@ -74,7 +75,21 @@ class YoloDepthPublisher(Node):
         self.declare_parameter('annotated_image_topic', '/camera/color/compressed')
         self.declare_parameter('raw_image_jpeg_quality', 60)
         # ★ YOLO 처리 주기 (카메라 fps와 분리됨, 이 값만큼만 추론 시도)
-        self.declare_parameter('inference_interval_s', 0.1)
+        # ★ 0.1 (10 Hz) -> 0.25 (4 Hz)  (2026-08-19)
+        #   시연에서는 YOLO + 영상송출 + Nav2 를 동시에 돌려야 하는데 실측하니
+        #   합계가 3.7~4.0 / 6코어였고 그중 YOLO 혼자 1.1~1.3코어였다.
+        #   CPU 가 포화되면 Nav2 lifecycle 전환이 타임아웃되어 **브링업이
+        #   통째로 실패한다** (2026-08-18 실제로 겪음).
+        #   4 Hz 로 낮추면 0.5~0.7코어가 생긴다.
+        #
+        #   ⚠️ 영상 송출 프레임률과는 무관하다. 송출용 원본 프레임은
+        #      _capture_loop() 이 별도 스레드에서 카메라 fps 그대로 내보내고
+        #      (raw_image_pub -> /camera/color/compressed_raw -> video_streamer.py),
+        #      이 타이머는 추론과 '박스 그린 영상'만 담당한다.
+        #      실제로 느려지는 것은 검출 반응 시간뿐이다(최악 100ms -> 250ms).
+        #      화재·쓰러진 사람은 초 단위 사건이라 문제되지 않고, 로봇이
+        #      0.25 m/s 로 움직이므로 프레임 사이 이동도 6 cm 뿐이다.
+        self.declare_parameter('inference_interval_s', 0.25)
         # bbox 내 유효 depth 픽셀 비율이 이 값 미만이면 해당 검출 폐기
         # (작은 소품은 배경 depth가 섞여 median이 오염되는 실패 모드 방지)
         self.declare_parameter('min_valid_ratio', 0.2)
@@ -91,6 +106,16 @@ class YoloDepthPublisher(Node):
         self.raw_jpeg_quality = self.get_parameter('raw_image_jpeg_quality').value
         inference_interval = self.get_parameter('inference_interval_s').value
         self.min_valid_ratio = self.get_parameter('min_valid_ratio').value
+
+        # ★ debug_log 를 실행 중에 바꿀 수 있게 한다 (2026-08-19).
+        #   지금까지는 위에서 값을 한 번 읽어 self.debug_log 에 넣어두고 다시
+        #   읽지 않았다. 그래서
+        #       ros2 param set /yolo_depth_publisher debug_log false
+        #   가 "Set parameter successful" 을 반환하는데도 로그가 계속 찍혔다.
+        #   파라미터 서버는 값을 받아들였지만 노드가 그 사실을 모르기 때문이다.
+        #   **성공이라고 답이 오는데 아무 일도 안 일어나는 것**이 제일 나쁘다.
+        #   (wheel_odom_bridge 의 enable_heading_hold 도 같은 문제였다.)
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         self.model = YOLO(weights_path)
         self.get_logger().info(f"모델 클래스 목록: {self.model.names}")
@@ -149,6 +174,19 @@ class YoloDepthPublisher(Node):
             if math.hypot(u - r['u'], v - r['v']) < self.fallback_match_dist:
                 return r
         return None
+
+    def _on_set_parameters(self, params):
+        """실행 중 파라미터 변경을 캐시된 값에 반영한다."""
+        for p in params:
+            if p.name == 'debug_log':
+                self.debug_log = bool(p.value)
+                self.get_logger().info(
+                    f'debug_log -> {self.debug_log} (즉시 반영됨)')
+            elif p.name == 'confidence_threshold':
+                self.conf_threshold = float(p.value)
+                self.get_logger().info(
+                    f'confidence_threshold -> {self.conf_threshold} (즉시 반영됨)')
+        return SetParametersResult(successful=True)
 
     def _encode_and_publish(self, publisher, image, quality=None):
         q = quality if quality is not None else self.raw_jpeg_quality

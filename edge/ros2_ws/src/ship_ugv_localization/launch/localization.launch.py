@@ -14,6 +14,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+import subprocess
+
 from launch.actions import LogInfo
 from launch_ros.actions import Node
 
@@ -93,17 +95,28 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ★ 배 측량은 매핑 랩과 같은 주행에서 이뤄져야 한다.
-    #   Nav2 순찰을 돌리려면 배 중심이 이미 있어야 하는데, 중심을 구하려고
-    #   도는 것이라 Nav2를 켠 뒤에 측량하면 닭-달걀이 되기 때문.
-    #   mapping.launch.py가 이 launch를 전제로 돌므로 여기 두면 매핑 시 항상 켜진다.
-    #   측량 입력(/event_detection/uvd)을 yolo_depth_publisher가 만들므로 같이 띄운다.
-    yolo_depth_publisher_node = Node(
-        package='ship_ugv_perception',
-        executable='yolo_depth_publisher',
-        name='yolo_depth_publisher',
-        output='screen',
-    )
+    # ★ yolo_depth_publisher 는 **여기서 띄우지 않는다** (2026-08-19 제거).
+    #
+    #   원래는 "측량 입력(/event_detection/uvd)을 yolo_depth_publisher 가 만드니
+    #   같이 띄운다" 는 의도로 여기 있었다. 의도는 맞지만 실제로는 동작하지
+    #   않고 있었다.
+    #
+    #   젯슨에는 systemd 서비스 `yolo-depth-publisher.service` 가 이미 있고,
+    #   카메라(pyorbbecsdk)는 **한 프로세스만 열 수 있다.** 그래서 둘이 경쟁하면
+    #   늦게 뜬 쪽이 죽는데, 늦게 뜨는 쪽이 항상 이 launch 였다:
+    #       [ERROR] [yolo_depth_publisher-11]: process has died [exit code 1]
+    #   런치 로그가 워낙 길어 이 한 줄은 아무도 못 봤고, "YOLO 잘 돌아가네" 하고
+    #   있었지만 실제로 도는 것은 systemd 쪽이었다.
+    #
+    #   반대로 CPU 를 아끼려고 systemd 를 잠깐 끄면 이번엔 이쪽이 살아나면서
+    #   터미널을 로그로 도배했다 (실측 120건/12초).
+    #
+    #   -> **systemd 가 YOLO 를 소유한다.** 부팅 시 자동으로 뜨고, 죽어도
+    #      Restart=always 로 되살아나며, 로그가 journald 로 가서 이 터미널을
+    #      더럽히지 않는다. 매핑 중 배 표면 측량도 그대로 동작한다.
+    #
+    #   대신 아래 기동 배너에서 "YOLO 가 실제로 떠 있는지" 를 확인한다.
+    #   누가 서비스를 꺼놨으면 매핑 마스킹이 **조용히** 실패하기 때문이다.
 
     ship_survey_node = Node(
         package='ship_ugv_perception',
@@ -257,6 +270,23 @@ def generate_launch_description():
     else:
         banner.append(LogInfo(msg='  네 장치 모두 정상 — 그래도 매핑 전에 '
                                   '/scan_filtered 가 실제로 흐르는지 한 번 볼 것'))
+
+    # ★ YOLO 는 이 launch 가 아니라 systemd 가 띄운다(위 주석 참고).
+    #   그래서 "떠 있는지" 를 여기서 확인해 준다. 안 떠 있으면 매핑 중
+    #   배 표면 측량이 **조용히** 실패한다 — 에러도 경고도 안 난다.
+    yolo_up = subprocess.run(
+        ['pgrep', '-f', 'yolo_depth_publisher'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    banner.append(LogInfo(msg=f"  {'✅' if yolo_up else '❌'} {'YOLO(카메라)':<14} "
+                              f"systemd yolo-depth-publisher.service"))
+    if not yolo_up:
+        banner.append(LogInfo(msg='━' * 60))
+        banner.append(LogInfo(
+            msg='  ⚠️  YOLO 가 안 떠 있다 — 카메라 영상 송출과 배 표면 측량이 '
+                '둘 다 조용히 실패한다'))
+        banner.append(LogInfo(
+            msg='  ⚠️  살리는 법:  sudo systemctl start yolo-depth-publisher'))
+        banner.append(LogInfo(msg='━' * 60))
     banner.append(LogInfo(msg='─' * 60))
 
     return LaunchDescription(banner + [
@@ -270,7 +300,6 @@ def generate_launch_description():
         ekf_local_node,
         ekf_global_node,
         change_point_node,
-        yolo_depth_publisher_node,
         ship_survey_node,
         websocket_client_node,
         laser_static_tf_node,
