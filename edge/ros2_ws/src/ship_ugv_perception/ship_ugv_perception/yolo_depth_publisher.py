@@ -162,6 +162,7 @@ class YoloDepthPublisher(Node):
         # ★ 캡처 전담 스레드 시작 (카메라 최대 속도로 계속 실행)
         self._capture_stop = threading.Event()
         self._latest_stamp = None
+        self._latest_raw = None
         self._frame_stamp = None
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
@@ -224,21 +225,39 @@ class YoloDepthPublisher(Node):
                 if color_frame is None or depth_frame is None:
                     continue
 
-                color_image = frame_to_bgr_image(color_frame)
-                if color_image is None:
-                    # MJPG가 아닌 포맷으로 스트림이 잡히면 imdecode가 None을 반환함.
-                    # 이 스레드는 데몬 스레드라 여기서 예외가 나면 노드는 안 죽고
-                    # 캡처만 조용히 영원히 멈추는 "좀비 상태"가 되므로 반드시 방어.
-                    continue
+                raw = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
+                # 카메라가 MJPG 로 주면(FFD8 = JPEG 시작표식) 그대로 흘려보낸다.
+                # 아니면 예전처럼 디코딩→재인코딩으로 후퇴한다.
+                is_jpeg = len(raw) > 2 and raw[0] == 0xFF and raw[1] == 0xD8
 
                 depth_data = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
                 depth_image = depth_data.reshape((depth_frame.get_height(), depth_frame.get_width()))
 
-                # ★ 원본을 즉시 발행 (YOLO 대기 없음, 이게 핵심)
-                self._encode_and_publish(self.raw_image_pub, color_image)
+                if is_jpeg:
+                    # ★ 원본 JPEG 를 그대로 발행 (2026-08-20).
+                    #   예전에는 카메라가 준 MJPG 를 풀었다가(imdecode) 다시
+                    #   압축해서(imencode) 보냈다. 초당 25.6번. 프로파일 실측으로
+                    #   그 왕복이 YOLO 추론의 3배를 먹고 있었다
+                    #   (인코딩 3.34초 + 디코딩 3.21초 vs 추론 3.1초 / 20초 기준).
+                    #   송출에 필요한 건 JPEG 바이트뿐이라 왕복이 통째로 낭비다.
+                    msg = CompressedImage()
+                    msg.header.stamp = self.get_clock().now().to_msg()
+                    msg.format = 'jpeg'
+                    msg.data = raw.tobytes()
+                    self.raw_image_pub.publish(msg)
+                    color_image = None      # 디코딩은 추론할 때만 (4 Hz)
+                else:
+                    color_image = frame_to_bgr_image(color_frame)
+                    if color_image is None:
+                        # MJPG 도 아니고 디코딩도 안 되는 포맷. 이 스레드는 데몬이라
+                        # 예외가 나면 노드는 안 죽고 캡처만 조용히 멈추는 "좀비
+                        # 상태"가 되므로 반드시 방어.
+                        continue
+                    self._encode_and_publish(self.raw_image_pub, color_image)
 
                 # ★ YOLO 처리 스레드(타이머)가 쓸 수 있게 최신 프레임 저장
                 with self._frame_lock:
+                    self._latest_raw = raw if is_jpeg else None
                     self._latest_color = color_image
                     self._latest_depth = depth_image
                     # ★ 이 프레임을 언제 찍었는지 남긴다 (2026-08-19).
@@ -253,10 +272,20 @@ class YoloDepthPublisher(Node):
                 self.get_logger().error(f"캡처 스레드 예외 (계속 재시도): {e}")
     def _get_latest_frame(self):
         with self._frame_lock:
-            if self._latest_color is None or self._latest_depth is None:
+            if self._latest_depth is None:
                 return None, None
+            raw = self._latest_raw
+            color = None if self._latest_color is None else self._latest_color.copy()
+            depth = self._latest_depth.copy()
             self._frame_stamp = getattr(self, '_latest_stamp', None)
-            return self._latest_color.copy(), self._latest_depth.copy()
+        if color is None:
+            if raw is None:
+                return None, None
+            # 락 밖에서 디코딩한다 — 캡처 스레드를 붙잡고 있지 않기 위해서.
+            color = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+            if color is None:
+                return None, None
+        return color, depth
 
     # ------------------------------------------------------------------
     # YOLO 처리 (캡처 스레드가 채워둔 최신 프레임을 가져다 씀, 카메라 속도와 무관)

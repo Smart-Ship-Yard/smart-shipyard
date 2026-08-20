@@ -171,7 +171,10 @@ class ShipSurveyNode(Node):
         # YOLO 클래스는 조립 단계별로 level1~level5. 전부 "배"를 가리키므로
         # 접두사로 거른다. 위험 이벤트 클래스(fallen_person/fire/no_helmet/
         # ship_defect)는 이 접두사가 없어서 자동으로 걸러진다.
-        self.declare_parameter('relock_on_level_change', True)
+        #   기본값을 False 로 둔다: 이 기능이 제대로 동작한 적이 없다.
+        #   실제로 발동한 것은 전부 YOLO 레벨 오검출이었다(한 시간에 7번).
+        #   조립 단계가 진짜로 바뀌는 시나리오를 시험할 때 True 로 켠다.
+        self.declare_parameter('relock_on_level_change', False)
         self.declare_parameter('ship_class_prefix', 'level')
         self.declare_parameter('min_confidence', 0.3)
 
