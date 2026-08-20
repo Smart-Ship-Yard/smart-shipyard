@@ -37,6 +37,10 @@ import json
 import math
 import os
 import shutil
+import sys as _sys
+
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from measure_ship_center import MEASURED_PATH, load_measured
 
 
 def copy_record(src, dst):
@@ -456,6 +460,23 @@ def main():
             else:
                 print('  대상 방향: 지정 안 됨 -> 0도로 그린다. '
                       '길쭉한 대상이면 --ship-yaw 를 줄 것')
+    elif load_measured() is not None and not a.use_survey:
+        mx, my, meta = load_measured()
+        cx_used, cy_used = mx, my
+        cmd += ['--center', str(mx), str(my)]
+        print(f'  순찰 중심: 실측 기록에서 읽음 ({mx:.3f}, {my:.3f})')
+        print(f'             config/{os.path.basename(MEASURED_PATH)} '
+              f"— 뎁스 {meta.get('depth_m', float('nan')):.3f} m, "
+              f"검출 {meta.get('samples', '?')}개")
+        cmd += ['--mask-size', str(SHIP_SIZE_XY[0]), str(SHIP_SIZE_XY[1]),
+                '--mask-yaw', str(math.radians(a.ship_yaw_deg
+                                               if a.ship_yaw_deg is not None
+                                               else SHIP_YAW_DEG))]
+        cmd += ['--mask-pad', str(a.mask_pad if a.mask_pad is not None
+                                  else SHIP_MASK_PAD)]
+        print(f'  대상 크기: 실측 상수 SHIP_SIZE_XY '
+              f'{SHIP_SIZE_XY[0]:.2f} x {SHIP_SIZE_XY[1]:.2f} m')
+
     elif survey and not a.use_survey:
         print('  ⛔ 중단: --center 로 실측한 배 중심을 주지 않았다.')
         print()
@@ -475,6 +496,10 @@ def main():
         print('     (로봇을 배 왼편에 나란히 두는 약속이면 X 는 +, Y 는 -)')
         print()
         print(f'       python3 scripts/finalize_map.py {name} --center <X> <Y>')
+        print()
+        print('  ▶ 또는 뎁스로 1회 측정하면 이 명령이 알아서 읽는다:')
+        print('       python3 scripts/measure_ship_center.py')
+        print(f'       python3 scripts/finalize_map.py {name}')
         print()
         print('     굳이 측량값을 쓰겠다면:  --use-survey')
         return 1
@@ -545,9 +570,12 @@ def main():
     print()
     if cx_used is not None:
         print()
+        print(f'  ▶ 배 중심   X = {cx_used:+.3f}   Y = {cy_used:+.3f}   '
+              f'(yaw 는 0 으로 고정)')
+        print()
         print('  📡 같은 배 위치를 프론트엔드에도 보내야 화면이 맞는다:')
-        print(f'        python3 scripts/publish_ship_pose.py '
-              f'{cx_used:.3f} {cy_used:.3f}')
+        print('        python3 scripts/publish_ship_pose.py'
+              + ('' if load_measured() else f' {cx_used:.3f} {cy_used:.3f}'))
         print('      (프론트는 배 pose 를 기준 좌표계로 써서 로봇·이벤트를 그린다.')
         print('       안 보내면 화면의 로봇 위치가 통째로 어긋난다)')
     print()

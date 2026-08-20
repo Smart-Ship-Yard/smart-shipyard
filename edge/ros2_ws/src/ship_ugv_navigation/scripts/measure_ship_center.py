@@ -31,6 +31,7 @@ yaw = 0 이다. 크기는 줄자 실측 상수(0.80 x 0.17)를 쓴다.
 import argparse
 import json
 import math
+import os
 import statistics
 import sys
 import time
@@ -42,6 +43,33 @@ CAM_OFFSET_Y = -0.089     # 오른쪽 (차체 반폭)
 CAM_YAW_DEG = -90.0       # 카메라가 로봇 오른쪽을 본다
 SHIP_THICKNESS = 0.17     # 줄자 실측. 짧은 변
 DET_TOPIC = '/event_detection/uvd'
+
+# 측정 결과를 여기에 남긴다. finalize_map.py 와 publish_ship_pose.py 가 읽는다.
+# /tmp 가 아니라 레포 안에 두는 이유: /tmp 는 재부팅이나 청소로 비워진다.
+# 오늘만 두 번 날아갔고, 그때마다 측량·정합 기록을 통째로 잃었다(2026-08-20).
+MEASURED_PATH = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    '..', 'config', 'ship_center_measured.json'))
+
+
+def load_measured():
+    """저장된 배 중심 측정값을 읽는다. 없거나 깨졌으면 None."""
+    try:
+        with open(MEASURED_PATH) as f:
+            d = json.load(f)
+        return float(d['x']), float(d['y']), d
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_measured(x, y, extra):
+    d = {'x': x, 'y': y, 'yaw_deg': 0.0, 'frame': 'map',
+         'source': 'measure_ship_center.py', 'timestamp': time.time()}
+    d.update(extra)
+    os.makedirs(os.path.dirname(MEASURED_PATH), exist_ok=True)
+    with open(MEASURED_PATH, 'w') as f:
+        json.dump(d, f, indent=2)
+    return MEASURED_PATH
 
 
 def surface_to_center(x_cam, z_cam, half_thick,
@@ -163,12 +191,19 @@ def main():
         print('  로봇이 캘리브레이션 시작 위치에 있다고 본다 '
               '(base_link 좌표 = map 좌표)')
 
+    path = save_measured(X, Y, {
+        'depth_m': z_cam, 'x_cam': x_cam, 'samples': len(samples),
+        'class_id': cls, 'thickness_m': a.thickness,
+        'via_tf': bool(a.use_tf),
+    })
+
     print()
     print(f'  ▶ 배 중심   X = {X:+.3f}   Y = {Y:+.3f}   (yaw 는 0 으로 고정)')
     print()
-    print('  다음 두 줄에 이 값을 그대로 쓴다:')
-    print(f'    python3 scripts/finalize_map.py <맵이름> --center {X:.3f} {Y:.3f}')
-    print(f'    python3 scripts/publish_ship_pose.py {X:.3f} {Y:.3f}')
+    print(f'  저장했다: config/{os.path.basename(path)}')
+    print('  아래 두 줄은 이 값을 알아서 읽는다 — 손으로 옮겨 적지 않아도 된다:')
+    print('    python3 scripts/finalize_map.py <맵이름>')
+    print('    python3 scripts/publish_ship_pose.py')
     node.destroy_node(); rclpy.shutdown()
     return 0
 

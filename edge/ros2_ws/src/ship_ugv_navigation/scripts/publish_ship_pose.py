@@ -28,7 +28,12 @@ X 는 양수, Y 는 음수가 된다. yaw 는 그 약속상 0 이다.
 import argparse
 import json
 import math
+import os
+import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from measure_ship_center import MEASURED_PATH, load_measured
 
 import rclpy
 from rclpy.node import Node
@@ -41,14 +46,31 @@ TOPIC = '/ship_survey/pose'
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('x', type=float, help='배 중심의 map X (m)')
-    ap.add_argument('y', type=float, help='배 중심의 map Y (m)')
+    # 인자를 안 주면 measure_ship_center.py 가 저장해둔 값을 읽는다.
+    # 사람이 숫자를 옮겨 적다 틀리는 것을 없애려는 것이다.
+    ap.add_argument('x', type=float, nargs='?', default=None,
+                    help='배 중심의 map X (m). 생략하면 저장된 측정값을 쓴다')
+    ap.add_argument('y', type=float, nargs='?', default=None,
+                    help='배 중심의 map Y (m). 생략하면 저장된 측정값을 쓴다')
     ap.add_argument('--yaw', type=float, default=0.0,
                     help='배 방향(도). 로봇을 배와 나란히 놓는 약속이면 0 (기본)')
     ap.add_argument('--block-id', default='B1')
     ap.add_argument('--seconds', type=float, default=5.0,
                     help='발행 지속 시간. 구독자 디스커버리에 몇 초가 필요하다')
     a = ap.parse_args()
+
+    if a.x is None or a.y is None:
+        got = load_measured()
+        if got is None:
+            print(f'  ❌ 저장된 배 중심 측정값이 없다: {MEASURED_PATH}')
+            print('     먼저 재거나, X Y 를 직접 줄 것:')
+            print('       python3 scripts/measure_ship_center.py')
+            print('       python3 scripts/publish_ship_pose.py <X> <Y>')
+            return 1
+        a.x, a.y, meta = got
+        print(f'  저장된 측정값을 읽었다: config/{os.path.basename(MEASURED_PATH)}'
+              f"  (뎁스 {meta.get('depth_m', float('nan')):.3f} m, "
+              f"검출 {meta.get('samples', '?')}개)")
 
     payload = {
         'event_type': 'ship_pose',
@@ -74,12 +96,16 @@ def main():
         pub.publish(msg)
         rclpy.spin_once(node, timeout_sec=0.2)
 
+    print()
+    print(f'  ▶ 배 중심   X = {a.x:+.3f}   Y = {a.y:+.3f}   '
+          f'(yaw {a.yaw:.1f}도)')
     print(f'  {a.seconds:.0f}초 발행 완료.')
     print('  확인:  터미널 1 에 [배위치] 로그  /  '
           'curl -s http://192.168.0.5:8000/api/init-data')
     node.destroy_node()
     rclpy.shutdown()
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
