@@ -157,6 +157,12 @@ class WebSocketClient(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.send_queue = queue.Queue()
+        # ★ 마지막 배 위치. 재연결할 때 다시 보내려고 들고 있는다(2026-08-20).
+        #   ship_pose 는 측량이 끝나는 그 순간 1회만 발행된다. 그래서 그 뒤에
+        #   백엔드가 재시작하고 DB가 비어 있으면 배 위치를 영영 못 받는다.
+        #   block_level 은 이미 재연결마다 다시 보내고 있었다. 같이 맞춘다.
+        #   (참조 대입 하나라 CPython 에서는 락 없이도 원자적이다)
+        self._last_ship_pose = None
 
         # ★ 서버 -> 젯슨 수신 메시지를 그대로 중계할 퍼블리셔 (해석하지 않음)
         self.inbound_pub = self.create_publisher(String, inbound_topic, 10)
@@ -364,6 +370,7 @@ class WebSocketClient(Node):
             'map_xy': [float(map_xy[0]), float(map_xy[1])],
             'yaw': yaw,
         }
+        self._last_ship_pose = payload
         self._enqueue(payload)
         self.get_logger().info(f"[배위치] block_id={block_id} map_xy={map_xy} yaw={yaw:.3f}")
 
@@ -419,6 +426,12 @@ class WebSocketClient(Node):
                         'level': current_level,
                     })
                     self.get_logger().info(f"[조립단계 재통보] level={current_level} 재전송")
+
+                last_pose = self._last_ship_pose
+                if last_pose is not None:
+                    self._enqueue(dict(last_pose))
+                    self.get_logger().info(
+                        f"[배위치 재통보] map_xy={last_pose['map_xy']} 재전송")
 
                 while not self._stop_event.is_set():
                     try:
