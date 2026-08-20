@@ -37,6 +37,19 @@ import json
 import math
 import os
 import shutil
+
+
+def copy_record(src, dst):
+    """기록 파일을 레포로 보존한다. 이미 그 파일이면 그냥 둔다.
+
+    /tmp 가 비워졌을 때 --align-dir maps/calibration_records 로 레포 기록을
+    다시 쓰는 복구 경로가 있는데(도구가 직접 그렇게 안내한다), 그때 원본과
+    대상이 같은 파일이 되어 SameFileError 로 죽었다(2026-08-20).
+    """
+    if os.path.abspath(src) == os.path.abspath(dst):
+        print(f'       (이미 레포에 있는 파일이라 그대로 둔다)')
+        return
+    shutil.copy2(src, dst)
 import subprocess
 import sys
 
@@ -170,7 +183,7 @@ def pick_survey_center(survey_dir, records, name, pgm_mtime):
         return None
 
     dst = os.path.join(records, f'survey_{name}.json')
-    shutil.copy2(src, dst)
+    copy_record(src, dst)
 
     yaw = d.get('yaw')
     yaw = float(yaw) if isinstance(yaw, (int, float)) else 0.0
@@ -262,6 +275,8 @@ def main():
                          '대상이 라이다에 안 잡혀(모형 배 등) 맵에서 크기를 '
                          '알 수 없을 때 --center 와 함께 준다. 측량 기록에 '
                          'size_xy 가 있으면 그것보다 이 값이 우선한다')
+    ap.add_argument('--use-survey', action='store_true',
+                    help='YOLO 측량이 낸 배 중심을 쓴다 (기본은 거부 — 부정확하다)')
     ap.add_argument('--no-mask', action='store_true',
                     help='keepout 마스크를 만들지 않는다. 순찰 대상이 라이다에 '
                          '잡히는 물체라면(코스트맵이 이미 안다) 마스크는 중복이며, '
@@ -359,12 +374,12 @@ def main():
         print()
 
     align_dst = os.path.join(records, f'align_{name}.json')
-    shutil.copy2(align_src, align_dst)
+    copy_record(align_src, align_dst)
     print(f'  정합    {align_src}\n       -> {align_dst}')
 
     if calib_src is not None:
         calib_dst = os.path.join(records, f'calib_{name}.json')
-        shutil.copy2(calib_src, calib_dst)
+        copy_record(calib_src, calib_dst)
         print(f'  캘리브  {calib_src}\n       -> {calib_dst}')
     else:
         print(f'  ⚠️ 캘리브레이션 기록 없음 ({a.calib_dir}) — 보정에는 영향 없음')
@@ -422,7 +437,9 @@ def main():
     # 되돌릴 방법이 그것뿐이기 때문이다.
     if a.center:
         cmd += ['--center', str(a.center[0]), str(a.center[1])]
-        print(f'  순찰 중심: --center 로 지정됨 ({a.center[0]}, {a.center[1]})')
+        cx_used, cy_used = a.center
+        print(f'  순찰 중심: --center 로 실측해 지정됨 '
+              f'({a.center[0]}, {a.center[1]})')
         if a.ship_size:
             cmd += ['--mask-size', str(a.ship_size[0]), str(a.ship_size[1])]
             print(f'  대상 크기: --ship-size {a.ship_size[0]} x {a.ship_size[1]} m')
@@ -439,8 +456,32 @@ def main():
             else:
                 print('  대상 방향: 지정 안 됨 -> 0도로 그린다. '
                       '길쭉한 대상이면 --ship-yaw 를 줄 것')
+    elif survey and not a.use_survey:
+        print('  ⛔ 중단: --center 로 실측한 배 중심을 주지 않았다.')
+        print()
+        print('     YOLO 측량(ship_survey_node)이 낸 값이 있긴 하다:')
+        print(f"       중심 ({survey['center'][0]:.3f}, {survey['center'][1]:.3f})"
+              + (f"  크기 {survey['size'][0]:.2f} x {survey['size'][1]:.2f} m"
+                 if survey.get('size') else ''))
+        print('     하지만 이 값은 믿을 수 없어서 2026-08-20 부터 기본으로 안 쓴다.')
+        print('     실측 0.80 x 0.17 m 인 배를 1.68 x 0.35 m 로 쟀다. 방향은 노이즈다.')
+        print('     이 값 하나가 keepout 마스크 위치와 프론트엔드 화면 전체의')
+        print('     기준 좌표계가 되므로, 틀리면 자율주행도 화면도 같이 틀어진다.')
+        print()
+        print('  ▶ 줄자로 재서 넣을 것:')
+        print('     원점은 캘리브레이션을 **시작한** 순간의 로봇 위치,')
+        print('     +x 는 로봇이 직진한 방향, +y 는 그 기준 왼쪽,')
+        print('     로봇 기준점은 base_link = 좌우 구동 바퀴 축의 중점이다.')
+        print('     (로봇을 배 왼편에 나란히 두는 약속이면 X 는 +, Y 는 -)')
+        print()
+        print(f'       python3 scripts/finalize_map.py {name} --center <X> <Y>')
+        print()
+        print('     굳이 측량값을 쓰겠다면:  --use-survey')
+        return 1
+
     elif survey:
         cx, cy = survey['center']
+        cx_used, cy_used = cx, cy
         cmd += ['--center', str(cx), str(cy)]
         print(f'  순찰 중심: 측량 기록에서 가져옴 ({cx:.3f}, {cy:.3f})')
         size = a.ship_size or survey['size']
@@ -467,6 +508,7 @@ def main():
                 cmd += ['--mask-pad', str(a.mask_pad)]
                 print(f'  마스크 여유: --mask-pad {a.mask_pad} m (사방)')
     else:
+        cx_used = cy_used = None
         print('  순찰 중심: 맵에서 자동 탐지')
     print()
 
@@ -500,6 +542,14 @@ def main():
     print('        cd ~/smart-shipyard/edge/ros2_ws && \\')
     print('          colcon build --symlink-install --packages-select ship_ugv_navigation')
     print('      안 하면 install/ 에 안 복사돼서 "맵을 못 찾는다" 에러가 난다.')
+    print()
+    if cx_used is not None:
+        print()
+        print('  📡 같은 배 위치를 프론트엔드에도 보내야 화면이 맞는다:')
+        print(f'        python3 scripts/publish_ship_pose.py '
+              f'{cx_used:.3f} {cy_used:.3f}')
+        print('      (프론트는 배 pose 를 기준 좌표계로 써서 로봇·이벤트를 그린다.')
+        print('       안 보내면 화면의 로봇 위치가 통째로 어긋난다)')
     print()
     print('      source 는 Nav2 를 띄울 터미널에서만 하면 된다:')
     print('        source ~/smart-shipyard/edge/ros2_ws/install/setup.bash')

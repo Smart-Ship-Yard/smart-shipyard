@@ -139,6 +139,27 @@ def generate_launch_description():
     #   대신 아래 기동 배너에서 "YOLO 가 실제로 떠 있는지" 를 확인한다.
     #   누가 서비스를 꺼놨으면 매핑 마스킹이 **조용히** 실패하기 때문이다.
 
+    # ---- YOLO 배 측량을 켤지 (2026-08-20: 기본 끔) ----
+    #   ros2 launch ship_ugv_localization localization.launch.py survey:=true
+    #
+    #   왜 껐나: 이 노드가 내놓는 배 중심·방향·크기가 못 쓸 정도로 부정확했다.
+    #     실측 0.80 x 0.17 m 인 배를 1.68 x 0.35 m 로 쟀다(2026-08-20).
+    #     방향은 노이즈고, 중심도 같은 배를 두 번 재서 크게 달랐다.
+    #   왜 문제인가: 이 값 하나가 **두 곳의 기준 좌표계**가 된다.
+    #     ① Nav2 keepout 마스크 위치  ② 프론트엔드 화면 전체
+    #        (ShipyardTwinDashboard.jsx 의 mapXYToShipLocalMeters 가 배 pose 를
+    #         기준으로 로봇·이벤트·블록을 전부 변환한다)
+    #     즉 배 pose 가 틀리면 자율주행도 화면도 같이 틀어진다.
+    #   대신: 매핑할 때 사람이 줄자로 한 번 재서 넣는다.
+    #     finalize_map.py <맵이름> --center X Y
+    #     방향은 "캘리브레이션 때 로봇을 배와 나란히" 약속으로 0도 고정.
+    #   ※ 이벤트 좌표(/event_detection/map_point)와 block_level 은 그대로 YOLO 를
+    #     쓴다. 그쪽은 1회 관측이라 오차가 누적되지 않고, 대안도 없다.
+    survey_on = any(a in ('survey:=true', 'survey:=True', 'survey:=1')
+                    for a in sys.argv)
+    banner_survey = ('켬 — YOLO 로 배를 측량한다 (부정확할 수 있음)' if survey_on
+                     else '끔 — 배 위치는 finalize_map.py --center X Y 로 실측해 넣는다')
+
     ship_survey_node = Node(
         package='ship_ugv_perception',
         executable='ship_survey_node',
@@ -300,6 +321,12 @@ def generate_launch_description():
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     banner.append(LogInfo(msg=f"  {'✅' if yolo_up else '❌'} {'YOLO(카메라)':<14} "
                               f"systemd yolo-depth-publisher.service"))
+    banner.append(LogInfo(msg=f"  {'✅' if survey_on else '⏸️'} {'배 측량':<14} "
+                              f"{banner_survey}"))
+    banner.append(LogInfo(
+        msg=f"  {'✅' if calib_file else '⏸️'} {'캘리브 불러오기':<12} "
+            + (os.path.basename(calib_file) if calib_file
+               else '끔 — 새로 잰다 (되살리려면 calib:=<맵이름>)')))
     if not yolo_up:
         banner.append(LogInfo(msg='━' * 60))
         banner.append(LogInfo(
@@ -321,7 +348,7 @@ def generate_launch_description():
         ekf_local_node,
         ekf_global_node,
         change_point_node,
-        ship_survey_node,
+        *( [ship_survey_node] if survey_on else [] ),
         websocket_client_node,
         laser_static_tf_node,
         rplidar_node,
