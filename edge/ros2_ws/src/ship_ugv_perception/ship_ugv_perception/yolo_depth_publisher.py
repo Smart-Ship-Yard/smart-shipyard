@@ -20,6 +20,7 @@ Astra+ 카메라로 Color+Depth를 받아 YOLO로 객체를 검출하고,
 """
 
 import json
+import time
 import math
 import os
 import re
@@ -93,6 +94,17 @@ class YoloDepthPublisher(Node):
         # bbox 내 유효 depth 픽셀 비율이 이 값 미만이면 해당 검출 폐기
         # (작은 소품은 배경 depth가 섞여 median이 오염되는 실패 모드 방지)
         self.declare_parameter('min_valid_ratio', 0.2)
+        # ★ 화면 중앙 뎁스 탐침 (2026-08-21 신설)
+        #   배 중심 좌표를 잴 때 쓴다. 카메라 중심을 배 중심에 맞춰 세우는
+        #   것이 약속이므로, **YOLO 가 배를 찾아줄 필요가 없다.** 중앙의
+        #   뎁스만 있으면 된다.
+        #   왜 필요한가: 이 모델이 배를 못 잡는다. 같은 구도에서 신뢰도가
+        #   0.043 까지 떨어지고(임계값 0.1) 클래스도 level1/level3/level4 로
+        #   흔들린다. 측정이 모델 상태에 좌우되면 안 된다.
+        self.declare_parameter('center_probe_enabled', True)
+        self.declare_parameter('center_probe_w', 80)   # 중앙 ROI 가로(px)
+        self.declare_parameter('center_probe_h', 60)   # 중앙 ROI 세로(px)
+        self.declare_parameter('center_probe_hz', 5.0)
 
         weights_path = self.get_parameter('weights_path').value
         topic = self.get_parameter('detection_topic').value
@@ -106,6 +118,11 @@ class YoloDepthPublisher(Node):
         self.raw_jpeg_quality = self.get_parameter('raw_image_jpeg_quality').value
         inference_interval = self.get_parameter('inference_interval_s').value
         self.min_valid_ratio = self.get_parameter('min_valid_ratio').value
+        self.probe_on = self.get_parameter('center_probe_enabled').value
+        self.probe_w = int(self.get_parameter('center_probe_w').value)
+        self.probe_h = int(self.get_parameter('center_probe_h').value)
+        self.probe_period = 1.0 / max(0.1, self.get_parameter('center_probe_hz').value)
+        self._probe_last = 0.0
 
         # ★ debug_log 를 실행 중에 바꿀 수 있게 한다 (2026-08-19).
         #   지금까지는 위에서 값을 한 번 읽어 self.debug_log 에 넣어두고 다시
@@ -120,6 +137,9 @@ class YoloDepthPublisher(Node):
         self.model = YOLO(weights_path)
         self.get_logger().info(f"모델 클래스 목록: {self.model.names}")
         self.pub = self.create_publisher(String, topic, 10)
+        # 화면 중앙 뎁스 탐침 결과 (measure_ship_center.py 가 쓴다)
+        self.probe_pub = self.create_publisher(
+            String, '/camera/center_probe', 10)
         self.raw_image_pub = self.create_publisher(
             CompressedImage, raw_image_topic, LOW_LATENCY_QOS)
         self.annotated_image_pub = self.create_publisher(
@@ -202,6 +222,44 @@ class YoloDepthPublisher(Node):
         msg.data = encoded.tobytes()
         publisher.publish(msg)
 
+    def _publish_center_probe(self, depth_image):
+        """화면 정중앙 ROI 의 뎁스 중앙값을 카메라 좌표로 내보낸다.
+
+        배 중심 좌표를 잴 때 쓴다(scripts/measure_ship_center.py --probe).
+        카메라 중심을 배 중심에 맞춰 세우는 것이 약속이라 **YOLO 가 배를
+        찾아줄 필요가 없다.** 검출을 거치지 않으므로 모델 성능과 무관하다.
+
+        검출 경로와 같은 규약을 따른다: bbox 중앙 1/4 대신 화면 중앙 ROI 를
+        쓰고, 유효 픽셀의 중앙값을 z 로 삼아 내부파라미터로 역투영한다.
+        """
+        now = time.time()
+        if now - self._probe_last < self.probe_period:
+            return
+        self._probe_last = now
+
+        h, w = depth_image.shape
+        u, v = w // 2, h // 2
+        x0, x1 = max(0, u - self.probe_w // 2), min(w, u + self.probe_w // 2)
+        y0, y1 = max(0, v - self.probe_h // 2), min(h, v + self.probe_h // 2)
+        roi = depth_image[y0:y1, x0:x1]
+        valid = roi[roi > 0]
+        ratio = len(valid) / roi.size if roi.size else 0.0
+        if ratio < self.min_valid_ratio:
+            # 유효 픽셀이 너무 적으면 중앙값이 배경에 오염된다. 보내지 않는다.
+            return
+
+        z_m = float(np.median(valid)) / 1000.0
+        payload = {
+            'depth_xyz': [(u - self.cx) * z_m / self.fx,
+                          (v - self.cy) * z_m / self.fy,
+                          z_m],
+            'u': u, 'v': v,
+            'valid_ratio': round(ratio, 3),
+            'roi': [self.probe_w, self.probe_h],
+            'class_id': 'center_probe',
+        }
+        self.probe_pub.publish(String(data=json.dumps(payload)))
+
     def _draw_box(self, image, x1, y1, x2, y2, class_name, conf, z_m):
         p1 = (int(x1), int(y1))
         p2 = (int(x2), int(y2))
@@ -232,6 +290,9 @@ class YoloDepthPublisher(Node):
 
                 depth_data = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
                 depth_image = depth_data.reshape((depth_frame.get_height(), depth_frame.get_width()))
+
+                if self.probe_on:
+                    self._publish_center_probe(depth_image)
 
                 if is_jpeg:
                     # ★ 원본 JPEG 를 그대로 발행 (2026-08-20).

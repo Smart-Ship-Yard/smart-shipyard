@@ -47,7 +47,8 @@ HFOV_DEG = 74.0           # Astra+ RGB 수평화각 (change_point.py 와 같은 
 MAX_SPREAD_M = 0.05       # 거리 중앙값 대비 퍼짐 한계
 MIN_SAMPLES = 5           # 이보다 적으면 중앙값을 믿을 수 없다
 EDGE_MARGIN_M = 0.05      # 배 끝과 화면 끝 사이에 최소 이만큼
-DET_TOPIC = '/event_detection/uvd'
+DET_TOPIC = '/event_detection/uvd'        # YOLO 검출 (--yolo 일 때)
+PROBE_TOPIC = '/camera/center_probe'      # 화면 중앙 뎁스 탐침 (기본)
 
 # 측정 결과를 여기에 남긴다. finalize_map.py 와 publish_ship_pose.py 가 읽는다.
 # /tmp 가 아니라 레포 안에 두는 이유: /tmp 는 재부팅이나 청소로 비워진다.
@@ -215,6 +216,12 @@ def main():
     ap.add_argument('--thickness', type=float, default=SHIP_THICKNESS,
                     help=f'배 짧은 변 실측(m). 기본 {SHIP_THICKNESS}')
     ap.add_argument('--class-prefix', default='level', help="배 클래스 접두사")
+    # 기본은 뎁스 탐침이다. YOLO 를 안 거치므로 모델 성능과 무관하다.
+    #   실측(2026-08-21): 같은 구도에서 이 모델의 신뢰도가 0.043 까지 떨어지고
+    #   (임계값 0.1) 클래스도 level1/level3/level4 로 흔들렸다. 배가 화면
+    #   가운데 있는 것은 사람이 눈으로 맞추는 약속이므로, 검출은 필요 없다.
+    ap.add_argument('--yolo', action='store_true',
+                    help='뎁스 탐침 대신 YOLO 검출을 쓴다 (모델이 잘 잡을 때만)')
     ap.add_argument('--use-tf', action='store_true',
                     help='캘리브레이션 뒤에 잴 때. map<-base_link 로 변환한다')
     ap.add_argument('--self-check', action='store_true', help='계산만 검증하고 끝')
@@ -258,8 +265,21 @@ def main():
         if xyz and len(xyz) == 3 and xyz[2] > 0.05:
             samples.append((float(xyz[0]), float(xyz[2]), str(d['class_id'])))
 
-    node.create_subscription(String, DET_TOPIC, cb, 10)
-    print(f'  {DET_TOPIC} 를 {a.seconds:.0f}초 읽는다 — 로봇을 움직이지 말 것')
+    def probe_cb(msg):
+        try:
+            d = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        xyz = d.get('depth_xyz')
+        if xyz and len(xyz) == 3 and xyz[2] > 0.05:
+            samples.append((float(xyz[0]), float(xyz[2]),
+                            f"중앙탐침 유효{d.get('valid_ratio', '?')}"))
+
+    topic = DET_TOPIC if a.yolo else PROBE_TOPIC
+    node.create_subscription(String, topic, cb if a.yolo else probe_cb, 10)
+    print(f'  {topic} 를 {a.seconds:.0f}초 읽는다 — 로봇을 움직이지 말 것')
+    if not a.yolo:
+        print('  (YOLO 검출을 거치지 않는다. 배가 화면 가운데 있어야 한다)')
     end = time.time() + a.seconds
     while time.time() < end:
         rclpy.spin_once(node, timeout_sec=0.1)
@@ -269,7 +289,13 @@ def main():
         print('  ❌ 배를 하나도 못 봤다.')
         print(f'     · YOLO 가 떠 있나:  systemctl is-active yolo-depth-publisher')
         print(f'     · 배가 카메라(로봇 오른쪽) 화면에 들어와 있나')
-        print(f'     · 클래스 접두사가 맞나 (지금 "{a.class_prefix}")')
+        if a.yolo:
+            print(f'     · 클래스 접두사가 맞나 (지금 "{a.class_prefix}")')
+        else:
+            print('     · YOLO 노드가 새 코드인가 (탐침은 2026-08-21 신설):')
+            print('         journalctl -u yolo-depth-publisher -n 5')
+            print(f'     · 중앙 ROI 에 유효 뎁스가 20% 이상 있나 '
+                  f'(배가 화면 가운데 있어야 한다)')
         warn_stale('배를 하나도 못 봤다')
         node.destroy_node(); rclpy.shutdown()
         return 1
@@ -283,7 +309,10 @@ def main():
 
     print(f'  검출 {len(samples)}개 ({cls}), 거리 중앙값 {z_cam:.3f} m '
           f'(퍼짐 {spread * 100:.1f} cm)')
-    problems = check_measurement(samples, x_cam, z_cam, spread)
+    # 탐침 경로는 화면 중앙을 강제로 보므로 x_cam 이 0 근처다. 그래서 "배가
+    # 잘렸나" 를 x_cam 으로 판단할 수 없다. 대신 거리만 본다 — 너무 가까우면
+    # 배가 화면을 넘치고, 그때는 중앙 ROI 가 배 중심이 아닐 수 있다.
+    problems = check_measurement(samples, x_cam if a.yolo else 0.0, z_cam, spread)
     if problems:
         print()
         for msg in problems:
