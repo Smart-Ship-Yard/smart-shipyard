@@ -245,6 +245,20 @@ def step(n, title):
 
 
 
+def read_patrol_yaml(path):
+    """이미 만들어둔 순찰 설정에서 (중심x, 중심y, 반지름) 을 읽는다."""
+    try:
+        got = {}
+        for line in open(path):
+            line = line.split('#')[0].strip()
+            for key in ('center_x', 'center_y', 'radius'):
+                if line.startswith(key + ':'):
+                    got[key] = float(line.split(':', 1)[1])
+        return (got['center_x'], got['center_y'], got['radius'])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 def print_recovery_options(name):
     """정합 기록이 미심쩍을 때 사람이 고를 두 갈래.
 
@@ -620,6 +634,26 @@ def main():
         cx_used = cy_used = None
         print('  순찰 중심: 맵에서 자동 탐지')
     print()
+
+    # 같은 값으로 다시 돌리면 3분짜리 반지름 훑기를 통째로 낭비한다.
+    # 결과 파일도 똑같이 나온다. 미리 비교해서 건너뛴다 (2026-08-21).
+    have = read_patrol_yaml(patrol_out) if not a.no_mask else None
+    if (have and cx_used is not None and not a.force
+            and abs(have[0] - cx_used) < 0.001
+            and abs(have[1] - cy_used) < 0.001
+            and (a.radius is None or abs(have[2] - a.radius) < 0.001)):
+        print(f'  ✅ 이미 이 값으로 설정돼 있다 — 다시 만들지 않는다')
+        print(f'       중심 ({have[0]:.3f}, {have[1]:.3f})   반지름 {have[2]:.2f} m')
+        print(f'       config/{os.path.basename(patrol_out)}')
+        print()
+        if a.radius is None:
+            print('     다른 반지름으로 바꾸려면:')
+            print(f'       python3 scripts/finalize_map.py {name} --radius <반지름>')
+        else:
+            print('     그래도 다시 만들려면 --force')
+        print()
+        print(f'  ▶ 배 중심   X = {cx_used:+.3f}   Y = {cy_used:+.3f}')
+        return 0
 
     r = subprocess.run(cmd)
 
