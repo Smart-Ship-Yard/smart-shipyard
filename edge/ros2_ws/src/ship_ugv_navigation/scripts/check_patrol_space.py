@@ -198,25 +198,90 @@ def clearance_at(m, x, y, cap=0.8):
     return cap
 
 
+# 로봇이 접선을 완벽히 따라가지 못하는 각도(도). 웨이포인트를 향해 틀어진다.
+#   2026-08-21 실측: 반지름 0.60 순찰 중 접선에서 26도 안쪽을 보고 있었고,
+#   그 바람에 앞으로 0.332 m 뻗은 차체가 마스크를 9 mm 밟아 갇혔다.
+#   접선만 가정하고 검사하면 "여유 0.325 m" 라고 통과시켜 버린다.
+HEADING_ERR_DEG = 30.0
+
+
 def check_circle(m, cx, cy, r, step_deg=2):
-    """반지름 r 원을 실제 footprint로 훑어 충돌 각도 수와 최소 여유를 반환."""
+    """반지름 r 원을 실제 footprint로 훑어 충돌 각도 수와 최소 여유를 반환.
+
+    ★ 접선 방향만 보지 않는다. ±HEADING_ERR_DEG 만큼 틀어진 자세도 함께 본다.
+      로봇은 웨이포인트를 향해 조금씩 안쪽을 보며 돌고, 차체가 앞으로
+      0.332 m 뻗어서 각도가 조금만 틀어져도 코끝이 크게 파고든다.
+      (여기서 보는 것은 **맵의 벽**이다. 배는 맵에 안 찍히므로
+       배와의 간격은 아래 min_patrol_radius 가 따로 지킨다)
+    """
     pts = footprint_points()
     bad, worst = 0, 99.0
     for a in range(0, 360, step_deg):
         th = math.radians(a)
         bx, by = cx + r * math.cos(th), cy + r * math.sin(th)
-        hd = th + math.pi / 2                      # 원의 접선 방향
-        ch, sh = math.cos(hd), math.sin(hd)
         hit = False
-        for px, py in pts:
-            X, Y = bx + px * ch - py * sh, by + px * sh + py * ch
-            if not is_free(m, X, Y):
-                hit = True
+        for err in (-HEADING_ERR_DEG, 0.0, HEADING_ERR_DEG):
+            hd = th + math.pi / 2 + math.radians(err)
+            ch, sh = math.cos(hd), math.sin(hd)
+            for px, py in pts:
+                X, Y = bx + px * ch - py * sh, by + px * sh + py * ch
+                if not is_free(m, X, Y):
+                    hit = True
+                    break
+                worst = min(worst, clearance_at(m, X, Y, cap=0.5))
+            if hit:
                 break
-            worst = min(worst, clearance_at(m, X, Y, cap=0.5))
         if hit:
             bad += 1
     return bad, (0.0 if worst > 90 else worst)
+
+
+def min_patrol_radius(mask_w, mask_h, margin, step=0.05):
+    """차체 어느 점도 마스크에 닿지 않는 최소 순찰 반지름.
+
+    ★ 2026-08-21 실측으로 다시 만든 규칙 ★
+    예전에는 "배 반대각 + 여유" 만 봤다(반지름 0.60 이 나왔다). 그런데
+      · 지켜야 할 것은 배가 아니라 **마스크**다 (배보다 사방 0.07 크다)
+      · 로봇은 접선을 완벽히 따라가지 못한다 (실측 26도 틀어져 있었다)
+      · 차체가 앞으로 0.332 m 뻗어서, 틀어지면 코끝이 원 안쪽으로 파고든다
+    이 셋을 빼먹어서 0.60 을 "여유 0.325 m" 로 통과시켰고, 실제로는 코끝이
+    마스크를 9 mm 밟아 로봇이 금지영역에 갇혔다. Nav2 는 충돌로 보고
+    복구 동작(spin -> 실패 -> wait)만 반복했다.
+
+    이제 실제 footprint 를 ±HEADING_ERR_DEG 로 돌려가며 마스크 사각형과의
+    간격을 직접 잰다.
+    """
+    pts = footprint_points()
+    hw, hh = mask_w / 2.0, mask_h / 2.0
+    r = 0.20
+    while r <= 2.0:
+        ok = True
+        for a in range(0, 360, 5):
+            th = math.radians(a)
+            bx, by = r * math.cos(th), r * math.sin(th)   # 마스크 중심 기준
+            for err in (-HEADING_ERR_DEG, 0.0, HEADING_ERR_DEG):
+                hd = th + math.pi / 2 + math.radians(err)
+                ch, sh = math.cos(hd), math.sin(hd)
+                for px, py in pts:
+                    X, Y = bx + px * ch - py * sh, by + px * sh + py * ch
+                    # 축정렬 사각형까지의 거리 (안이면 0)
+                    dx = max(hw - abs(X), 0.0) if abs(X) < hw else abs(X) - hw
+                    dy = max(hh - abs(Y), 0.0) if abs(Y) < hh else abs(Y) - hh
+                    inside = abs(X) < hw and abs(Y) < hh
+                    gap = -min(dx, dy) if inside else math.hypot(
+                        max(abs(X) - hw, 0.0), max(abs(Y) - hh, 0.0))
+                    if gap < margin:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if not ok:
+                break
+        if ok:
+            return r
+        r += step
+    return None
+
 
 
 # ======================================================================
@@ -642,20 +707,16 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
     #    2026-08-19 사례라 치수는 그때 값이다)
     #   크기를 아는 경우에는 차체 안쪽 끝이 대상 모서리를 넘지 않도록 직접 막는다.
     if mask_size:
-        reach = math.hypot(mask_size[0] / 2.0, mask_size[1] / 2.0)
-        need_inner = reach + margin
-        min_r = None
-        rr = 0.20
-        while rr <= 1.60:
-            if sweep_bounds(rr)[0] >= need_inner:
-                min_r = rr
-                break
-            rr += 0.05
-        print(f'대상이 맵에 없어 크기로 최소 반지름을 정한다: '
-              f'중심에서 모서리까지 {reach:.3f} m + 여유 {margin} m '
-              f'= 차체 안쪽이 {need_inner:.3f} m 밖에 있어야 함')
+        # 지켜야 할 것은 배가 아니라 **마스크**다. Nav2 가 금지영역으로 보는
+        # 것이 마스크이고, 배보다 사방 mask_pad 만큼 크다.
+        mw, mh = mask_size[0] + 2 * mask_pad, mask_size[1] + 2 * mask_pad
+        min_r = min_patrol_radius(mw, mh, margin)
+        print(f'대상이 맵에 없어 마스크 크기로 최소 반지름을 정한다: '
+              f'마스크 {mw:.2f} x {mh:.2f} m 에서 사방 {margin} m 를 띄운다')
+        print(f'  차체를 접선 ±{HEADING_ERR_DEG:.0f}도 로 돌려가며 실제로 재본 값이다 '
+              f'— 로봇이 접선을 완벽히 따라가지 못하기 때문이다')
         if min_r is None:
-            print('❌ 1.60 m 까지 봐도 차체 안쪽이 대상을 비켜가지 못한다 — 대상이 너무 크다')
+            print('❌ 2.0 m 까지 봐도 차체가 마스크를 비켜가지 못한다 — 대상이 너무 크다')
             return 1
         print(f'  -> {min_r:.2f} m 부터 검사한다 (그 미만은 대상을 관통하므로 제외)')
         print()
