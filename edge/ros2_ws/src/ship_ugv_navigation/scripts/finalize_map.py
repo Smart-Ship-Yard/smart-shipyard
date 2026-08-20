@@ -186,7 +186,11 @@ def pick_survey_center(survey_dir, records, name, pgm_mtime):
     print(f'  측량    {src}\n       -> {dst}')
     print(f'          배 중심 ({cx:.3f}, {cy:.3f}), yaw {yaw:.3f} rad')
     if size:
-        print(f'          배 크기 {size[0]:.2f} x {size[1]:.2f} m — keepout 마스크에 사용')
+        # 이 값은 기록 보존일 뿐이다. 마스크는 [4/4] 에서 SHIP_SIZE_XY(실측 상수)로
+        # 그린다. 예전에 여기서 "마스크에 사용" 이라고 찍어 혼동을 줬다.
+        print(f'          측량이 잰 크기 {size[0]:.2f} x {size[1]:.2f} m — 기록 보존용')
+        print(f'          (마스크는 실측 상수 {SHIP_SIZE_XY[0]:.2f} x {SHIP_SIZE_XY[1]:.2f} m 를 쓴다. '
+              f'측량 size_xy 는 크기가 아니라 점이 퍼진 정도라 못 믿는다)')
     else:
         print('          ⚠️ size_xy 가 없다 — 맵의 장애물에서 크기를 찾아본다.')
         print('             배가 라이다에 안 잡히는 경우라면 마스크가 안 만들어진다')
@@ -197,6 +201,31 @@ def step(n, title):
     print(f'\n[{n}/4] {title}')
     print('-' * 60)
 
+
+
+def print_recovery_options(name):
+    """정합 기록이 미심쩍을 때 사람이 고를 두 갈래.
+
+    판단 기준은 하나뿐이다: **맵을 저장한 뒤에 로봇이 더 움직였는가.**
+    움직였으면 저장된 맵과 지금 정합값이 서로 다른 것을 가리킨다.
+    두 중단 지점에서 같은 안내를 쓰므로 여기 하나로 모았다.
+    """
+    print('  아무 파일도 고치지 않았다.')
+    print('  판단 기준은 하나다 — 맵을 저장한 뒤에 로봇이 더 돌아다녔는가?')
+    print()
+    print('  1) 저장한 뒤에도 더 주행했다  ->  정합값을 직접 읽어서 넣는다')
+    print('     저장 이후 맵이 자라서, 저장본과 지금 정합값이 서로 안 맞는다.')
+    print('     지금 TF 를 읽는다:')
+    print('         ros2 run tf2_ros tf2_echo map slam_map')
+    print('     ★ uwb_frame 이 아니라 slam_map 이다. 둘은 다른 변환이다.')
+    print('        map<-uwb_frame  = UWB 캘리브레이션 결과 (여기에 넣으면 안 된다)')
+    print('        map<-slam_map   = 정합 결과 (이게 필요한 값이다)')
+    print('     나온 Translation 의 x, y 와 Rotation RPY 의 yaw(radian)를 그대로:')
+    print(f'         python3 scripts/bake_map_origin.py maps/{name}.yaml --tf <x> <y> <yaw>')
+    print()
+    print('  2) 저장 직후 그 자리에 세워둔 채였다  ->  그냥 진행한다')
+    print('     로봇이 안 움직였으면 맵도 안 바뀌었다. 정합값은 이 맵에 그대로 맞다.')
+    print(f'         python3 scripts/finalize_map.py {name} --force')
 
 def main():
     ap = argparse.ArgumentParser(
@@ -304,10 +333,7 @@ def main():
         print('     이 맵의 정합 기록이 아닐 가능성이 높다.')
         print('     (맵을 저장한 뒤에 align을 다시 호출했다면 정상일 수 있다)')
         print()
-        print('  아무 파일도 고치지 않았다. 아래 중 하나를 선택할 것:')
-        print(f'    1) 맞다고 확신하면:  python3 scripts/finalize_map.py {name} --force')
-        print(f'    2) 값을 직접 입력:   python3 scripts/bake_map_origin.py '
-              f'maps/{name}.yaml --tf <x> <y> <yaw>')
+        print_recovery_options(name)
         return 1
 
     if align_src is None:          # --force 인 경우 최신 것으로 진행
@@ -324,10 +350,7 @@ def main():
         print('     다른 매핑 세션의 기록일 가능성이 있다.')
         print('     (정상 절차라면 align 직후 맵을 저장하므로 몇 분 이내여야 한다)')
         print()
-        print('  아무 파일도 고치지 않았다. 아래 중 하나를 선택할 것:')
-        print(f'    1) 맞다고 확신하면:  python3 scripts/finalize_map.py {name} --force')
-        print(f'    2) 값을 직접 입력:   python3 scripts/bake_map_origin.py '
-              f'maps/{name}.yaml --tf <x> <y> <yaw>')
+        print_recovery_options(name)
         print()
         print('  판단 근거: 아래 값이 매핑 때 본 tf2_echo map slam_map 과 같은지 확인')
         print('  ' + '-' * 56)
@@ -478,8 +501,14 @@ def main():
         print('    python3 scripts/check_patrol_space.py --obstacle 0.127 0.127')
     print()
     print('  ⚠️  방금 만든 파일은 src/ 에만 있다. navigation.launch.py 로 켜기 전에:')
-    print('        cd ~/smart-shipyard/edge/ros2_ws && colcon build --symlink-install')
+    print('        cd ~/smart-shipyard/edge/ros2_ws && \\')
+    print('          colcon build --symlink-install --packages-select ship_ugv_navigation')
     print('      안 하면 install/ 에 안 복사돼서 "맵을 못 찾는다" 에러가 난다.')
+    print()
+    print('      source 는 Nav2 를 띄울 터미널에서만 하면 된다:')
+    print('        source ~/smart-shipyard/edge/ros2_ws/install/setup.bash')
+    print('      (심볼릭 링크 install 이라, 기존 패키지에 파일만 추가된 이번 같은')
+    print('       경우엔 사실 다시 안 해도 된다. 새 패키지를 만들었을 때만 필수다)')
     print('=' * 60)
     # 0 / 2 는 사용 가능이므로 성공으로 취급
     return 0 if r.returncode in (0, 2) else 1
