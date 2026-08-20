@@ -57,7 +57,6 @@ class ShipPosePublisher(Node):
                          reliability=QoSReliabilityPolicy.RELIABLE)
         self.pub = self.create_publisher(String, '/ship_survey/pose', qos)
 
-        self._confirmed = False
         self.data = self._load()
         if self.data:
             self.pub.publish(String(data=json.dumps(self.data['payload'])))
@@ -85,14 +84,16 @@ class ShipPosePublisher(Node):
         }
 
     def _remind(self):
-        """전달이 확인되면 한 번만 알리고 조용해진다. 문제가 있을 때만 계속 짖는다.
+        """지금 어떤 배 위치가 서버에 올라가 있는지 5초마다 상기시킨다.
 
-        발행 자체는 시작할 때 딱 한 번이다(latch 라 나중에 붙는 구독자도
-        그 값을 받아간다). 그래서 5초마다 "보냈습니다" 를 반복하는 것은
-        사실과도 안 맞고 화면만 시끄럽다.
+        전송 자체는 시작할 때 **딱 한 번**이다. latch(TRANSIENT_LOCAL) 라
+        나중에 붙는 구독자도 그 값을 받아간다. 이 로그는 재전송이 아니라
+        확인용이다 — 그 점을 문구에 적어 오해를 없앤다.
 
-        다만 **못 간 경우**는 계속 알려야 한다. 조용히 넘어가면 프론트엔드
-        화면에 배 위치가 없는 채로 시연에 들어가게 된다. 실제로 이 경고가
+        계속 찍는 이유: 이 값이 틀리면 마스크와 관제화면이 같이 틀어지는데
+        조용하면 언제 잰 값인지 모른 채 지나간다. 화면에 늘 보이면
+        "아, 저 값이 올라가 있구나" 하고 안심할 수 있다.
+        못 간 경우도 마찬가지로 계속 알린다 — 실제로 이 경고가
         websocket_client 가 죽어 있는 것을 잡아냈다(2026-08-20).
         """
         if self.data is None:
@@ -104,15 +105,12 @@ class ShipPosePublisher(Node):
 
         d = self.data
         if self.pub.get_subscription_count():
-            if not self._confirmed:
-                self._confirmed = True
-                self.get_logger().info(
-                    f"✅ {d['when']} 에 측정한 배 중심 "
-                    f"(X={d['x']:+.3f}, Y={d['y']:+.3f}) 을 서버로 보냈습니다")
+            self.get_logger().info(
+                f"✅ {d['when']} 에 측정한 배 중심 "
+                f"(X={d['x']:+.3f}, Y={d['y']:+.3f}) 을 서버로 보냈습니다 "
+                f"— 딱 한 번 전송했을 뿐, 로그는 확인용입니다")
             return
 
-        # 받는 노드가 사라지면 다시 경고하고, 돌아오면 다시 한 번 알린다.
-        self._confirmed = False
         self.get_logger().warn(
             f"⚠️ {d['when']} 측정값을 발행했지만 받는 노드가 없다 — "
             'websocket_client 가 떠 있나?')
