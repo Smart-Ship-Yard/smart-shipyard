@@ -42,6 +42,11 @@ CAM_OFFSET_X = 0.135      # base_link 앞으로
 CAM_OFFSET_Y = -0.089     # 오른쪽 (차체 반폭)
 CAM_YAW_DEG = -90.0       # 카메라가 로봇 오른쪽을 본다
 SHIP_THICKNESS = 0.17     # 줄자 실측. 짧은 변
+SHIP_LENGTH = 0.80        # 줄자 실측. 긴 변
+HFOV_DEG = 74.0           # Astra+ RGB 수평화각 (change_point.py 와 같은 값)
+MAX_SPREAD_M = 0.05       # 거리 중앙값 대비 퍼짐 한계
+MIN_SAMPLES = 5           # 이보다 적으면 중앙값을 믿을 수 없다
+EDGE_MARGIN_M = 0.05      # 배 끝과 화면 끝 사이에 최소 이만큼
 DET_TOPIC = '/event_detection/uvd'
 
 # 측정 결과를 여기에 남긴다. finalize_map.py 와 publish_ship_pose.py 가 읽는다.
@@ -105,6 +110,47 @@ def surface_to_center(x_cam, z_cam, half_thick,
     return bx + half_thick * c, by + half_thick * s
 
 
+def fit_margin(z, x_cam, ship_len=SHIP_LENGTH, hfov_deg=HFOV_DEG):
+    """배 끝과 화면 끝 사이에 남은 여유(m). 음수면 배가 잘려 보인다.
+
+    왜 중요한가: 뎁스를 bbox 중앙 1/4 에서 읽으므로, 배가 화면에서 잘리면
+    그 bbox 중심이 "배 중심" 이 아니라 "보이는 부분의 중심" 이 된다.
+    그 차이가 그대로 좌표 오차가 되고, 마스크와 프론트 화면이 같이 틀어진다.
+
+        거리 z 에서 화면 가로 반폭 = z * tan(hfov/2)
+        여유 = 반폭 - 배 반길이 - |중심이 치우친 거리|
+    """
+    half_frame = z * math.tan(math.radians(hfov_deg / 2.0))
+    return half_frame - ship_len / 2.0 - abs(x_cam)
+
+
+def check_measurement(samples, x_cam, z_cam, spread):
+    """측정을 믿을 수 있는지 본다. 문제 목록을 돌려준다(빈 목록이면 통과).
+
+    잘못된 값을 저장하는 것이 아무것도 저장하지 않는 것보다 나쁘다.
+    옛 값이 남아 조용히 쓰이면 매핑과 캘리브레이션을 통째로 다시 해야 한다.
+    """
+    bad = []
+    if len(samples) < MIN_SAMPLES:
+        bad.append(f'검출이 {len(samples)}개뿐이다 (최소 {MIN_SAMPLES}개). '
+                   f'배가 화면에 제대로 안 잡혔다')
+    if spread > MAX_SPREAD_M:
+        bad.append(f'거리가 {spread * 100:.1f} cm 나 흔들렸다 '
+                   f'(한계 {MAX_SPREAD_M * 100:.0f} cm). 로봇이나 배가 움직였다')
+    m = fit_margin(z_cam, x_cam)
+    if m < EDGE_MARGIN_M:
+        if m < 0:
+            bad.append(f'배가 화면에서 잘려 보인다 ({-m * 100:.0f} cm 초과). '
+                       f'뒤로 물러나거나 앞뒤로 밀어 중앙에 맞출 것')
+        else:
+            bad.append(f'배 끝과 화면 끝 사이가 {m * 100:.0f} cm 뿐이다 '
+                       f'(최소 {EDGE_MARGIN_M * 100:.0f} cm). 조금 더 물러날 것')
+        need = (SHIP_LENGTH / 2.0 + abs(x_cam) + EDGE_MARGIN_M) / math.tan(
+            math.radians(HFOV_DEG / 2.0))
+        bad.append(f'   → 지금 거리 {z_cam:.2f} m, 필요한 거리 {need:.2f} m 이상')
+    return bad
+
+
 def self_check():
     """카메라가 정면(오른쪽) 0.5 m 앞의 표면을 봤을 때를 손으로 계산해 맞춘다."""
     # x_cam=0(화면 중앙), z_cam=0.5(전방 0.5m) -> 카메라 시선은 -y
@@ -114,7 +160,41 @@ def self_check():
     # 화면 오른쪽으로 0.1 m 치우친 점이면 base_link 기준 뒤쪽(-x)으로 간다
     x2, _ = surface_to_center(0.1, 0.5, 0.0)
     assert abs(x2 - (0.135 - 0.1)) < 1e-9, x2
+
+    # 0.53 m 에서 0.80 m 배는 화면을 정확히 꽉 채운다 -> 여유 0
+    assert abs(fit_margin(0.5308, 0.0)) < 0.001, fit_margin(0.5308, 0.0)
+    # 0.88 m 면 양쪽에 26 cm 씩 남는다
+    assert 0.25 < fit_margin(0.88, 0.0) < 0.27, fit_margin(0.88, 0.0)
+    # 너무 가까우면 잘린다 -> 문제로 잡혀야 한다
+    assert check_measurement([0] * 30, 0.0, 0.40, 0.01), '가까운데 통과했다'
+    # 적당한 거리·안정된 측정은 통과해야 한다
+    assert not check_measurement([0] * 30, 0.02, 0.88, 0.01), '정상인데 막혔다'
     print('  self-check 통과')
+
+
+def warn_stale(reason):
+    """측정에 실패했을 때 옛 값이 남아 있으면 반드시 알린다.
+
+    실패했는데 조용히 끝나면, finalize_map 이 옛 값을 그대로 써서
+    마스크와 프론트 화면이 엉뚱한 곳을 가리킨다. 그때는 매핑과
+    캘리브레이션을 통째로 다시 해야 한다. 초장에 잡아야 하는 이유다.
+    """
+    got = load_measured()
+    print()
+    print('  ' + '━' * 58)
+    print(f'  ⛔ 측정 실패 — 저장하지 않았다 ({reason})')
+    if got is None:
+        print('     저장된 값도 없다. 다시 재기 전에는 finalize_map 이 멈춘다.')
+    else:
+        mx, my, meta = got
+        print(f'     ⚠️ 옛 측정값이 그대로 남아 있다:  X = {mx:+.3f}  Y = {my:+.3f}')
+        print(f'        {measured_age_text(meta)}')
+        print('        지금 이대로 finalize_map 을 돌리면 **이 옛 값이 쓰인다.**')
+        print('        배나 로봇을 옮겼다면 마스크와 프론트 화면이 같이 틀어진다.')
+        print()
+        print('     다시 재거나, 못 믿겠으면 지울 것:')
+        print('        python3 scripts/measure_ship_center.py --clear')
+    print('  ' + '━' * 58)
 
 
 def main():
@@ -127,10 +207,25 @@ def main():
     ap.add_argument('--use-tf', action='store_true',
                     help='캘리브레이션 뒤에 잴 때. map<-base_link 로 변환한다')
     ap.add_argument('--self-check', action='store_true', help='계산만 검증하고 끝')
+    ap.add_argument('--clear', action='store_true',
+                    help='저장된 측정값을 지운다 (못 믿을 때)')
+    ap.add_argument('--force', action='store_true',
+                    help='검사에 걸려도 저장한다 (권하지 않는다)')
     a = ap.parse_args()
 
     if a.self_check:
         self_check()
+        return 0
+
+    if a.clear:
+        got = load_measured()
+        if got is None:
+            print(f'  지울 것이 없다: {MEASURED_PATH}')
+        else:
+            os.remove(MEASURED_PATH)
+            print(f'  지웠다: X = {got[0]:+.3f}  Y = {got[1]:+.3f} '
+                  f'({measured_age_text(got[2])})')
+            print('  이제 finalize_map 은 새로 재기 전까지 멈춘다.')
         return 0
 
     import rclpy
@@ -164,6 +259,7 @@ def main():
         print(f'     · YOLO 가 떠 있나:  systemctl is-active yolo-depth-publisher')
         print(f'     · 배가 카메라(로봇 오른쪽) 화면에 들어와 있나')
         print(f'     · 클래스 접두사가 맞나 (지금 "{a.class_prefix}")')
+        warn_stale('배를 하나도 못 봤다')
         node.destroy_node(); rclpy.shutdown()
         return 1
 
@@ -176,11 +272,19 @@ def main():
 
     print(f'  검출 {len(samples)}개 ({cls}), 거리 중앙값 {z_cam:.3f} m '
           f'(퍼짐 {spread * 100:.1f} cm)')
-    if spread > 0.05:
-        print('  ⚠️ 거리 퍼짐이 5 cm 를 넘는다 — 로봇이나 배가 흔들렸을 수 있다')
-    if abs(x_cam) > 0.10:
-        print(f'  ⚠️ 배가 화면 중앙에서 {abs(x_cam) * 100:.0f} cm 치우쳐 있다 '
-              f'— 앞뒤로 밀어 중앙에 맞추면 더 정확하다')
+    problems = check_measurement(samples, x_cam, z_cam, spread)
+    if problems:
+        print()
+        for msg in problems:
+            print(f'  ✗ {msg}')
+        if not a.force:
+            warn_stale('위 문제 때문')
+            print()
+            print('  고쳐서 다시 재는 것이 맞다. 그래도 저장하려면 --force')
+            node.destroy_node(); rclpy.shutdown()
+            return 1
+        print()
+        print('  ⚠️ --force 라 문제를 무시하고 저장한다')
 
     if a.use_tf:
         import tf2_ros
