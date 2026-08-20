@@ -40,6 +40,22 @@ import shutil
 import subprocess
 import sys
 
+# ==========================================================================
+#  순찰 대상(모형 배)의 실측 크기 — 줄자로 잰 값이다
+# ==========================================================================
+#  ★ 측량(ship_survey_node)이 내는 size_xy 를 쓰지 않는 이유 (2026-08-19 실측)
+#     같은 배를 네 번 재서 0.115 / 0.589 / 0.699 / 2.560 m 가 나왔다.
+#     검출 하나가 배 표면 윤곽이 아니라 **배 중심 한 점**을 주기 때문에,
+#     size_xy 는 크기가 아니라 "점들이 얼마나 퍼졌나"(=위치 오차)를 잰다.
+#     정지 상태면 안 퍼져서 작게, 주행 중이면 퍼져서 크게 나온다.
+#     구조적인 문제라 튜닝으로는 못 고친다.
+#
+#  그래서 **크기는 실측 상수를 쓰고, 측량에서는 중심만 가져온다.**
+#  배가 바뀌면 이 값만 고치면 된다. --ship-size 로 덮어쓸 수도 있다.
+SHIP_SIZE_XY = (0.80, 0.17)    # m — 5단계 조립 완성형 모형 배
+SHIP_MASK_PAD = 0.10           # m — 사방 여유. 측량 중심 오차를 흡수한다
+                               #     -> 마스크 1.00 x 0.37 m
+
 PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(PKG_ROOT, 'scripts')
 
@@ -183,7 +199,8 @@ def main():
                          '여럿이라 자동 선택이 틀렸을 때 쓴다. 정확히 찍을 필요 없다 '
                          '— 가장 가까운 장애물을 지목한 것으로 보고 그 무게중심을 쓴다')
     ap.add_argument('--mask-pad', type=float, metavar='M',
-                    help='마스크를 대상 외곽에서 이만큼 더 부풀린다(m). 기본 0.05. '
+                    default=SHIP_MASK_PAD,
+                    help=f'마스크를 대상 외곽에서 이만큼 더 부풀린다(m). 기본 {SHIP_MASK_PAD}. '
                          '측량 중심에 오차가 있을 때 그만큼 키워 덮는 용도다. '
                          '예: 배 실측 0.80 x 0.17 m 에 사방 0.10 m 를 주면 '
                          '마스크가 1.00 x 0.37 m 가 된다. '
@@ -197,6 +214,7 @@ def main():
                          '(정지 상태 실측 흔들림 0.05도). '
                          '측량 기록이 있으면 그쪽 yaw 가 자동으로 쓰이므로 불필요하다.')
     ap.add_argument('--ship-size', nargs=2, type=float, metavar=('W', 'H'),
+                    default=list(SHIP_SIZE_XY),
                     help='순찰 대상의 크기(m). keepout 마스크를 그리는 데 쓴다. '
                          '대상이 라이다에 안 잡혀(모형 배 등) 맵에서 크기를 '
                          '알 수 없을 때 --center 와 함께 준다. 측량 기록에 '
@@ -390,9 +408,23 @@ def main():
         print(f'  순찰 중심: 측량 기록에서 가져옴 ({cx:.3f}, {cy:.3f})')
         size = a.ship_size or survey['size']
         if size:
+            # ★ 방향도 --ship-yaw 가 있으면 그쪽이 이긴다 (2026-08-19).
+            #   측량 yaw 는 점 뭉치에 사각형을 맞춘 값이라, 점이 안 퍼지면
+            #   (정지 측량) 11 cm 뭉치에서 나온 무의미한 각도가 된다.
+            #   실측: 측량 85.7도 vs 로봇을 배와 나란히 세워 잰 -15.2도.
+            use_yaw = (math.radians(a.ship_yaw_deg)
+                       if a.ship_yaw_deg is not None else survey['yaw'])
             cmd += ['--mask-size', str(size[0]), str(size[1]),
-                    '--mask-yaw', str(survey['yaw'])]
-            src_label = '--ship-size' if a.ship_size else '측량 기록'
+                    '--mask-yaw', str(use_yaw)]
+            if a.ship_yaw_deg is not None:
+                print(f'  대상 방향: --ship-yaw {a.ship_yaw_deg:.2f}도 '
+                      f'(측량값 {math.degrees(survey["yaw"]):.1f}도 대신)')
+            else:
+                print(f'  대상 방향: 측량 기록 '
+                      f'{math.degrees(survey["yaw"]):.1f}도 '
+                      f'— 길쭉한 대상이면 --ship-yaw 로 실측값을 줄 것')
+            src_label = ('--ship-size' if a.ship_size != list(SHIP_SIZE_XY)
+                         else f'실측 상수 SHIP_SIZE_XY')
             print(f'  대상 크기: {src_label} {size[0]:.2f} x {size[1]:.2f} m')
             if a.mask_pad is not None:
                 cmd += ['--mask-pad', str(a.mask_pad)]
