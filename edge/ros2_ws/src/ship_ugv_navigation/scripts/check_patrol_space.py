@@ -94,20 +94,11 @@ def required_space(obs_x, obs_y, margin=DEFAULT_MARGIN):
 # ======================================================================
 # 맵 로딩
 # ======================================================================
-def load_map(yaml_path):
-    meta = {}
-    with open(yaml_path) as f:
-        for line in f:
-            line = line.split('#')[0].strip()
-            if ':' not in line:
-                continue
-            k, v = line.split(':', 1)
-            meta[k.strip()] = v.strip()
+def read_pgm(pgm_path):
+    """P5 PGM 을 (폭, 높이, 픽셀 bytearray) 로 읽는다. 주석 줄을 건너뛴다.
 
-    res = float(meta['resolution'])
-    origin = [float(x) for x in meta['origin'].strip('[]').split(',')]
-    pgm_path = os.path.join(os.path.dirname(os.path.abspath(yaml_path)), meta['image'])
-
+    bake_map_origin.py 도 이 함수를 쓴다 (맵 회전을 픽셀에 굽기 위해).
+    """
     d = open(pgm_path, 'rb').read()
     parts, i = [], 0
     while len(parts) < 4:                     # P5 / width / height / maxval
@@ -123,7 +114,24 @@ def load_map(yaml_path):
         parts.append(d[s:i])
     i += 1
     w, h = int(parts[1]), int(parts[2])
-    px = d[i:i + w * h]
+    return w, h, bytearray(d[i:i + w * h])
+
+
+def load_map(yaml_path):
+    meta = {}
+    with open(yaml_path) as f:
+        for line in f:
+            line = line.split('#')[0].strip()
+            if ':' not in line:
+                continue
+            k, v = line.split(':', 1)
+            meta[k.strip()] = v.strip()
+
+    res = float(meta['resolution'])
+    origin = [float(x) for x in meta['origin'].strip('[]').split(',')]
+    pgm_path = os.path.join(os.path.dirname(os.path.abspath(yaml_path)), meta['image'])
+
+    w, h, px = read_pgm(pgm_path)
 
     free = [[px[r * w + c] == FREE for c in range(w)] for r in range(h)]
     return {'w': w, 'h': h, 'res': res, 'ox': origin[0], 'oy': origin[1],
@@ -579,6 +587,17 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
             print('     지정한 좌표를 그대로 순찰 중심으로 쓰고, 마스크는 만들지 않는다')
     print()
 
+    # ★ 마스크를 여기서 먼저 만든다 (2026-08-20).
+    #   예전에는 "완주 가능한 반지름을 찾았을 때"에만 만들었다. 그래서 순찰이
+    #   불가능한 맵에서는 마스크가 아예 안 나왔고, 그 상태로 Nav2 를 켜면
+    #   launch 가 "마스크 없음"으로 판단해 **배를 밟고 지나간다.**
+    #   마스크는 대상이 어디 있느냐의 문제일 뿐, 순찰이 되느냐와 무관하다.
+    map_name = os.path.splitext(os.path.basename(yaml_path))[0]
+    if emit_mask and bbox is not None:
+        emit_keepout_mask(emit_mask, m, bbox, map_name,
+                          rect=mask_rect, pad_m=mask_pad)
+        print()
+
     good = []       # 완주 + 여유 충분
     passable = []   # 완주는 되나 여유 부족
     r = 0.20
@@ -629,12 +648,9 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
         print(f'   권장: {best[0]:.2f} m (여유 {best[1]:.3f} m)')
         print()
         if emit_patrol:
-            map_name = os.path.splitext(os.path.basename(yaml_path))[0]
             emit_patrol_yaml(emit_patrol, map_name, cx, cy, best[0], best[1], tight)
             if emit_mask:
                 if bbox is not None:
-                    emit_keepout_mask(emit_mask, m, bbox, map_name,
-                                      rect=mask_rect, pad_m=mask_pad)
                     # 마스크는 대상 외곽에 MASK_PAD 만큼 더 부풀린다. 좁은 맵에서는
                     # 그 여유가 순찰 여유를 거의 다 먹어 경로가 금지영역에 닿는다.
                     # 조용히 두면 "왜 갑자기 경로가 안 나오지" 로 헤매게 된다.

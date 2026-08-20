@@ -27,6 +27,11 @@ setup(
             glob('maps/*.yaml') + glob('maps/*.pgm')),
         # keepout 마스크. finalize_map.py 가 맵마다 만들며, 없을 수도 있다
         # (라이다에 잡히는 대상만 있는 맵). glob 이 빈 목록이어도 문제없다.
+        # 캘리브레이션 기록. 전원이 나가면 노드 메모리의 map<-uwb_frame 이
+        # 날아가는데, 이 파일을 불러오면 되살릴 수 있다(재매핑 불필요).
+        #   ros2 launch ship_ugv_localization localization.launch.py calib:=<맵이름>
+        (os.path.join('share', package_name, 'maps', 'calibration_records'),
+            glob('maps/calibration_records/*.json')),
         (os.path.join('share', package_name, 'masks'),
             glob('masks/*.yaml') + glob('masks/*.pgm')),
         (os.path.join('share', package_name, 'worlds'), glob('worlds/*.world')),

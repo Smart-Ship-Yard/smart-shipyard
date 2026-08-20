@@ -74,6 +74,14 @@ class UwbMapCalibration(Node):
         self.declare_parameter('max_collection_timeout_s', 30.0)
         self.declare_parameter('known_heading_in_map_rad', 0.0)  # 로봇이 직진한 방향 (map 기준, 보통 +x = 0)
         self.declare_parameter('result_save_dir', '/tmp/uwb_calibration_results')
+        # ★ 2026-08-20 신설. 지난 캘리브레이션 결과를 그대로 되살린다.
+        #   map<-uwb_frame 은 **방에 고정된 값**이다. UWB 앵커가 벽에 붙어 있고
+        #   map 원점도 한 번 정하면 안 움직이므로, 로봇이 어디 있든 같은 값이다.
+        #   그런데 이 값이 노드 메모리에만 있어서, 배터리가 나가면(모터와 젯슨이
+        #   배터리 하나를 같이 쓴다) 같이 날아갔다. 그러면 그 map 좌표계로 만든
+        #   맵까지 통째로 못 쓰게 되어 매핑을 처음부터 다시 해야 했다.
+        #   -> 저장해둔 json 을 불러오면 맵을 그대로 다시 쓸 수 있다.
+        self.declare_parameter('load_calibration_file', '')
 
         self.map_frame_id = self.get_parameter('map_frame_id').value
         self.uwb_frame_id = self.get_parameter('uwb_frame_id').value
@@ -94,6 +102,8 @@ class UwbMapCalibration(Node):
         self.theta = 0.0
         self.tx = 0.0
         self.ty = 0.0
+        self.loaded_from = None
+        self._load_calibration(self.get_parameter('load_calibration_file').value)
 
         # ---- 통신 ----
         self.create_subscription(
@@ -115,6 +125,46 @@ class UwbMapCalibration(Node):
             f"직진시키세요 (최소 {self.min_travel}m 이동 시 자동 종료, "
             f"최대 {self.max_collection_timeout}초 타임아웃)."
         )
+
+    # ------------------------------------------------------------------
+    def _load_calibration(self, path: str) -> bool:
+        """저장해둔 캘리브레이션 결과를 그대로 되살린다.
+
+        되살릴 수 있는 이유는 map<-uwb_frame 이 방에 고정된 값이기 때문이다.
+        로봇의 현재 위치와 무관하므로, 전원이 나간 뒤 아무 데서나 켜도 된다.
+        불러오기가 실패하면 항등변환으로 두고 평소대로 서비스를 기다린다
+        (여기서 노드를 죽이면 TF tree 가 끊겨 더 나쁘다).
+        """
+        if not path:
+            return False
+        if not os.path.exists(path):
+            self.get_logger().error(
+                f"load_calibration_file 이 가리키는 파일이 없다: {path} — "
+                "평소대로 '~/calibrate' 서비스로 새로 재야 한다")
+            return False
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            self.theta = float(d['published_tf_theta_rad'])
+            self.tx = float(d['published_tf_tx'])
+            self.ty = float(d['published_tf_ty'])
+        except (OSError, ValueError, KeyError) as e:
+            self.get_logger().error(
+                f"캘리브레이션 파일을 못 읽었다 ({path}): {e} — "
+                "평소대로 '~/calibrate' 서비스로 새로 재야 한다")
+            self.theta = self.tx = self.ty = 0.0
+            return False
+
+        self.loaded_from = path
+        self.state = CalibState.DONE
+        self.get_logger().info(
+            f"저장된 캘리브레이션을 불러왔다: {os.path.basename(path)}  "
+            f"tx={self.tx:.4f} ty={self.ty:.4f} "
+            f"theta={math.degrees(self.theta):.2f}deg")
+        self.get_logger().info(
+            "   이 맵으로 바로 주행할 수 있다. 1.5m 주행 캘리브레이션은 안 해도 된다. "
+            "(UWB 앵커를 옮겼거나 새로 매핑할 때만 다시 잰다)")
+        return True
 
     # ------------------------------------------------------------------
     def _load_last_index(self) -> int:

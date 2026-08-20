@@ -11,6 +11,7 @@ ship_ugv_localization/launch/localization.launch.py
 """
 
 import os
+import sys
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -38,11 +39,31 @@ def generate_launch_description():
         }],
     )
 
+    # ---- 저장된 캘리브레이션 되살리기 (2026-08-20 신설) ----
+    #   ros2 launch ship_ugv_localization localization.launch.py calib:=shipyard_map_hall_v3
+    #
+    #   map<-uwb_frame 은 방에 고정된 값이다(UWB 앵커가 벽에 붙어 있다).
+    #   그런데 노드 메모리에만 있어서, 배터리가 나가면 — 모터와 젯슨이 배터리
+    #   하나를 같이 쓴다 — 같이 날아가고, 그 좌표계로 만든 맵까지 통째로
+    #   못 쓰게 되어 매핑을 처음부터 다시 해야 했다. 불러오면 그럴 필요가 없다.
+    #
+    #   이 런치 파일은 OpaqueFunction 없이 즉시 조립하는 방식이라
+    #   LaunchConfiguration 을 여기서 풀 수 없다. 그래서 argv 를 직접 본다.
+    #   (사람이 직접 실행하는 파일이고, 다른 런치가 include 하지 않는다)
+    calib_arg = next((a.split(':=', 1)[1] for a in sys.argv
+                      if a.startswith('calib:=')), '')
+    calib_file = ''
+    if calib_arg:
+        calib_file = calib_arg if calib_arg.endswith('.json') else os.path.join(
+            get_package_share_directory('ship_ugv_navigation'),
+            'maps', 'calibration_records', f'calib_{calib_arg}.json')
+
     uwb_calibration_node = Node(
         package='uwb_map_calibration',
         executable='calibration_node',
         name='uwb_map_calibration',
         output='screen',
+        parameters=[{'load_calibration_file': calib_file}],
     )
 
     heading_filter_node = Node(
