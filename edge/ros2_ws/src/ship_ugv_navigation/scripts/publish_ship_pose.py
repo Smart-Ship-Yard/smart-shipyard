@@ -10,7 +10,7 @@
 mapXYToShipLocalMeters). 그래서 배 pose 하나가 틀리면 화면 전체가 틀어진다.
 
 YOLO 측량(ship_survey_node)이 이 값을 만들었는데 못 쓸 정도로 부정확했다
-(실측 0.80 x 0.17 m 인 배를 1.68 x 0.35 m 로 쟀다). 그래서 사람이 재서 넣는다.
+(실측 0.77 x 0.14 m 인 배를 1.68 x 0.35 m 로 쟀다). 그래서 사람이 재서 넣는다.
 
 경로: 이 스크립트 -> /ship_survey/pose -> websocket_client -> 백엔드
       -> MongoDB 저장 + 프론트 브로드캐스트 -> /api/init-data 에도 반영

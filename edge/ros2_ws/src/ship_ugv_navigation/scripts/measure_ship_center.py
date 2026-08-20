@@ -6,14 +6,14 @@
 왜 이 방식인가
 --------------
 ship_survey_node 는 주행하며 여러 각도에서 표면점을 모아 사각형을 맞췄다.
-점 하나하나의 오차가 크기·방향으로 증폭돼서, 실측 0.80 x 0.17 m 인 배를
+점 하나하나의 오차가 크기·방향으로 증폭돼서, 실측 0.77 x 0.14 m 인 배를
 1.68 x 0.35 m 로 쟀다(2026-08-20). 원리상 안 되는 방식이었다.
 
 이 스크립트는 **모으지 않는다.** 정지 상태에서 뎁스를 몇 초 읽어 중앙값만
 쓴다. 깨졌던 것은 뎁스 센서가 아니라 누적·피팅 단계였다.
 
 방향(yaw)은 아예 재지 않는다. "로봇을 배와 나란히 세운다"는 약속이 곧
-yaw = 0 이다. 크기는 줄자 실측 상수(0.80 x 0.17)를 쓴다.
+yaw = 0 이다. 크기는 줄자 실측 상수(0.77 x 0.14)를 쓴다.
 
 놓는 법
 -------
@@ -41,8 +41,8 @@ import time
 CAM_OFFSET_X = 0.135      # base_link 앞으로
 CAM_OFFSET_Y = -0.089     # 오른쪽 (차체 반폭)
 CAM_YAW_DEG = -90.0       # 카메라가 로봇 오른쪽을 본다
-SHIP_THICKNESS = 0.17     # 줄자 실측. 짧은 변
-SHIP_LENGTH = 0.80        # 줄자 실측. 긴 변
+SHIP_THICKNESS = 0.14     # 줄자 실측 (2026-08-21 재측정, 0.17 -> 0.14). 짧은 변
+SHIP_LENGTH = 0.77        # 줄자 실측 (2026-08-21 재측정, 0.80 -> 0.77). 긴 변
 HFOV_DEG = 74.0           # Astra+ RGB 수평화각 (change_point.py 와 같은 값)
 MAX_SPREAD_M = 0.05       # 거리 중앙값 대비 퍼짐 한계
 MIN_SAMPLES = 5           # 이보다 적으면 중앙값을 믿을 수 없다
@@ -152,23 +152,34 @@ def check_measurement(samples, x_cam, z_cam, spread):
 
 
 def self_check():
-    """카메라가 정면(오른쪽) 0.5 m 앞의 표면을 봤을 때를 손으로 계산해 맞춘다."""
-    # x_cam=0(화면 중앙), z_cam=0.5(전방 0.5m) -> 카메라 시선은 -y
-    x, y = surface_to_center(0.0, 0.5, SHIP_THICKNESS / 2.0)
-    assert abs(x - 0.135) < 1e-9, x
-    assert abs(y - (-0.089 - 0.5 - 0.085)) < 1e-9, y
+    """계산을 손으로 따라간 값과 맞춘다.
+
+    숫자를 박아두지 않고 상수에서 유도한다. 박아두면 배 치수를 고칠 때
+    같이 안 고쳐서 조용히 썩는다 (2026-08-21 에 실제로 그랬다).
+    """
+    half = SHIP_THICKNESS / 2.0
+    # 카메라 정면(오른쪽) 0.5 m 앞의 표면. 시선이 -y 이므로 x 는 오프셋 그대로
+    x, y = surface_to_center(0.0, 0.5, half)
+    assert abs(x - CAM_OFFSET_X) < 1e-9, x
+    assert abs(y - (CAM_OFFSET_Y - 0.5 - half)) < 1e-9, y
+
     # 화면 오른쪽으로 0.1 m 치우친 점이면 base_link 기준 뒤쪽(-x)으로 간다
     x2, _ = surface_to_center(0.1, 0.5, 0.0)
-    assert abs(x2 - (0.135 - 0.1)) < 1e-9, x2
+    assert abs(x2 - (CAM_OFFSET_X - 0.1)) < 1e-9, x2
 
-    # 0.53 m 에서 0.80 m 배는 화면을 정확히 꽉 채운다 -> 여유 0
-    assert abs(fit_margin(0.5308, 0.0)) < 0.001, fit_margin(0.5308, 0.0)
-    # 0.88 m 면 양쪽에 26 cm 씩 남는다
-    assert 0.25 < fit_margin(0.88, 0.0) < 0.27, fit_margin(0.88, 0.0)
-    # 너무 가까우면 잘린다 -> 문제로 잡혀야 한다
-    assert check_measurement([0] * 30, 0.0, 0.40, 0.01), '가까운데 통과했다'
-    # 적당한 거리·안정된 측정은 통과해야 한다
-    assert not check_measurement([0] * 30, 0.02, 0.88, 0.01), '정상인데 막혔다'
+    # 배가 화면 가로를 정확히 꽉 채우는 거리에서는 여유가 0
+    z_full = SHIP_LENGTH / (2.0 * math.tan(math.radians(HFOV_DEG / 2.0)))
+    assert abs(fit_margin(z_full, 0.0)) < 1e-9, fit_margin(z_full, 0.0)
+    # 그보다 가까우면 잘린다 -> 문제로 잡혀야 한다
+    assert check_measurement([0] * 30, 0.0, z_full * 0.8, 0.01), '가까운데 통과했다'
+    # 권장 거리에서는 통과해야 한다
+    assert not check_measurement([0] * 30, 0.02, z_full * 1.7, 0.01), '정상인데 막혔다'
+    # 흔들림과 표본 부족도 잡아야 한다
+    assert check_measurement([0] * 30, 0.0, z_full * 1.7, 0.20), '흔들렸는데 통과했다'
+    assert check_measurement([0] * 2, 0.0, z_full * 1.7, 0.01), '표본 2개인데 통과했다'
+
+    print(f'  치수 {SHIP_LENGTH:.2f} x {SHIP_THICKNESS:.2f} m, '
+          f'꽉 차는 거리 {z_full:.2f} m, 권장 {z_full * 1.7:.2f} m')
     print('  self-check 통과')
 
 
