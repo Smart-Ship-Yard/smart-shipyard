@@ -33,7 +33,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from measure_ship_center import MEASURED_PATH, load_measured
+from measure_ship_center import (MEASURED_PATH, load_measured,
+                                 measured_age_text)
 
 import rclpy
 from rclpy.node import Node
@@ -68,8 +69,9 @@ def main():
             print('       python3 scripts/publish_ship_pose.py <X> <Y>')
             return 1
         a.x, a.y, meta = got
-        print(f'  저장된 측정값을 읽었다: config/{os.path.basename(MEASURED_PATH)}'
-              f"  (뎁스 {meta.get('depth_m', float('nan')):.3f} m, "
+        print(f'  저장된 측정값을 읽었다: config/{os.path.basename(MEASURED_PATH)}')
+        print(f"     {measured_age_text(meta)}  "
+              f"(뎁스 {meta.get('depth_m', float('nan')):.3f} m, "
               f"검출 {meta.get('samples', '?')}개)")
 
     payload = {

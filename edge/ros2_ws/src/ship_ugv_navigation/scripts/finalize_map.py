@@ -40,7 +40,8 @@ import shutil
 import sys as _sys
 
 _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from measure_ship_center import MEASURED_PATH, load_measured
+from measure_ship_center import (MEASURED_PATH, load_measured,
+                                 measured_age_text)
 
 
 def copy_record(src, dst):
@@ -465,8 +466,9 @@ def main():
         cx_used, cy_used = mx, my
         cmd += ['--center', str(mx), str(my)]
         print(f'  순찰 중심: 실측 기록에서 읽음 ({mx:.3f}, {my:.3f})')
-        print(f'             config/{os.path.basename(MEASURED_PATH)} '
-              f"— 뎁스 {meta.get('depth_m', float('nan')):.3f} m, "
+        print(f'             config/{os.path.basename(MEASURED_PATH)} — '
+              f"{measured_age_text(meta)}")
+        print(f"             뎁스 {meta.get('depth_m', float('nan')):.3f} m, "
               f"검출 {meta.get('samples', '?')}개")
         cmd += ['--mask-size', str(SHIP_SIZE_XY[0]), str(SHIP_SIZE_XY[1]),
                 '--mask-yaw', str(math.radians(a.ship_yaw_deg

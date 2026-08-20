@@ -62,6 +62,22 @@ def load_measured():
         return None
 
 
+def measured_age_text(meta):
+    """언제 잰 값인지 한 줄로. 재놓고 잊은 값을 그대로 쓰는 것을 막는다."""
+    ts = meta.get('timestamp')
+    if not ts:
+        return '측정 시각 모름'
+    age = time.time() - float(ts)
+    when = time.strftime('%m-%d %H:%M', time.localtime(ts))
+    if age < 90:
+        return f'{when} — 방금 잰 값'
+    if age < 3600:
+        return f'{when} — {age / 60:.0f}분 전'
+    if age < 86400:
+        return f'{when} — {age / 3600:.1f}시간 전  ⚠️ 그 사이 배나 로봇을 옮겼나?'
+    return f'{when} — {age / 86400:.0f}일 전  ⚠️ 오래된 값이다. 다시 재는 것을 권한다'
+
+
 def save_measured(x, y, extra):
     d = {'x': x, 'y': y, 'yaw_deg': 0.0, 'frame': 'map',
          'source': 'measure_ship_center.py', 'timestamp': time.time()}
