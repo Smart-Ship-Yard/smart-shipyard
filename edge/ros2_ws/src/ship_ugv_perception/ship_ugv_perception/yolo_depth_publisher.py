@@ -161,6 +161,8 @@ class YoloDepthPublisher(Node):
 
         # ★ 캡처 전담 스레드 시작 (카메라 최대 속도로 계속 실행)
         self._capture_stop = threading.Event()
+        self._latest_stamp = None
+        self._frame_stamp = None
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
 
@@ -239,12 +241,21 @@ class YoloDepthPublisher(Node):
                 with self._frame_lock:
                     self._latest_color = color_image
                     self._latest_depth = depth_image
+                    # ★ 이 프레임을 언제 찍었는지 남긴다 (2026-08-19).
+                    #   아래 _process_frame 이 YOLO 추론을 마친 뒤 검출을
+                    #   발행하는데, 그 사이 55~305 ms 가 걸린다. 소비자
+                    #   (ship_survey_node, change_point)가 "지금" 로봇 위치로
+                    #   좌표를 계산하면 그 시간만큼 로봇이 움직인 오차가
+                    #   그대로 실린다. 실측: 주행 중 측량이 같은 배를 네 번 재서
+                    #   중심이 최대 62 cm 흩어졌다(정지 시엔 오차 0).
+                    self._latest_stamp = self.get_clock().now().to_msg()
             except Exception as e:
                 self.get_logger().error(f"캡처 스레드 예외 (계속 재시도): {e}")
     def _get_latest_frame(self):
         with self._frame_lock:
             if self._latest_color is None or self._latest_depth is None:
                 return None, None
+            self._frame_stamp = getattr(self, '_latest_stamp', None)
             return self._latest_color.copy(), self._latest_depth.copy()
 
     # ------------------------------------------------------------------
@@ -362,11 +373,18 @@ class YoloDepthPublisher(Node):
                 )
 
             msg = String()
-            msg.data = json.dumps({
+            # ★ stamp = 이 검출이 나온 **사진을 찍은 시각** (발행 시각이 아니다).
+            #   소비자는 이 시각의 TF 를 조회해야 로봇 위치가 맞다.
+            st = getattr(self, '_frame_stamp', None)
+            payload = {
                 'u': u, 'v': v, 'depth': z_m,
                 'depth_xyz': [X, Y, z_m],
                 'class_id': class_name, 'confidence': conf,
-            })
+            }
+            if st is not None:
+                payload['stamp_sec'] = int(st.sec)
+                payload['stamp_nanosec'] = int(st.nanosec)
+            msg.data = json.dumps(payload)
             self.pub.publish(msg)
 
         self._encode_and_publish(self.annotated_image_pub, display_image)
