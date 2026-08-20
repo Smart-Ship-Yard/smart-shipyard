@@ -124,7 +124,14 @@ class WheelOdomBridge(Node):
         # ★ 폭주 감지기 (2026-08-17) — _check_runaway 주석 참고
         self.declare_parameter('runaway_guard_enabled', True)
         self.declare_parameter('runaway_grace_s', 0.4)        # 이 시간 이상 지속돼야 확정
-        self.declare_parameter('runaway_min_cmd_tps', 30)     # 이 미만 명령은 판정 제외
+        self.declare_parameter('runaway_min_cmd_tps', 30)     # 이 미만 '명령'은 판정 제외
+        #   실측이 이 미만이면 폭주로 보지 않는다. 명령 쪽 문턱(30)과 반드시
+        #   따로 두어야 한다 — 2026-08-20 오검출의 원인이 이 둘을 하나로 쓴 것이었다.
+        #   정상 최대 바퀴 속도: 0.35 m/s / (2pi*0.0308 m) * 330 틱 = 597 tps
+        #   실제 폭주 6회 실측:                              1250~1350 tps
+        #   700 은 그 사이. 정상 주행으로는 절대 못 넘고, 폭주는 항상 넘는다.
+        #   (부호 역전 고리는 PWM 이 포화할 때까지 스스로 가속하므로 중간값이 없다)
+        self.declare_parameter('runaway_min_meas_tps', 700)
         self.declare_parameter('heading_hold_max_error_rad', math.radians(30.0))
 
         self.declare_parameter('cmd_vel_timeout_s', 0.5)   # ROS 레벨 세이프티(중복 방어)
@@ -159,6 +166,7 @@ class WheelOdomBridge(Node):
         self.runaway_guard_enabled = self.get_parameter('runaway_guard_enabled').value
         self.runaway_grace_s = self.get_parameter('runaway_grace_s').value
         self.runaway_min_cmd_tps = self.get_parameter('runaway_min_cmd_tps').value
+        self.runaway_min_meas_tps = self.get_parameter('runaway_min_meas_tps').value
         self._runaway_latched = False
         self._runaway_since = None
         self.heading_hold_max_error = self.get_parameter('heading_hold_max_error_rad').value
@@ -546,7 +554,7 @@ class WheelOdomBridge(Node):
             # 명령이 유의미하고, 실제가 반대 방향으로 유의미하게 돌고 있으면 True
             return (abs(cmd) >= self.runaway_min_cmd_tps
                     and cmd * meas < 0
-                    and abs(meas) >= self.runaway_min_cmd_tps)
+                    and abs(meas) >= self.runaway_min_meas_tps)
 
         bad_l = is_wrong_way(cmd_l, meas_l)
         bad_r = is_wrong_way(cmd_r, meas_r)
