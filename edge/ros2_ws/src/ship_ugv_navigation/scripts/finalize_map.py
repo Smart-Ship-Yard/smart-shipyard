@@ -40,6 +40,7 @@ import shutil
 import sys as _sys
 
 _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bake_map_origin import BAKED_MARKER
 from measure_ship_center import (MEASURED_PATH, load_measured,
                                  measured_age_text)
 
@@ -307,6 +308,10 @@ def main():
                          '대상이 라이다에 안 잡혀(모형 배 등) 맵에서 크기를 '
                          '알 수 없을 때 --center 와 함께 준다. 측량 기록에 '
                          'size_xy 가 있으면 그것보다 이 값이 우선한다')
+    ap.add_argument('--radius', type=float, default=None, metavar='M',
+                    help='순찰 반지름을 직접 고른다 (m). 안 주면 여유가 가장 큰 값')
+    ap.add_argument('--max-radius', type=float, default=None, metavar='M',
+                    help='순찰 반지름을 여기까지만 훑는다 (기본 1.00 m)')
     ap.add_argument('--use-survey', action='store_true',
                     help='YOLO 측량이 낸 배 중심을 쓴다 (기본은 거부 — 부정확하다)')
     ap.add_argument('--no-mask', action='store_true',
@@ -338,14 +343,36 @@ def main():
         return 1
 
     # ---- 1. 기록 보존 ----
-    step(1, '정합·캘리브레이션 기록 보존')
+    # ★ 이미 보정된 맵이면 [1/4] 도 건너뛴다 (2026-08-21).
+    #   기록 보존은 처음 마무리할 때 이미 끝났다(maps/calibration_records/).
+    #   그런데 이 단계가 /tmp 의 정합 기록을 찾으므로, 며칠 뒤 반지름만
+    #   바꾸려고 다시 돌리면 "/tmp 에 정합 기록이 없다" 며 멈췄다.
+    #   /tmp 는 재부팅으로 비워지니 사실상 매번 막힌다.
+    already_baked = BAKED_MARKER in open(yaml_path).read()
+    survey = None
+    align_dst = None
+
+    if already_baked:
+        step(1, '정합·캘리브레이션 기록 보존 — 건너뜀')
+        print('  이미 마무리된 맵이다. 기록은 처음 마무리할 때 보존했다:')
+        for kind in ('align', 'calib', 'survey'):
+            got = os.path.join(records, f'{kind}_{name}.json')
+            if os.path.exists(got):
+                print(f'    {kind:7s} maps/calibration_records/{kind}_{name}.json')
+        print('  순찰 설정·마스크만 다시 만든다 (반지름을 바꿀 때 이 경로다).')
+
+    if not already_baked:
+        step(1, '정합·캘리브레이션 기록 보존')
     os.makedirs(records, exist_ok=True)
 
     pgm_mtime = os.path.getmtime(pgm_path)
     if a.align_file:
         if not os.path.exists(a.align_file):
             print(f'❌ 지정한 정합 기록이 없다: {a.align_file}')
-            return 1
+            if already_baked:
+                print('  (이미 마무리된 맵이라 무시하고 넘어간다)')
+            else:
+                return 1
         align_src, all_aligns = a.align_file, [a.align_file]
         print(f'  정합 기록을 직접 지정함: {a.align_file}')
     else:
@@ -358,7 +385,10 @@ def main():
         print('   ros2 service call /slam_map_alignment/align std_srvs/srv/Trigger')
         print()
         print('   이미 레포에 기록이 있다면 --align-dir 로 그 폴더를 지정해도 된다.')
-        return 1
+        if already_baked:
+            print('  (이미 마무리된 맵이라 무시하고 넘어간다)')
+        else:
+            return 1
 
     def show_candidates():
         print(f'  맵 저장 시각        {fmt_time(pgm_path)}  ({name}.pgm)')
@@ -377,7 +407,10 @@ def main():
         print('     (맵을 저장한 뒤에 align을 다시 호출했다면 정상일 수 있다)')
         print()
         print_recovery_options(name)
-        return 1
+        if already_baked:
+            print('  (이미 마무리된 맵이라 무시하고 넘어간다)')
+        else:
+            return 1
 
     if align_src is None:          # --force 인 경우 최신 것으로 진행
         align_src = all_aligns[-1]
@@ -399,7 +432,10 @@ def main():
         print('  ' + '-' * 56)
         for line in open(align_src).read().splitlines():
             print('  ' + line)
-        return 1
+        if already_baked:
+            print('  (이미 마무리된 맵이라 무시하고 넘어간다)')
+        else:
+            return 1
 
     if len(all_aligns) > 1:
         show_candidates()
@@ -423,12 +459,26 @@ def main():
 
     # ---- 2·3. origin 보정 + free_thresh 교정 ----
     step(2, 'origin 보정 (slam_map -> map) + free_thresh 교정')
-    r = subprocess.run(
-        [sys.executable, os.path.join(SCRIPTS, 'bake_map_origin.py'),
-         yaml_path, '--align', align_dst])
-    if r.returncode != 0:
-        print('\n❌ origin 보정 실패. 위 메시지를 확인할 것.')
-        return 1
+    # 이미 보정된 맵이면 [2/4] 를 건너뛴다 (2026-08-21).
+    #   반지름만 바꾸려고 다시 돌리는 경우가 있는데, 예전에는 여기서
+    #   "이미 보정된 맵이다" 로 멈춰서 [4/4] 가 아예 안 돌았다. 그래서
+    #   --radius 를 줘도 아무 일도 안 일어났다.
+    #   ※ 다시 굽는 것은 위험하다. 회전이 두 번 들어가 맵이 통째로 틀어진다.
+    #     되굽고 싶으면 .orig 로 되돌린 뒤 실행할 것.
+    if BAKED_MARKER in open(yaml_path).read():
+        print('  이미 보정된 맵이다 — origin·회전은 그대로 두고 넘어간다.')
+        print('  (순찰 설정·마스크만 다시 만든다. 반지름을 바꾸려면 이게 맞다)')
+        print('  다시 구우려면 원본으로 되돌린 뒤 실행할 것:')
+        base = os.path.splitext(yaml_path)[0]
+        print(f'        cp {base}.yaml.orig {base}.yaml')
+        print(f'        cp {base}.pgm.orig  {base}.pgm')
+    else:
+        r = subprocess.run(
+            [sys.executable, os.path.join(SCRIPTS, 'bake_map_origin.py'),
+             yaml_path, '--align', align_dst])
+        if r.returncode != 0:
+            print('\n❌ origin 보정 실패. 위 메시지를 확인할 것.')
+            return 1
 
     step(3, '보정 결과')
     print(open(yaml_path).read())
@@ -454,6 +504,11 @@ def main():
     cmd = [sys.executable, os.path.join(SCRIPTS, 'check_patrol_space.py'),
            '--map', yaml_path,
            '--emit-patrol', patrol_out]
+    if a.radius is not None:
+        cmd += ['--radius', str(a.radius)]
+    if a.max_radius is not None:
+        cmd += ['--max-radius', str(a.max_radius)]
+
     if a.no_mask:
         # 오래된 마스크가 남아 있으면 launch 가 그것을 켜 버린다. 같이 지운다.
         for p in (mask_out, os.path.splitext(mask_out)[0] + '.pgm'):

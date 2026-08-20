@@ -472,8 +472,35 @@ def rect_bbox(m, cx, cy, sx, sy, yaw):
             max(0, int(math.floor(min(cols)))), min(m['w'] - 1, int(math.ceil(max(cols)))))
 
 
+def _print_radius_howto(cands, best, map_name):
+    """다른 반지름으로 바꾸는 법을 그대로 복사해 쓸 수 있게 찍는다.
+
+    표에 ★ 가 여러 개인데 자동으로 하나가 골라지면, 나머지를 어떻게
+    쓰는지 알 길이 없다. 웨이포인트 개수가 반지름에 맞물려 계산되므로
+    patrol yaml 을 손으로 고치면 간격 규칙이 깨진다. 반드시 다시 만들어야 한다.
+    """
+    others = [c for c in cands if abs(c[0] - best[0]) > 0.001]
+    if not others:
+        return
+    print()
+    print('   다른 반지름으로 바꾸려면 — 아래를 그대로 복사해서 쓰면 된다:')
+    print()
+    print('     cd ~/smart-shipyard/edge/ros2_ws/src/ship_ugv_navigation')
+    print(f'     python3 scripts/finalize_map.py {map_name} --radius <반지름>')
+    print()
+    print('     고를 수 있는 값: '
+          + ', '.join(f'{c[0]:.2f}' for c in cands) + '  (m)')
+    print(f'     예)  python3 scripts/finalize_map.py {map_name} '
+          f'--radius {others[-1][0]:.2f}')
+    print()
+    print('   ※ patrol_*.yaml 을 손으로 고치지 말 것. 웨이포인트 개수가')
+    print('     반지름에 맞물려 계산되므로 반지름만 바꾸면 간격 규칙이 깨진다.')
+    print('   ※ 반지름을 바꿔도 맵과 마스크는 그대로다. 순찰 설정만 다시 쓴다.')
+
+
 def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
-                emit_mask=None, mask_size=None, mask_yaw=0.0, mask_pad=None):
+                emit_mask=None, mask_size=None, mask_yaw=0.0, mask_pad=None,
+                max_radius=1.00, pick_radius=None):
     mask_pad = MASK_PAD if mask_pad is None else mask_pad
     mask_rect = None   # (cx, cy, sx, sy, yaw) — 회전 사각형으로 칠할 때만 채워진다
     m = load_map(yaml_path)
@@ -564,8 +591,14 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
             # 실제로는 줄자로 재서 코드에 박아둔 상수다(2026-08-20 정정).
             print(f'  배 크기는 이미 알고 있다 — 사용자가 줄자로 재서 넣어둔 '
                   f'{mask_size[0]:.2f} x {mask_size[1]:.2f} m (yaw {math.degrees(mask_yaw):.0f}도)')
-            print('  같은 모형 배만 쓰므로 매번 같다. 측량이 잰 크기는 안 쓴다.')
-            print('  좌표도 지정값을 그대로 쓴다 (맵의 장애물로 스냅하지 않음)')
+            print('  같은 모형 배만 쓰므로 매번 같다.')
+            print('  중심 좌표는 measure_ship_center.py 로 실측한 값을 쓴다:')
+            print('    cd ~/smart-shipyard/edge/ros2_ws/src/ship_ugv_navigation')
+            print('    python3 scripts/measure_ship_center.py')
+            print('  (YOLO 로 배 표면점을 모아 중심을 추정하던 옛 측량법은 안 쓴다 —')
+            print('   같은 배를 1.68 x 0.35 m 로 재는 등 못 믿을 값이 나왔다)')
+            print('  맵에서 배를 찾아 그쪽으로 좌표를 옮기는 보정도 하지 않는다.')
+            print('  배가 라이다(21 cm)보다 낮아(19 cm) 맵에 아예 안 찍히기 때문이다.')
 
         # 크기를 못 받았으면 "어느 물체냐"를 고르는 용도로만 좌표를 쓴다.
         # 중심 좌표 자체는 그 물체의 픽셀 무게중심으로 바꾼다 — 사람이 눈대중으로
@@ -631,7 +664,13 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
     print(' 반지름 | 완주 | 최소여유 | 판정')
     print('--------+------+----------+---------------------------')
 
-    while r <= 1.60:
+    # 1.60 m 까지 무조건 훑던 것을 줄인다 (2026-08-21).
+    #   배가 0.77 m 로 고정이라 그보다 훨씬 큰 반지름은 쓸 일이 없고,
+    #   표가 20줄 넘게 나와 정작 볼 값이 묻힌다. 두 가지로 자른다.
+    #     · max_radius 까지만 (기본 1.00 m, --max-radius 로 변경)
+    #     · 한 번이라도 되던 것이 3연속 실패하면 거기서 끝 (경계만 보여준다)
+    fail_streak = 0
+    while r <= max_radius + 1e-9:
         bad, worst = check_circle(m, cx, cy, r)
         if bad == 0:
             passable.append((r, worst))
@@ -639,18 +678,34 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
             if worst >= margin:
                 good.append((r, worst))
             print(f'  {r:.2f}m |  OK  |  {worst:.3f}m | {verdict}')
+            fail_streak = 0
         else:
             print(f'  {r:.2f}m |  --  |  {worst:.3f}m | {bad}개 각도에서 충돌')
+            fail_streak += 1
+            if passable and fail_streak >= 3:
+                print('  (여기부터 계속 막힌다 — 더 안 본다)')
+                break
         r += 0.05
 
     def report(cands, radius_label, tight):
+        # 기본은 "여유가 가장 큰 것". 사람이 --radius 로 고르면 그것을 쓴다.
         best = max(cands, key=lambda t: t[1])
         lo, hi = cands[0][0], cands[-1][0]
         print(f'   {radius_label} {lo:.2f} ~ {hi:.2f} m')
         print(f'   권장: {best[0]:.2f} m (여유 {best[1]:.3f} m)')
+        if pick_radius is not None:
+            hit = min(cands, key=lambda t: abs(t[0] - pick_radius))
+            if abs(hit[0] - pick_radius) > 0.001:
+                print(f'   ⚠️ --radius {pick_radius:.2f} m 는 쓸 수 있는 값이 아니다 '
+                      f'— 가장 가까운 {hit[0]:.2f} m 로 간다')
+            else:
+                print(f'   ▶ --radius 로 {hit[0]:.2f} m 를 골랐다 '
+                      f'(여유 {hit[1]:.3f} m)')
+            best = hit
         print()
         if emit_patrol:
             emit_patrol_yaml(emit_patrol, map_name, cx, cy, best[0], best[1], tight)
+            _print_radius_howto(cands, best, map_name)
             if emit_mask:
                 if bbox is not None:
                     # 마스크는 대상 외곽에 MASK_PAD 만큼 더 부풀린다. 좁은 맵에서는
@@ -718,6 +773,11 @@ def main():
                     help='순찰 중심 map 좌표 (생략 시 자동 탐지)')
     ap.add_argument('--obstacle', nargs=2, type=float, metavar=('X', 'Y'),
                     help='중앙 물체 크기(m). 맵 없이 필요 공터만 계산')
+    ap.add_argument('--max-radius', type=float, default=1.00, metavar='M',
+                    help='순찰 반지름을 여기까지만 훑는다 (기본 1.00 m). '
+                         '배가 0.77 m 로 고정이라 그보다 큰 원은 쓸 일이 없다')
+    ap.add_argument('--radius', type=float, default=None, metavar='M',
+                    help='순찰 반지름을 직접 고른다. 안 주면 여유가 가장 큰 것을 쓴다')
     ap.add_argument('--margin', type=float, default=DEFAULT_MARGIN,
                     help=f'안전여유 m (기본 {DEFAULT_MARGIN})')
     ap.add_argument('--emit-patrol', metavar='PATH',
@@ -749,8 +809,9 @@ def main():
             print('❌ --mask-size 는 --center 와 함께 줘야 한다 '
                   '(어디에 그릴지 알 수 없음)')
             return 3
-        return analyze_map(a.map, a.center, a.margin, a.emit_patrol, a.emit_mask,
-                           a.mask_size, a.mask_yaw, a.mask_pad)
+        return analyze_map(a.map, a.center, a.margin, a.emit_patrol,
+                           a.emit_mask, a.mask_size, a.mask_yaw, a.mask_pad,
+                           max_radius=a.max_radius, pick_radius=a.radius)
     ap.print_help()
     return 3
 
