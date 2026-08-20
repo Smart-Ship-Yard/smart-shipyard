@@ -17,17 +17,38 @@ import * as THREE from "three";
  * ========================================================================== */
 
 /* ---------------------------------------------------------------------------
+ * -1. 실제 연동 스위치 — 여기 두 값만 바꾸면 가짜↔진짜가 전환된다.
+ *     서버 IP는 이정기님(백엔드)에게 물어봐서 채운다 (hostname -I 로 확인한 값).
+ * ------------------------------------------------------------------------- */
+const USE_REAL_BACKEND = true;   // false로 두면 예전처럼 2.2초마다 가짜 이벤트
+const USE_REAL_VIDEO = true;     // false로 두면 예전처럼 Canvas 가짜 CCTV
+const SERVER_HOST = "192.168.0.5:8000"; // ← 백엔드 서버 IP:포트로 교체 (예: 192.168.0.42:8000)
+const EVENT_WS_URL = `ws://${SERVER_HOST}/ws/frontend`;
+
+/* 영상은 두 가지 방식 중 고를 수 있다.
+ *   "direct" — 백엔드를 아예 거치지 않고, 브라우저가 카메라 컴퓨터에 바로 접속
+ *              (MJPEG HTTP 스트림, <img> 태그 하나로 끝남 — 제일 단순)
+ *   "relay"  — 백엔드가 중계 (/ws/jetson-stream → /ws/frontend-stream, JPEG 바이너리)
+ * 예전에 SSH로 테스트하셨던 "백엔드 안 거치고 바로 오는" 방식은 direct 쪽이다. */
+const VIDEO_MODE = "direct"; // "direct" | "relay" | (USE_REAL_VIDEO=false면 어차피 mock)
+// 젯슨에 이미 떠 있는 mediamtx가 카메라 영상을 WebRTC로 서빙해준다
+// (video_streamer.py가 ffmpeg로 mediamtx에 rtsp://127.0.0.1:8554/ugv1 로 송출 →
+//  mediamtx가 그걸 WebRTC 재생 페이지로도 자동 변환해줌). 그 페이지를 그대로 iframe으로 끼운다.
+const DIRECT_CAMERA_URL = "http://192.168.0.6:8889/ugv1"; // ← 젯슨 IP로 교체 (포트 8889 = mediamtx WebRTC)
+const VIDEO_WS_URL = `ws://${SERVER_HOST}/ws/frontend-stream`; // relay 모드일 때만 사용
+
+/* ---------------------------------------------------------------------------
  * 0. 도메인 상수 — 백엔드와 사전 합의한 인터페이스(좌표계 / 이벤트 스키마)
- *    탐지 클래스 8종: 계획서 9p 기준
+ *    탐지 클래스 4종: docs/interface.md v1.5 확정 기준
+ *    (helmet_off→no_helmet, ship_block→block_level 로 이름/구조가 바뀌었음)
  * ------------------------------------------------------------------------- */
 const SEVERITY = { DANGER: "danger", WARN: "warn", INFO: "info" };
 
 const CLASS_META = {
   fallen_person:  { label: "작업자 쓰러짐",  severity: SEVERITY.DANGER, group: "안전" },
   fire:           { label: "화재",          severity: SEVERITY.DANGER, group: "화재" },
-  helmet_off:     { label: "안전모 미착용",  severity: SEVERITY.WARN,   group: "안전" },
-  helmet_on:      { label: "안전모 착용",    severity: SEVERITY.INFO,   group: "안전" },
-  ship_block:     { label: "블록 탐지",      severity: SEVERITY.INFO,   group: "공정" },
+  no_helmet:      { label: "안전모 미착용",  severity: SEVERITY.WARN,   group: "안전" },
+  ship_defect:    { label: "선박 결함",      severity: SEVERITY.WARN,   group: "품질" },
 };
 
 const SEV_COLOR = {
@@ -91,11 +112,112 @@ function serverToWorld(blockId, local = { x: 0.5, y: 1, z: 0.5 }) {
 }
 
 /* ---------------------------------------------------------------------------
+ * 1-b. 역방향 매핑 — 서버가 실제로 주는 절대좌표(map_xy, 미터)를
+ *      blockId + local{x,y,z}로 변환한다. (요구사항 3의 진짜 버전)
+ *
+ *      서버는 blockId/local을 주지 않는다. 대신
+ *        - ship_pose 메시지로 배의 절대 위치/방향(map_xy, yaw)을 알려주고
+ *        - 위험 이벤트 메시지의 map_xy로 감지된 대상의 절대 위치를 알려준다
+ *      이 둘을 조합해 "배를 기준으로 어디쯤인지"를 계산해야 한다.
+ *
+ *      ⚠️ SHIP_REAL_LENGTH_M / SHIP_REAL_BEAM_M 은 임시값이다.
+ *      실제 배 모형을 측량한 값(이한종님 쪽 ship_survey_node 결과)으로
+ *      반드시 교체할 것 — 지금 값으로는 Ping이 엉뚱한 구획에 찍힐 수 있다.
+ * ------------------------------------------------------------------------- */
+const SHIP_REAL_LENGTH_M = 0.8; // TODO: 실측값으로 교체
+const SHIP_REAL_BEAM_M = 0.17;   // TODO: 실측값으로 교체
+// 임시 보정값(캘리브레이션): ship_survey_node가 재는 yaw 기준과 로봇 EKF가
+// 재는 yaw 기준이 서로 다른 것 같아서(2026-08-20 실측 1건 기준 약 58도 차이),
+// 화면에 실제 위치와 최대한 비슷하게 나오도록 임시로 더해주는 값이다.
+// ⚠️ 데이터 1건으로만 계산한 추정치라 정확하지 않을 수 있다.
+// 로봇을 배 정중앙 앞(뱃머리)에 딱 세워두고 화면에서도 정확히 그 자리에
+// 나오는지 확인해서, 안 맞으면 이 숫자를 조금씩 조절해야 한다.
+// 근본적으로는 이정기님/이한종님 쪽에 배 측량 시스템과 로봇 EKF가 같은
+// 지도 기준(0도 방향)을 쓰고 있는지 확인 요청 필요.
+const CALIBRATION_YAW_OFFSET_DEG = 0;
+const CALIBRATION_YAW_OFFSET_RAD = CALIBRATION_YAW_OFFSET_DEG * Math.PI / 180;
+
+/* 서버 절대좌표(mapXY)를, "배를 기준으로 한" 상대 좌표(미터)로 바꾸는 공용 변환.
+ * forward: 배 진행방향(+뱃머리 ~ -선미), beam: 좌우(+우현 ~ -좌현).
+ * 이벤트 위치(구획 매핑)와 UGV 위치(3D 이동) 둘 다 이 함수를 함께 쓴다. */
+function mapXYToShipLocalMeters(mapXY, shipPose) {
+  if (!mapXY || !shipPose || !shipPose.map_xy) return null;
+
+  const [ex, ey] = mapXY;
+  const [sx, sy] = shipPose.map_xy;
+  const yaw = (shipPose.yaw ?? 0) + CALIBRATION_YAW_OFFSET_RAD;
+  const dx = ex - sx, dy = ey - sy;
+
+  // 배의 yaw만큼 반대로 회전시켜 "배를 기준으로 한" 좌표로 바꾼다.
+  const cos = Math.cos(-yaw), sin = Math.sin(-yaw);
+  const forward = dx * cos - dy * sin;
+  const beam = dx * sin + dy * cos;
+  return { forward, beam };
+}
+
+function mapXYToBlockLocal(mapXY, shipPose) {
+  const rel = mapXYToShipLocalMeters(mapXY, shipPose);
+  if (!rel) return null;
+
+  let t = rel.forward / SHIP_REAL_LENGTH_M + 0.5; // 0(선미)~1(선수)로 정규화
+  t = Math.max(0, Math.min(1, t));
+
+  let blockId = BLOCKS[0].id;
+  for (const b of BLOCKS) {
+    const [r0, r1] = SECTION_RANGE[b.id];
+    if (t >= r0 && t <= r1) { blockId = b.id; break; }
+  }
+  const [r0, r1] = SECTION_RANGE[blockId];
+  const localZ = r1 > r0 ? (t - r0) / (r1 - r0) : 0.5;
+  const localX = Math.max(0, Math.min(1, rel.beam / SHIP_REAL_BEAM_M + 0.5));
+
+  return { blockId, local: { x: localX, y: 0.6, z: localZ } };
+}
+
+/* UGV는 배 위가 아니라 배 옆(바깥)을 돌아다니므로 0~1로 자르지 않고,
+ * 배 축척(SHIP_LEN/SHIP_REAL_LENGTH_M)을 그대로 곱해서 Three.js 월드 좌표로 바꾼다.
+ * 반환값의 x/z는 SceneManager.setUgvPosition()에 그대로 넣으면 된다. */
+function mapXYToUgvWorld(mapXY, ugvYaw, shipPose) {
+  const rel = mapXYToShipLocalMeters(mapXY, shipPose);
+  if (!rel) return null;
+
+  // 안전장치: 로봇은 배 위가 아니라 배 "주변 작업장"을 돌아다니므로,
+  // 배 실측 길이/폭보다 훨씬 멀리 나가는 게 정상이다 (오작동 아님).
+  // 그래서 배 크기가 아니라 "작업장에서 로봇이 실제로 돌아다닐 것으로
+  // 예상되는 범위(미터)"를 기준으로 클램프한다 — 필요하면 이 두 값을
+  // 실제 로봇 활동 반경에 맞게 더 늘려도 된다.
+  const MAX_PATROL_FORWARD_M = 3;  // 배 기준 앞뒤로 최대 몇 m까지 보여줄지
+  const MAX_PATROL_BEAM_M = 2;     // 배 기준 좌우로 최대 몇 m까지 보여줄지
+  const clamped = Math.abs(rel.forward) > MAX_PATROL_FORWARD_M || Math.abs(rel.beam) > MAX_PATROL_BEAM_M;
+  const clampedForward = Math.max(-MAX_PATROL_FORWARD_M, Math.min(MAX_PATROL_FORWARD_M, rel.forward));
+  const clampedBeam = Math.max(-MAX_PATROL_BEAM_M, Math.min(MAX_PATROL_BEAM_M, rel.beam));
+  if (clamped) {
+    console.warn(
+      "[좌표 변환] UGV가 MAX_PATROL_FORWARD_M/MAX_PATROL_BEAM_M 범위 밖으로 나가서 " +
+      "화면 가장자리로 눌러서 표시 중 — 로봇이 실제로 그렇게 멀리 갔다면, 이 두 값을 늘려주세요.",
+      { rawForward: rel.forward, rawBeam: rel.beam }
+    );
+  }
+
+  const lengthScale = SHIP_LEN / SHIP_REAL_LENGTH_M;
+  const beamScale = SHIP_BEAM / SHIP_REAL_BEAM_M;
+  const worldZ = clampedForward * lengthScale;
+  const worldX = clampedBeam * beamScale;
+
+  // UGV의 진짜 yaw(map 기준 절대각)도 "배를 기준으로 한 상대각"으로 바꿔서
+  // 3D 모델(항상 +z가 뱃머리 방향으로 고정)에서 자연스럽게 보이게 한다.
+  const relativeYaw = (shipPose.yaw != null && ugvYaw != null)
+    ? ugvYaw - shipPose.yaw
+    : null;
+
+  return { x: worldX, z: worldZ, yaw: relativeYaw };
+}
+/* ---------------------------------------------------------------------------
  * 2. 모의 이벤트 소스 — 실제 WebSocket과 동일한 페이로드 형태
  *    payload: { id, ts, cls, blockId, local{x,y,z}, conf }
  * ------------------------------------------------------------------------- */
 const CLASS_POOL = [
-  "fallen_person", "fire", "helmet_off", "helmet_on", "ship_block",
+  "fallen_person", "fire", "no_helmet", "ship_defect",
 ];
 
 function makeMockEvent() {
@@ -128,6 +250,45 @@ function connectEventSource(onEvent) {
 }
 
 /* ---------------------------------------------------------------------------
+ * 2-b. 진짜 이벤트 소스 — 백엔드 /ws/frontend에 연결한다. (docs/interface.md v1.5)
+ *
+ *    connectEventSource와 계약이 다르다: 서버 메시지는 event_type 기준으로
+ *    종류가 여러 개(position/위험이벤트/block_level/ship_pose)라, 여기서는
+ *    "원본 메시지 그대로" handlers.onMessage로 넘긴다. 종류별 처리(핑을 찍을지,
+ *    공정률을 바꿀지 등)는 이 함수 밖에서 판단한다 — 서버 스펙이 바뀌어도
+ *    이 연결 함수 자체는 손댈 필요가 없게 하기 위함.
+ * ------------------------------------------------------------------------- */
+function connectRealEventSource(url, handlers) {
+  let ws;
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    console.error("WebSocket 연결 생성 실패:", e);
+    handlers.onClose?.();
+    return () => {};
+  }
+
+  ws.onopen = () => handlers.onOpen?.();
+  ws.onclose = () => handlers.onClose?.();
+  ws.onerror = (e) => {
+    console.error("WebSocket 오류 (서버가 꺼져있거나 IP/포트가 다를 수 있음):", e);
+    handlers.onError?.(e);
+  };
+  ws.onmessage = (msg) => {
+    let data;
+    try {
+      data = JSON.parse(msg.data);
+    } catch (e) {
+      console.warn("이벤트 파싱 실패, 무시:", msg.data);
+      return;
+    }
+    handlers.onMessage?.(data);
+  };
+
+  return () => ws.close();
+}
+
+/* ---------------------------------------------------------------------------
  * 3. Three.js 씬 매니저 (명령형 래퍼)
  *    React state로 매 프레임 리렌더하면 비싸므로, 3D는 ref/명령형으로 제어.
  * ------------------------------------------------------------------------- */
@@ -146,7 +307,7 @@ class SceneManager {
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color("#0a0e17");
-    this.scene.fog = new THREE.Fog("#0a0e17", 28, 60);
+    this.scene.fog = new THREE.Fog("#0a0e17", 70, 160);
 
     this.camera = new THREE.PerspectiveCamera(46, w / h, 0.1, 200);
     this.camera.position.set(0, 16, 20);
@@ -490,7 +651,17 @@ class SceneManager {
     g.add(cam);
     this.ugv = g;
     this.ugvAngle = 0;
+    this.usingRealUgvPosition = false; // 진짜 position 이벤트가 한 번이라도 오면 true로 바뀜
+    this._ugvTarget = null;            // 실제 좌표 도착 목표 {x, z, yaw}
     this.scene.add(g);
+  }
+
+  /* 진짜 UGV 위치(월드 좌표, mapXYToUgvWorld로 이미 변환된 값)를 받아서
+   * 목표점으로 저장해둔다. _tick()에서 매 프레임 부드럽게 그쪽으로 움직인다.
+   * 한 번이라도 이게 호출되면, 그 뒤로는 장식용 자동 순찰 애니메이션을 끈다. */
+  setUgvPosition(x, z, yaw) {
+    this.usingRealUgvPosition = true;
+    this._ugvTarget = { x, z, yaw };
   }
 
   setBlockProgress(blockId, progress) {
@@ -571,7 +742,7 @@ class SceneManager {
     this._up = () => { dragging = false; };
     this._wheel = (e) => {
       e.preventDefault();
-      this.radius = Math.max(12, Math.min(46, this.radius + e.deltaY * 0.02));
+      this.radius = Math.max(12, Math.min(110, this.radius + e.deltaY * 0.02));
       update();
     };
     this.canvas.addEventListener("pointerdown", this._down);
@@ -609,13 +780,30 @@ class SceneManager {
     const t = performance.now();
     const dt = this.clock.getDelta();
 
-    // UGV 순찰 — 배 우현을 따라 앞뒤로 왕복
-    this.ugvT = (this.ugvT ?? 0) + dt * 0.12;
-    const sweep = Math.sin(this.ugvT); // -1~1
-    const z = sweep * (SHIP_LEN / 2);
-    const x = SHIP_BEAM / 2 + 1.6;
-    this.ugv.position.set(x, 0, z);
-    this.ugv.rotation.y = Math.cos(this.ugvT) >= 0 ? 0 : Math.PI;
+    if (this.usingRealUgvPosition && this._ugvTarget) {
+      // 진짜 좌표 모드 — 매 프레임 목표점 쪽으로 부드럽게 이동(끊겨 보이지 않게).
+      // position 이벤트는 0.5초에 한 번만 오므로, 오는 순간 순간이동하지 않도록
+      // lerp로 보간한다.
+      const lerpSpeed = Math.min(1, dt * 4);
+      const tgt = this._ugvTarget;
+      this.ugv.position.x += (tgt.x - this.ugv.position.x) * lerpSpeed;
+      this.ugv.position.z += (tgt.z - this.ugv.position.z) * lerpSpeed;
+      this.ugv.position.y = 0;
+      if (tgt.yaw != null) {
+        // 각도는 -π~π 경계를 넘나들 수 있어 단순 lerp로는 최단경로가 아닐 수
+        // 있지만, UGV가 저속으로 움직이는 데모 수준에서는 충분히 자연스럽다.
+        this.ugv.rotation.y += (tgt.yaw - this.ugv.rotation.y) * lerpSpeed;
+      }
+    } else {
+      // 아직 진짜 좌표가 한 번도 안 왔을 때만 장식용 자동 순찰 애니메이션 사용
+      // (서버 연결 전/테스트 중에도 화면이 심심하지 않도록 하는 임시 표시)
+      this.ugvT = (this.ugvT ?? 0) + dt * 0.12;
+      const sweep = Math.sin(this.ugvT); // -1~1
+      const z = sweep * (SHIP_LEN / 2);
+      const x = SHIP_BEAM / 2 + 1.6;
+      this.ugv.position.set(x, 0, z);
+      this.ugv.rotation.y = Math.cos(this.ugvT) >= 0 ? 0 : Math.PI;
+    }
 
     // Ping 애니메이션 + 만료 처리
     this.pings = this.pings.filter((p) => {
@@ -754,24 +942,144 @@ function drawCctvFrame(ctx, cv, { event, label, f }) {
   ctx.fillText(new Date().toLocaleTimeString("ko-KR"), cv.width - 96 * scale, 18 * scale);
 }
 
-/* 캔버스 애니메이션 루프 공유 훅 */
+/* 진짜 영상 위에 얹는 오버레이(bbox 라벨 + HUD). mock용 drawCctvFrame과는
+ * 별개 함수 — 실제 영상 픽셀은 그대로 두고 그 위에만 덧그린다.
+ * 서버가 픽셀 bbox 좌표를 아직 안 주므로 지금은 하단에 라벨만 표시한다. */
+function drawRealOverlay(ctx, cv, { event, label }) {
+  const scale = cv.width / 520;
+  const meta = event ? CLASS_META[event.cls] : null;
+  if (meta) {
+    const col = SEV_COLOR[meta.severity];
+    ctx.fillStyle = col; ctx.globalAlpha = 0.85;
+    ctx.fillRect(10 * scale, cv.height - 34 * scale, 220 * scale, 24 * scale);
+    ctx.fillStyle = "#0a0e17"; ctx.globalAlpha = 1;
+    ctx.font = `bold ${12 * scale}px monospace`;
+    ctx.fillText(`${event.cls} ${(event.conf * 100).toFixed(0)}%`, 16 * scale, cv.height - 17 * scale);
+  }
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "#2dd4bf"; ctx.font = `${11 * scale}px monospace`;
+  ctx.fillText(`● LIVE  UGV-CAM  ${label}`, 10 * scale, 18 * scale);
+  ctx.fillText(new Date().toLocaleTimeString("ko-KR"), cv.width - 96 * scale, 18 * scale);
+}
+
+/* 영상 채널에 아직 프레임이 한 장도 안 온 상태(연결 전/서버 꺼짐)에 보여줄 화면 */
+function drawWaitingScreen(ctx, cv, label) {
+  ctx.fillStyle = "#0b0f16";
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = "#7d8aa3";
+  ctx.font = "13px monospace";
+  ctx.textAlign = "center";
+  ctx.fillText(`영상 연결 대기중… (${label})`, cv.width / 2, cv.height / 2 - 8);
+  ctx.fillText(VIDEO_WS_URL, cv.width / 2, cv.height / 2 + 14);
+  ctx.textAlign = "left";
+}
+
+/* 캔버스 애니메이션 루프 공유 훅.
+ * USE_REAL_VIDEO=false면 기존처럼 Canvas 가짜 화면(drawCctvFrame),
+ * true면 /ws/frontend-stream에서 진짜 JPEG 프레임을 받아 그린다. */
 function useCctvCanvas(cvRef, active, event, label) {
   useEffect(() => {
     if (!active || !cvRef.current) return;
     const cv = cvRef.current;
     const ctx = cv.getContext("2d");
-    let raf, f = 0;
-    const loop = () => { f++; drawCctvFrame(ctx, cv, { event, label, f }); raf = requestAnimationFrame(loop); };
-    loop();
-    return () => cancelAnimationFrame(raf);
+
+    // Canvas 루프는 mock 모드이거나, 진짜 영상이어도 "relay"(서버 중계) 모드일 때만 쓴다.
+    // "direct" 모드는 이 훅을 아예 쓰지 않고 <img> 태그로 따로 그린다 (아래 LiveVideoDirect).
+    if (!USE_REAL_VIDEO || VIDEO_MODE !== "relay") {
+      let raf, f = 0;
+      const loop = () => { f++; drawCctvFrame(ctx, cv, { event, label, f }); raf = requestAnimationFrame(loop); };
+      loop();
+      return () => cancelAnimationFrame(raf);
+    }
+
+    // === 진짜 영상 모드 ===
+    let ws;
+    try {
+      ws = new WebSocket(VIDEO_WS_URL);
+    } catch (e) {
+      console.error("영상 채널 연결 실패:", e);
+      drawWaitingScreen(ctx, cv, label);
+      return;
+    }
+    ws.binaryType = "blob";
+    let bitmap = null;
+    let raf;
+
+    ws.onmessage = async (ev) => {
+      try {
+        const bmp = await createImageBitmap(ev.data);
+        if (bitmap) bitmap.close();
+        bitmap = bmp;
+      } catch (e) {
+        // 프레임 한 장이 깨져도 무시하고 다음 프레임을 기다린다
+      }
+    };
+    ws.onerror = (e) => console.error("영상 채널 오류 (서버/IP 확인):", e);
+
+    const draw = () => {
+      if (bitmap) {
+        ctx.drawImage(bitmap, 0, 0, cv.width, cv.height);
+        drawRealOverlay(ctx, cv, { event, label });
+      } else {
+        drawWaitingScreen(ctx, cv, label);
+      }
+      raf = requestAnimationFrame(draw);
+    };
+    draw();
+
+    return () => {
+      cancelAnimationFrame(raf);
+      ws.close();
+      if (bitmap) bitmap.close();
+    };
   }, [cvRef, active, event, label]);
+}
+
+/* "direct" 모드 전용 — 백엔드를 아예 안 거치고, 카메라 컴퓨터가 내보내는
+ * MJPEG HTTP 스트림을 <img> 태그로 그냥 띄운다. 브라우저가 알아서 프레임을
+ * 계속 갱신해주므로 별도 JS 루프가 필요 없다 (제일 단순한 방식).
+ * 스트림 서버가 꺼져 있으면 onError가 걸려 "연결 안 됨" 문구로 바뀐다. */
+function LiveVideoDirect({ event, label, className }) {
+  const [key, setKey] = useState(0); // iframe을 강제로 새로 불러오게 하는 트릭 (수동 재연결용)
+  const meta = event ? CLASS_META[event.cls] : null;
+
+  return (
+    <div className={`direct-video-wrap ${className || ""}`}>
+      {/* mediamtx가 자동으로 만들어주는 WebRTC 재생 페이지를 통째로 끼운다.
+       * iframe 안쪽 내용은 다른 서버(젯슨)라 onError로 성공/실패를 정확히
+       * 감지할 수 없다 — 안 뜨면 mediamtx 페이지 자체가 자기 상태를 보여준다. */}
+      <iframe
+        key={key}
+        src={DIRECT_CAMERA_URL}
+        title="UGV 실시간 영상"
+        className="direct-video-frame"
+        allow="autoplay"
+      />
+      <button
+        type="button"
+        className="direct-video-reload"
+        onClick={(e) => { e.stopPropagation(); setKey((k) => k + 1); }}
+        title="영상이 안 뜨면 눌러서 다시 연결"
+      >
+        ⟳ 재연결
+      </button>
+      {meta && (
+        <div className="direct-video-badge" style={{ background: SEV_COLOR[meta.severity] }}>
+          {event.cls} {(event.conf * 100).toFixed(0)}%
+        </div>
+      )}
+      <div className="direct-video-hud">● LIVE  UGV-CAM  {label}</div>
+    </div>
+  );
 }
 
 /* 상시 라이브 패널 — 항상 켜져 UGV 영상을 흘려본다.
  * 경고(노랑) 발생 시 테두리가 깜빡이며 "확인 필요"를 알린다. */
 function LivePanel({ ugvBlock, warnEvent, onExpand }) {
   const cvRef = useRef(null);
-  useCctvCanvas(cvRef, true, warnEvent, ugvBlock ? ugvBlock.name : "야드 순찰");
+  const label = ugvBlock ? ugvBlock.name : "야드 순찰";
+  const isDirect = USE_REAL_VIDEO && VIDEO_MODE === "direct";
+  useCctvCanvas(cvRef, !isDirect, warnEvent, label);
   const warning = !!warnEvent;
   return (
     <div className={`live-panel ${warning ? "live-warn" : ""}`} onClick={onExpand} title="클릭하면 확대">
@@ -779,7 +1087,11 @@ function LivePanel({ ugvBlock, warnEvent, onExpand }) {
         <span className="live-dot" /> 실시간 UGV 영상
         {warning && <span className="live-warn-tag">⚠ 경고 — 확인</span>}
       </div>
-      <canvas ref={cvRef} width={420} height={236} className="live-canvas" />
+      {isDirect ? (
+        <LiveVideoDirect event={warnEvent} label={label} className="live-canvas" />
+      ) : (
+        <canvas ref={cvRef} width={420} height={236} className="live-canvas" />
+      )}
     </div>
   );
 }
@@ -788,7 +1100,8 @@ function LivePanel({ ugvBlock, warnEvent, onExpand }) {
  * ESC 키로도 닫을 수 있게 한다 (X 버튼 클릭 없이 키보드로 종료). */
 function CctvPopup({ block, event, auto, onClose }) {
   const cvRef = useRef(null);
-  useCctvCanvas(cvRef, !!block, event, block ? block.name : "");
+  const isDirect = USE_REAL_VIDEO && VIDEO_MODE === "direct";
+  useCctvCanvas(cvRef, !!block && !isDirect, event, block ? block.name : "");
 
   useEffect(() => {
     if (!block) return;
@@ -809,7 +1122,11 @@ function CctvPopup({ block, event, auto, onClose }) {
           </div>
           <span className="popup-esc-hint">Esc 로 닫기</span>
         </div>
-        <canvas ref={cvRef} width={760} height={428} className="popup-canvas" />
+        {isDirect ? (
+          <LiveVideoDirect event={event} label={block.name} className="popup-canvas" />
+        ) : (
+          <canvas ref={cvRef} width={760} height={428} className="popup-canvas" />
+        )}
         <div className="popup-meta">
           <div><span className="k">구역</span><span className="v">{block.name} ({block.id})</span></div>
           {meta ? (
@@ -848,6 +1165,13 @@ export default function ShipyardTwinDashboard() {
   const [warnEvent, setWarnEvent] = useState(null);      // 라이브 패널 경고 표시
   const [ugvBlock, setUgvBlock] = useState(BLOCKS[0]);   // UGV가 보고 있는 구역
   const warnTimer = useRef(null);
+ const FALLBACK_SHIP_POSE = {
+  map_xy: [1.0778516278314955, -0.740519236385165],
+  yaw: 0.35384,
+  block_id: null,
+  };
+  const shipPoseRef = useRef(FALLBACK_SHIP_POSE);
+  const seenEventTypesRef = useRef(new Set()); // 디버깅용 — 어떤 event_type이 실제로 오는지 콘솔에 한 번씩만 찍기
 
   const handlePickBlock = useCallback((blockId) => {
     const block = BLOCKS.find((b) => b.id === blockId);
@@ -866,50 +1190,118 @@ export default function ShipyardTwinDashboard() {
     return () => { ro.disconnect(); sm.dispose(); };
   }, [handlePickBlock]);
 
-  // 이벤트 소스 연결
-  useEffect(() => {
-    setConnected(true);
-    const off = connectEventSource((payload) => {
-      const meta = CLASS_META[payload.cls];
-      // 3D Ping (위험/경고만 시각화, info는 로그만)
-      if (meta.severity !== SEVERITY.INFO && sceneRef.current) {
-        sceneRef.current.spawnPing(payload);
-      }
-      // ship_block info → 공정률 진행
-      if (payload.cls === "ship_block") {
-        setProgress((p) => {
-          const next = Math.min(1, (p[payload.blockId] ?? 0) + 0.08);
-          if (sceneRef.current) sceneRef.current.setBlockProgress(payload.blockId, next);
-          return { ...p, [payload.blockId]: next };
-        });
-      }
+  // 이벤트 소스 연결 — 위험/경고 이벤트가 감지됐을 때 공통으로 하는 일
+  // (3D Ping, 팝업/경고 표시, 로그 적재, 통계). 가짜 소스든 진짜 소스든
+  // "정규화된 payload"(cls/blockId/local/conf)만 만들어서 이 함수에 넘기면 된다.
+  const handleDetectionEvent = useCallback((payload) => {
+    const meta = CLASS_META[payload.cls];
+    if (!meta) return; // 모르는 타입은 서버와 동일하게 조용히 무시
 
-      // === 영상 송출 정책 ===
-      // 위험(빨강): CCTV 큰 팝업 자동 송출 (클릭 안 해도 뜸)
-      if (meta.severity === SEVERITY.DANGER) {
-        const block = BLOCKS.find((b) => b.id === payload.blockId);
-        setActiveBlock(block);
-        setActiveEvent({ ...payload, _meta: meta });
-        setAutoPopup(true);
-        setUgvBlock(block);
-        if (sceneRef.current) sceneRef.current.highlightBlock(payload.blockId);
-      }
-      // 경고(노랑): 라이브 패널에 경고 표시(테두리 점멸) + 영상 전환, 팝업은 안 띄움
-      else if (meta.severity === SEVERITY.WARN) {
-        const block = BLOCKS.find((b) => b.id === payload.blockId);
-        setUgvBlock(block);
-        setWarnEvent({ ...payload, _meta: meta });
-        clearTimeout(warnTimer.current);
-        warnTimer.current = setTimeout(() => setWarnEvent(null), 6000);
-      }
+    if (sceneRef.current) sceneRef.current.spawnPing(payload);
 
-      // 로그 적재 (최근 40개)
-      setEvents((prev) => [{ ...payload, _meta: meta }, ...prev].slice(0, 40));
-      // 통계
-      setStats((s) => ({ ...s, [meta.severity]: s[meta.severity] + 1 }));
-    });
-    return () => { off(); clearTimeout(warnTimer.current); };
+    if (meta.severity === SEVERITY.DANGER) {
+      const block = BLOCKS.find((b) => b.id === payload.blockId);
+      setActiveBlock(block);
+      setActiveEvent({ ...payload, _meta: meta });
+      setAutoPopup(true);
+      setUgvBlock(block);
+      if (sceneRef.current) sceneRef.current.highlightBlock(payload.blockId);
+    } else if (meta.severity === SEVERITY.WARN) {
+      const block = BLOCKS.find((b) => b.id === payload.blockId);
+      setUgvBlock(block);
+      setWarnEvent({ ...payload, _meta: meta });
+      clearTimeout(warnTimer.current);
+      warnTimer.current = setTimeout(() => setWarnEvent(null), 6000);
+    }
+
+    setEvents((prev) => [{ ...payload, _meta: meta }, ...prev].slice(0, 40));
+    setStats((s) => ({ ...s, [meta.severity]: s[meta.severity] + 1 }));
   }, []);
+
+  useEffect(() => {
+    if (!USE_REAL_BACKEND) {
+      // === 가짜 데이터 모드 (기존과 동일) ===
+      setConnected(true);
+      const off = connectEventSource((payload) => {
+        if (payload.cls === "ship_block") return; // 실제 스펙엔 없는 타입이라 무시
+        handleDetectionEvent(payload);
+      });
+      return () => { off(); clearTimeout(warnTimer.current); };
+    }
+
+    // === 진짜 백엔드 모드 ===
+    console.log(`[이벤트 채널] 연결 시도: ${EVENT_WS_URL}`);
+    const off = connectRealEventSource(EVENT_WS_URL, {
+      onOpen: () => { console.log("[이벤트 채널] 연결 성공"); setConnected(true); },
+      onClose: () => { console.log("[이벤트 채널] 연결 끊김"); setConnected(false); },
+      onError: () => setConnected(false),
+      onMessage: (data) => {
+        const type = data.event_type;
+
+        // 디버깅용: 어떤 event_type이 실제로 도착하는지 콘솔에 타입당 1번만 찍는다.
+        // (F12 → Console 탭에서 확인. 서버 연결은 됐는데 화면이 안 바뀔 때
+        //  "메시지가 아예 안 오는지" vs "와도 처리를 안 하는지"를 구분하는 용도.)
+        if (!seenEventTypesRef.current.has(type)) {
+          seenEventTypesRef.current.add(type);
+          console.log(`[이벤트 채널] 새 타입 최초 수신: "${type}"`, data);
+        }
+
+        // ① 배 위치/방향 — 좌표 변환에만 쓰고 화면엔 직접 안 그림
+        if (type === "ship_pose") {
+          shipPoseRef.current = { map_xy: data.map_xy, yaw: data.yaw, block_id: data.block_id };
+          console.log("[이벤트 채널] ship_pose 수신 — 이제부터 UGV 좌표 변환 가능", shipPoseRef.current);
+          return;
+        }
+
+        // ⓪ UGV 자체 위치(position 핑, 0.5초 주기) — ship_pose와 조합해서
+        // 3D 화면의 UGV를 실제 위치로 움직인다. ship_pose를 아직 한 번도
+        // 못 받았으면(배 기준점을 모름) 변환할 수 없으니 조용히 건너뛴다.
+        if (type === "position") {
+          if (!shipPoseRef.current) {
+            console.warn(
+              "[이벤트 채널] position은 왔는데 ship_pose가 아직 없어서 UGV를 못 움직임 — " +
+              "젯슨의 ship_survey_node가 배 위치 측량을 마쳤는지 확인 필요"
+            );
+            return;
+          }
+          if (sceneRef.current) {
+            const world = mapXYToUgvWorld(data.ekf_global, data.yaw, shipPoseRef.current);
+            if (world) sceneRef.current.setUgvPosition(world.x, world.z, world.yaw);
+          }
+          return;
+        }
+
+        // ③ 조립 단계 — Ping이 아니라 공정률 색상으로 반영
+        if (type === "block_level") {
+          const p = Math.max(0, Math.min(1, Number(data.level) / 3));
+          setProgress((prev) => {
+            if (sceneRef.current) sceneRef.current.setBlockProgress(data.block_id, p);
+            return { ...prev, [data.block_id]: p };
+          });
+          return;
+        }
+
+        // ② 위험 이벤트(fallen_person/fire/no_helmet/ship_defect)
+        const meta = CLASS_META[type];
+        if (!meta) return; // stream_boost 등 프론트가 보내는 종류가 되돌아오면 무시
+
+        const conv = mapXYToBlockLocal(data.map_xy ?? null, shipPoseRef.current);
+        const blockId = conv?.blockId ?? shipPoseRef.current?.block_id ?? BLOCKS[0].id;
+        const local = conv?.local ?? { x: 0.5, y: 0.6, z: 0.5 };
+
+        handleDetectionEvent({
+          id: `evt_${Date.now()}_${Math.floor(Math.random() * 1e4)}`,
+          ts: Date.now(),
+          cls: type,
+          blockId,
+          local,
+          conf: data.confidence ?? 0,
+        });
+      },
+    });
+
+    return () => { off(); clearTimeout(warnTimer.current); };
+  }, [handleDetectionEvent]);
 
   // 초기 공정률을 씬에 반영
   useEffect(() => {
@@ -1138,6 +1530,21 @@ const CSS = `
   color:#aebbd2; border-bottom:1px solid #1e2a3f; }
 .live-dot { width:7px; height:7px; border-radius:50%; background:#36d399; box-shadow:0 0 8px #36d399; animation:blink 2s infinite; }
 .live-canvas { display:block; width:100%; height:auto; }
+
+/* direct 모드(백엔드 안 거치고 카메라 컴퓨터에 바로 접속) 전용 스타일 */
+.direct-video-wrap { position:relative; width:100%; aspect-ratio:420/236; background:#0b0f16; overflow:hidden; }
+.direct-video-frame { display:block; width:100%; height:100%; border:none; background:#0b0f16; }
+.direct-video-reload { position:absolute; right:8px; top:6px; z-index:2; background:rgba(10,14,23,.75);
+  border:1px solid #1e2a3f; color:#aebbd2; font-size:11px; padding:3px 8px; border-radius:6px; cursor:pointer; }
+.direct-video-reload:hover { border-color:#2dd4bf; color:#2dd4bf; }
+.direct-video-fallback { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
+  justify-content:center; gap:5px; color:#7d8aa3; font-size:11px; text-align:center; padding:10px; }
+.direct-video-url { color:#aebbd2; font-family:monospace; font-size:10px; word-break:break-all; }
+.direct-video-retry { color:#5a6580; font-size:10px; }
+.direct-video-badge { position:absolute; left:8px; bottom:8px; padding:3px 8px; border-radius:4px;
+  font-size:11px; font-weight:700; color:#0a0e17; }
+.direct-video-hud { position:absolute; left:8px; top:6px; color:#2dd4bf; font-size:11px; font-family:monospace;
+  text-shadow:0 1px 3px rgba(0,0,0,.8); }
 .live-warn-tag { margin-left:auto; color:#ffb020; font-weight:700; }
 .live-panel.live-warn { border-color:#ffb020; animation:warnPulse 1s infinite; }
 @keyframes warnPulse { 0%,100%{box-shadow:0 0 0 rgba(255,176,32,0)} 50%{box-shadow:0 0 18px rgba(255,176,32,.5)} }
