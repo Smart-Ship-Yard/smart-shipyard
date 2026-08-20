@@ -551,8 +551,11 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
             # 맵에 섬이 없으므로 이 경로로만 마스크를 만들 수 있다.
             bbox = rect_bbox(m, cx, cy, mask_size[0], mask_size[1], mask_yaw)
             mask_rect = (cx, cy, mask_size[0], mask_size[1], mask_yaw)
-            print(f'  대상 크기 {mask_size[0]:.2f} x {mask_size[1]:.2f} m '
-                  f'(yaw {math.degrees(mask_yaw):.0f}도) 를 함께 받았다 — 마스크에 사용')
+            # "함께 받았다" 라고 찍었더니 측량이 재서 넘겨준 값처럼 읽혔다.
+            # 실제로는 줄자로 재서 코드에 박아둔 상수다(2026-08-20 정정).
+            print(f'  배 크기는 이미 알고 있다 — 사용자가 줄자로 재서 넣어둔 '
+                  f'{mask_size[0]:.2f} x {mask_size[1]:.2f} m (yaw {math.degrees(mask_yaw):.0f}도)')
+            print('  같은 모형 배만 쓰므로 매번 같다. 측량이 잰 크기는 안 쓴다.')
             print('  좌표도 지정값을 그대로 쓴다 (맵의 장애물로 스냅하지 않음)')
 
         # 크기를 못 받았으면 "어느 물체냐"를 고르는 용도로만 좌표를 쓴다.

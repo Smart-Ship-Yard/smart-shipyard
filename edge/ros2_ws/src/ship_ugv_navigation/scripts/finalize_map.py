@@ -183,17 +183,13 @@ def pick_survey_center(survey_dir, records, name, pgm_mtime):
     else:
         size = None
 
+    # 측량에서 실제로 쓰는 것은 **중심 좌표뿐**이다.
+    # 크기(size_xy)와 방향(yaw)도 파일에는 들어 있지만 마스크에 쓰지 않는다
+    # — 크기는 점이 퍼진 정도를 잰 값이라 못 믿고, 방향은 실측 상수로 고정했다.
+    # 예전에는 이 둘까지 화면에 찍어서 "저 값이 마스크에 쓰이나" 하고
+    # 헷갈리게 했다(2026-08-20). 안 쓰는 값은 안 찍는다.
     print(f'  측량    {src}\n       -> {dst}')
-    print(f'          배 중심 ({cx:.3f}, {cy:.3f}), yaw {yaw:.3f} rad')
-    if size:
-        # 이 값은 기록 보존일 뿐이다. 마스크는 [4/4] 에서 SHIP_SIZE_XY(실측 상수)로
-        # 그린다. 예전에 여기서 "마스크에 사용" 이라고 찍어 혼동을 줬다.
-        print(f'          측량이 잰 크기 {size[0]:.2f} x {size[1]:.2f} m — 기록 보존용')
-        print(f'          (마스크는 실측 상수 {SHIP_SIZE_XY[0]:.2f} x {SHIP_SIZE_XY[1]:.2f} m 를 쓴다. '
-              f'측량 size_xy 는 크기가 아니라 점이 퍼진 정도라 못 믿는다)')
-    else:
-        print('          ⚠️ size_xy 가 없다 — 맵의 장애물에서 크기를 찾아본다.')
-        print('             배가 라이다에 안 잡히는 경우라면 마스크가 안 만들어진다')
+    print(f'          배 중심 ({cx:.3f}, {cy:.3f})  ← 마스크·순찰이 쓰는 값은 이것뿐')
     return {'center': (cx, cy), 'yaw': yaw, 'size': size}
 
 
