@@ -234,6 +234,7 @@ class ShipSurveyNode(Node):
         # ---- 상태 ----
         self.points = []        # [(map_x, map_y), ...] 배 표면점 누적
         self.finalized = False  # 확정 후 다음 재측량 트리거까지 수집 중단
+        self._done_msg = ''     # 확정 요약. 확정 뒤 5초마다 다시 찍는다(아래 _check_done)
         self.current_level = None   # 지금 수집 중인 점들이 어느 조립 단계의 배인지
 
         # ---- TF ----
@@ -433,6 +434,7 @@ class ShipSurveyNode(Node):
     def _check_done(self):
         """1초마다 종료조건을 확인하고, 충족되면 자동 확정."""
         if self.finalized:
+            self.get_logger().info(self._done_msg, throttle_duration_sec=5.0)
             return
 
         num = len(self.points)
@@ -537,13 +539,19 @@ class ShipSurveyNode(Node):
 
         # 타이머는 살려둔다 (재측량 트리거가 오면 다시 써야 함). finalized 플래그로
         # 게이팅하므로 확정 상태에서는 1초마다 즉시 return만 한다.
+        # 확정 요약을 남겨둔다. 확정되면 화면이 조용해져서 "아직 수집 중인가"
+        # 하고 계속 돌게 되는 일이 있었다(2026-08-20). _check_done 이 5초마다 다시 찍는다.
+        self._done_msg = (
+            f"[배 측량 확정 — 수집 끝, 더 안 돌아도 됩니다] "
+            f"map_xy=({cx:.3f}, {cy:.3f}) yaw={math.degrees(yaw):.1f}deg "
+            f"점 {num_used}개 / 방위 {covered}/{total_bins}칸 -> {os.path.basename(path)}")
         self.finalized = True
         self.points = []
 
+        self.get_logger().info(self._done_msg)
         self.get_logger().info(
-            f"[배 측량 확정] map_xy=({cx:.3f}, {cy:.3f}) yaw={yaw:.3f}rad "
-            f"({math.degrees(yaw):.1f}deg) size_xy=({long_side:.3f}, {short_side:.3f})m "
-            f"점 {num_used}개 사용")
+            f"   (size_xy=({long_side:.3f}, {short_side:.3f})m 는 기록용. "
+            f"마스크는 finalize_map.py 의 실측 상수를 쓴다)")
         return cx, cy, yaw, long_side, short_side
 
 
