@@ -229,12 +229,36 @@ class HeadingComplementaryFilter(Node):
         # 기존 yaw_est와 last_uwb_xy는 '옛 변환' 기준의 값이라 새 좌표계와
         # 섞으면 안 된다. 통째로 리셋하고 새 좌표계에서 다시 초기화.
         if self.last_tf_yaw is not None:
-            tf_change = abs(wrap_to_pi(tf_yaw - self.last_tf_yaw))
-            if tf_change > self.recalib_threshold:
-                self.get_logger().info(
-                    f"캘리브레이션 변경 감지 (TF 회전 {math.degrees(tf_change):.1f}deg 변화) "
-                    "→ yaw 재초기화 (다음 이동 구간에서 새 좌표계 기준으로 재탄생)")
-                self.yaw_est = None
+            delta = wrap_to_pi(tf_yaw - self.last_tf_yaw)
+            if abs(delta) > self.recalib_threshold:
+                # ★ 2026-08-21: 예전에는 yaw_est 를 통째로 버렸다(None).
+                #   그런데 좌표계가 돌아갔을 뿐 **로봇이 실제로 향한 방향은
+                #   그대로**다. 회전량만큼 더해주면 새 좌표계에서 그대로 맞다.
+                #     map_point = R(tf_yaw) * uwb_point 이므로
+                #     같은 물리 방향의 map 각도는 tf_yaw 가 변한 만큼 변한다.
+                #
+                #   버리면 어떻게 되는가 (실측으로 겪은 일):
+                #     캘리브레이션은 "서비스 호출 -> 1.5 m 직진 -> 주행이 끝난
+                #     뒤에야 TF 발행" 순서다. 직진 중에 필터가 옛 좌표계로
+                #     초기화되고, 직진이 끝난 직후 TF 가 바뀌면서 그 값을
+                #     버린다. 그런데 그때는 로봇이 이미 멈춰 있어 다시
+                #     초기화될 기회가 없다. 그러면 /heading/imu_uwb_fused 가
+                #     **아무것도 발행하지 않고**(초기화 전에는 발행 안 함),
+                #     ekf_global 은 절대 방위각 없이 돌아간다.
+                #     실측: 1.5 m 직진 후 로봇 방위각이 66도로 찍혔다(0도여야 함).
+                #     조용히 일어나서 Nav2 를 켜기 전까지 아무도 모른다.
+                if self.yaw_est is not None:
+                    self.yaw_est = wrap_to_pi(self.yaw_est + delta)
+                    self.get_logger().info(
+                        f"캘리브레이션 변경 감지 (TF 회전 {math.degrees(delta):+.1f}deg) "
+                        f"→ yaw 를 같은 만큼 돌려 이어간다: "
+                        f"{math.degrees(self.yaw_est):.1f}deg")
+                else:
+                    self.get_logger().info(
+                        f"캘리브레이션 변경 감지 (TF 회전 {math.degrees(delta):+.1f}deg) "
+                        "→ 아직 yaw 가 초기화된 적 없다. 다음 이동 구간에서 잡는다")
+                # 위치 기준점은 옛 좌표계 값이라 그대로 쓰면 안 된다. 다음
+                # 콜백이 새 좌표계로 다시 잡는다 (한 구간만 늦어질 뿐이다).
                 self.last_uwb_xy = None
                 self.last_uwb_stamp = None
         self.last_tf_yaw = tf_yaw
