@@ -155,8 +155,10 @@ class UwbMapCalibration(Node):
             self.theta = self.tx = self.ty = 0.0
             return False
 
+        # 상태는 IDLE 그대로 둔다. 이 노드는 캘리브레이션을 마쳐도 IDLE 로
+        # 돌아가는 구조라 '완료' 상태가 따로 없다. 불러온 뒤에도 '~/calibrate'
+        # 로 언제든 다시 잴 수 있어야 한다 (앵커를 옮겼을 때).
         self.loaded_from = path
-        self.state = CalibState.DONE
         self.get_logger().info(
             f"저장된 캘리브레이션을 불러왔다: {os.path.basename(path)}  "
             f"tx={self.tx:.4f} ty={self.ty:.4f} "
