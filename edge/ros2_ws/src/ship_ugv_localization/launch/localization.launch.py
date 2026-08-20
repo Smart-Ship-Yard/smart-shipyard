@@ -157,6 +157,27 @@ def generate_launch_description():
     #     쓴다. 그쪽은 1회 관측이라 오차가 누적되지 않고, 대안도 없다.
     survey_on = any(a in ('survey:=true', 'survey:=True', 'survey:=1')
                     for a in sys.argv)
+
+    # ---- 실측 배 중심을 켜질 때마다 서버로 보낸다 (2026-08-20 신설) ----
+    #   매핑한 날에는 publish_ship_pose.py 를 사람이 치지만, 며칠 뒤에 맵만
+    #   불러와 자율주행을 돌리는 날에는 아무도 안 친다. 그러면 프론트엔드
+    #   화면에 배 위치가 안 가고, 그 화면은 배 pose 를 기준 좌표계로 쓰므로
+    #   로봇도 이벤트도 전부 어긋난 자리에 그려진다.
+    #   ※ 이 파일은 install/ 에서도 src 로의 심볼릭 링크라, realpath 로
+    #     소스 트리를 되짚으면 측정값 파일을 확실히 찾을 수 있다.
+    #     (share 경유로 찾으면 colcon build 를 해야만 보인다)
+    measured_file = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.realpath(__file__)),
+        '..', '..', 'ship_ugv_navigation', 'config',
+        'ship_center_measured.json'))
+
+    ship_pose_pub_node = Node(
+        package='ship_ugv_navigation',
+        executable='ship_pose_publisher',
+        name='ship_pose_publisher',
+        output='screen',
+        parameters=[{'measured_file': measured_file}],
+    )
     banner_survey = ('켬 — YOLO 로 배를 측량한다 (부정확할 수 있음)' if survey_on
                      else '끔 — 배 위치는 finalize_map.py --center X Y 로 실측해 넣는다')
 
@@ -324,6 +345,13 @@ def generate_launch_description():
     banner.append(LogInfo(msg=f"  {'✅' if survey_on else '⏸️'} {'배 측량':<14} "
                               f"{banner_survey}"))
     banner.append(LogInfo(
+        msg=f"  {'✅' if os.path.exists(measured_file) else '❌'} "
+            f"{'배 중심 실측값':<11} "
+            + ('있음 — 켜지면 자동으로 서버에 보낸다'
+               if os.path.exists(measured_file)
+               else '없음 — 프론트엔드에 배 위치가 안 간다. '
+                    'scripts/measure_ship_center.py 로 잴 것')))
+    banner.append(LogInfo(
         msg=f"  {'✅' if calib_file else '⏸️'} {'캘리브 불러오기':<12} "
             + (os.path.basename(calib_file) if calib_file
                else '끔 — 새로 잰다 (되살리려면 calib:=<맵이름>)')))
@@ -348,7 +376,7 @@ def generate_launch_description():
         ekf_local_node,
         ekf_global_node,
         change_point_node,
-        *( [ship_survey_node] if survey_on else [] ),
+        *( [ship_survey_node] if survey_on else [ship_pose_pub_node] ),
         websocket_client_node,
         laser_static_tf_node,
         rplidar_node,

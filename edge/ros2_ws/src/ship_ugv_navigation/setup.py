@@ -62,6 +62,11 @@ setup(
             'ship_ugv_navigation.fake_global_localization:main',
 
             # ── [시뮬·실물 공용] 아래 둘은 양쪽에서 그대로 실행한다 ─────────
+            # 실측한 배 중심을 켜질 때마다 서버로 보낸다. 매핑을 안 하는
+            # 날에도 프론트엔드가 배 위치를 받게 하려는 것이다.
+            'ship_pose_publisher = '
+            'ship_ugv_navigation.ship_pose_publisher:main',
+
             'patrol_mission_node = '
             'ship_ugv_navigation.patrol_mission_node:main',
             'event_gate_node = '
