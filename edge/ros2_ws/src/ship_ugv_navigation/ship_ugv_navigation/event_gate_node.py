@@ -81,7 +81,11 @@ class EventGateNode(Node):
             #   fallen_person 오검출이 계속 떠서 순찰이 반복 정지했다.
             #   실측 오검출: 0.2369 / 0.2511 / 0.3209 — 0.2 로는 전부 통과한다.
             #   진짜 검출은 실측 0.55~0.83 이었으므로 0.5 면 충분히 구분된다.
-            ('min_confidence', 0.5),
+            # ★ 0.5 -> 0.75 (2026-08-21). 0.5 로도 못 걸렀다. 순찰 6바퀴째에
+            #   **아무것도 없는 바닥**을 fire conf 0.70 으로 잡아 정지했다.
+            #   같은 날 진짜 불은 0.88 / 0.90 이었다 (배 근처, map_xy 0.40,-0.99).
+            #   오검출 0.70 과 진짜 0.88 사이인 0.75 로 가른다.
+            ('min_confidence', 0.75),
             # ★ 신설 (2026-08-19). 이 거리보다 먼 검출은 정지 사유로 보지 않는다.
             #   오검출들이 전부 4.0~4.2 m 에서 떴다. 순찰 반경이 0.6 m 인데
             #   4 m 밖의 물체 때문에 멈추면 시연이 진행되지 않는다.
@@ -185,7 +189,14 @@ class EventGateNode(Node):
 
         if cls not in self.trigger:
             # ship_defect 등 정지 대상이 아닌 것. 기록만 하고 계속 주행한다.
-            self.get_logger().info(f'감지 {cls} — 정지 대상 아님, 계속 주행')
+            # ★ 10초에 한 번만 찍는다 (2026-08-21). 배가 시야에 있으면 4 Hz 로
+            #   계속 검출되어 초당 4줄이 쏟아진다. 그 바람에 "Goal canceled"
+            #   같은 정작 봐야 할 로그가 화면 밖으로 밀려났다.
+            #   그리고 이미 정지한 상태에서 "계속 주행" 이라고 찍으면 안 된다.
+            state = '정지 중' if self.active else '계속 주행'
+            self.get_logger().info(
+                f'감지 {cls} — 정지 대상 아님 ({state})',
+                throttle_duration_sec=10.0)
             return
         try:
             if float(conf) < self.min_conf:
