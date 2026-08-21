@@ -161,11 +161,20 @@ class ShipSurveyNode(Node):
         self.declare_parameter('block_id', 'B1')
         # 조립 단계 확정 신호 (websocket_client가 3초 안정화 후 발행). 재측량 트리거.
         self.declare_parameter('block_level_topic', '/block_level/confirmed')
+        # ★ 신설 (2026-08-19). 확정 후 조립 단계가 바뀌면 재측량하는 기능 스위치.
+        #   원래 의도는 "배를 조립하면 모양이 달라지니 다시 재라" 인데, 실제로는
+        #   **YOLO 의 레벨 오검출**이 이 트리거를 계속 당겼다. 매핑 한 시간 사이에
+        #   측량이 7번 다시 돌았고, 그때마다 앞서 모은 점을 전부 버려서 좋은
+        #   측량이 나쁜 것으로 덮였다. 매핑 때는 false 로 둘 것.
 
         # ---- 배 클래스 판별 ----
         # YOLO 클래스는 조립 단계별로 level1~level5. 전부 "배"를 가리키므로
         # 접두사로 거른다. 위험 이벤트 클래스(fallen_person/fire/no_helmet/
         # ship_defect)는 이 접두사가 없어서 자동으로 걸러진다.
+        #   기본값을 False 로 둔다: 이 기능이 제대로 동작한 적이 없다.
+        #   실제로 발동한 것은 전부 YOLO 레벨 오검출이었다(한 시간에 7번).
+        #   조립 단계가 진짜로 바뀌는 시나리오를 시험할 때 True 로 켠다.
+        self.declare_parameter('relock_on_level_change', False)
         self.declare_parameter('ship_class_prefix', 'level')
         self.declare_parameter('min_confidence', 0.3)
 
@@ -183,7 +192,14 @@ class ShipSurveyNode(Node):
         # ---- 측량 종료 조건 ----
         self.declare_parameter('min_points', 50)          # 10Hz 검출 기준 약 5초분
         self.declare_parameter('bearing_bin_deg', 30.0)   # 360/30 = 12칸
-        self.declare_parameter('min_covered_bins', 8)     # 12칸 중 8칸 = 약 240도
+        # ★ 8 -> 11 (2026-08-19). 12칸 중 8칸이면 **240도만 돌고 확정**해버린다.
+        #   배를 한쪽에서만 보고 사각형을 맞추는 셈이라 결과가 재현되지 않았다.
+        #   같은 배를 네 번 재서 중심이 최대 62 cm, 크기가 0.115~2.560 m 로
+        #   흩어졌는데 그중 둘은 covered_bins 9/12 로 "정상" 판정이었다.
+        #   11칸(330도)이면 사실상 한 바퀴를 다 돌아야 확정된다.
+        #   벽에 막혀 못 채우는 자리에서는 수동 확정을 쓴다:
+        #       ros2 service call /ship_survey_node/finalize std_srvs/srv/Trigger
+        self.declare_parameter('min_covered_bins', 11)    # 12칸 중 11칸 = 약 330도
         self.declare_parameter('max_depth_m', 4.0)        # 이보다 먼 검출은 배가 아님
         self.declare_parameter('outlier_radius_m', 2.0)   # 중앙값에서 이 이상 떨어지면 버림
         # ★ 사람이 세션 시작 때 대충 실측한 배 방향(라디안). 장축의 180도 모호성만
@@ -195,6 +211,7 @@ class ShipSurveyNode(Node):
         self.block_id = self.get_parameter('block_id').value
         self.class_prefix = self.get_parameter('ship_class_prefix').value
         self.min_confidence = self.get_parameter('min_confidence').value
+        self.relock = bool(self.get_parameter('relock_on_level_change').value)
 
         self.map_frame = self.get_parameter('map_frame_id').value
         self.base_frame = self.get_parameter('base_frame_id').value
@@ -217,6 +234,7 @@ class ShipSurveyNode(Node):
         # ---- 상태 ----
         self.points = []        # [(map_x, map_y), ...] 배 표면점 누적
         self.finalized = False  # 확정 후 다음 재측량 트리거까지 수집 중단
+        self._done_msg = ''     # 확정 요약. 확정 뒤 5초마다 다시 찍는다(아래 _check_done)
         self.current_level = None   # 지금 수집 중인 점들이 어느 조립 단계의 배인지
 
         # ---- TF ----
@@ -272,7 +290,7 @@ class ShipSurveyNode(Node):
             return 0
 
     # ------------------------------------------------------------------
-    def _camera_xyz_to_map_xy(self, depth_xyz):
+    def _camera_xyz_to_map_xy(self, depth_xyz, stamp=None):
         """
         카메라 좌표계 3D 점을 map 좌표 2D로 변환.
         change_point.py / websocket_client.py와 동일한 보정 순서를 따른다.
@@ -297,8 +315,30 @@ class ShipSurveyNode(Node):
         point_in_base.point.z = self.cam_offset_z
 
         try:
-            transform = self.tf_buffer.lookup_transform(
-                self.map_frame, self.base_frame, Time(), timeout=self.tf_timeout)
+            # ★ 사진을 찍은 시각의 TF 를 쓴다 (2026-08-19 수정).
+            #   예전에는 Time()(=가장 최신)을 썼다. 그런데 이 검출은 YOLO 추론을
+            #   거쳐 55~305 ms 뒤에 도착한 것이라, "지금" 로봇 위치를 쓰면 그
+            #   시간만큼 로봇이 움직인 거리가 그대로 오차가 된다.
+            #   실측: 주행하며 같은 배를 네 번 재니 중심이 최대 62 cm, 크기가
+            #   0.115~2.560 m 로 흩어졌다. 정지 상태에서는 오차가 0 이었다
+            #   (네 방향 152점이 11 cm 안으로 수렴).
+            #   stamp 가 없으면(구버전 발행기) 예전처럼 최신 TF 로 넘어간다.
+            lookup_time = Time() if stamp is None else stamp
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    self.map_frame, self.base_frame, lookup_time,
+                    timeout=self.tf_timeout)
+            except Exception:
+                if stamp is None:
+                    raise
+                # 그 시각 TF 가 버퍼에 없으면(지연이 버퍼보다 김) 최신으로 후퇴.
+                self.get_logger().warn(
+                    '촬영 시각 TF 없음 — 최신 TF 로 대체(정확도 떨어짐). '
+                    'tf_timeout_s 를 늘리거나 추론 주기를 줄일 것',
+                    throttle_duration_sec=10.0)
+                transform = self.tf_buffer.lookup_transform(
+                    self.map_frame, self.base_frame, Time(),
+                    timeout=self.tf_timeout)
         except Exception as e:
             self.get_logger().warn(
                 f"TF 조회 실패 ({self.map_frame}<-{self.base_frame}): {e}",
@@ -338,7 +378,12 @@ class ShipSurveyNode(Node):
         if depth <= 0.0 or depth > self.max_depth:
             return
 
-        map_xy = self._camera_xyz_to_map_xy(depth_xyz)
+        # 촬영 시각(있으면)을 함께 넘긴다 — 없으면 구버전 발행기라 None 이다.
+        stamp = None
+        if det.get('stamp_sec') is not None:
+            stamp = Time(seconds=int(det['stamp_sec']),
+                         nanoseconds=int(det.get('stamp_nanosec', 0)))
+        map_xy = self._camera_xyz_to_map_xy(depth_xyz, stamp)
         if map_xy is None:
             return
 
@@ -355,6 +400,15 @@ class ShipSurveyNode(Node):
           측량한 것이라, 남겨두면 옛 형태와 새 형태를 합친 엉뚱한 사각형이 나온다.
         """
         level = int(msg.data)
+
+        # ★ 재측량을 끈 상태에서 **이미 확정됐다면** 무시한다 (2026-08-19).
+        #   레벨 오검출로 좋은 측량이 덮이는 것을 막는다.
+        if not self.relock and self.finalized:
+            self.get_logger().info(
+                f'조립 단계 {self.current_level} -> {level} 이지만 '
+                'relock_on_level_change=false 이고 이미 확정됨 — 재측량 안 함',
+                throttle_duration_sec=10.0)
+            return
 
         # 첫 수신은 "변경"이 아니라 현재 단계를 처음 알게 된 것뿐이다. 여기서
         # 초기화해버리면 매핑 랩에서 모으던 점을 통째로 날린다.
@@ -380,6 +434,7 @@ class ShipSurveyNode(Node):
     def _check_done(self):
         """1초마다 종료조건을 확인하고, 충족되면 자동 확정."""
         if self.finalized:
+            self.get_logger().info(self._done_msg, throttle_duration_sec=5.0)
             return
 
         num = len(self.points)
@@ -484,13 +539,19 @@ class ShipSurveyNode(Node):
 
         # 타이머는 살려둔다 (재측량 트리거가 오면 다시 써야 함). finalized 플래그로
         # 게이팅하므로 확정 상태에서는 1초마다 즉시 return만 한다.
+        # 확정 요약을 남겨둔다. 확정되면 화면이 조용해져서 "아직 수집 중인가"
+        # 하고 계속 돌게 되는 일이 있었다(2026-08-20). _check_done 이 5초마다 다시 찍는다.
+        self._done_msg = (
+            f"[배 측량 확정 — 수집 끝, 더 안 돌아도 됩니다] "
+            f"map_xy=({cx:.3f}, {cy:.3f}) yaw={math.degrees(yaw):.1f}deg "
+            f"점 {num_used}개 / 방위 {covered}/{total_bins}칸 -> {os.path.basename(path)}")
         self.finalized = True
         self.points = []
 
+        self.get_logger().info(self._done_msg)
         self.get_logger().info(
-            f"[배 측량 확정] map_xy=({cx:.3f}, {cy:.3f}) yaw={yaw:.3f}rad "
-            f"({math.degrees(yaw):.1f}deg) size_xy=({long_side:.3f}, {short_side:.3f})m "
-            f"점 {num_used}개 사용")
+            f"   (size_xy=({long_side:.3f}, {short_side:.3f})m 는 기록용. "
+            f"마스크는 finalize_map.py 의 실측 상수를 쓴다)")
         return cx, cy, yaw, long_side, short_side
 
 

@@ -1,0 +1,19 @@
+{
+  "event_type": "ship_pose",
+  "block_id": "B1",
+  "map_xy": [
+    1.1776061058044434,
+    -0.05310821533203125
+  ],
+  "yaw": -1.4839273234194195,
+  "size_xy": [
+    2.1371793353573993,
+    0.47582733611809513
+  ],
+  "block_level": 3,
+  "timestamp": 1787217724.6522112,
+  "num_points": 59,
+  "covered_bins": 11,
+  "total_bins": 12,
+  "trigger": "auto"
+}

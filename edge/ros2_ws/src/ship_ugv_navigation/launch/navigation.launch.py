@@ -100,7 +100,9 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
+from launch.actions import (DeclareLaunchArgument, LogInfo, OpaqueFunction,
+                            ExecuteProcess, RegisterEventHandler)
+from launch.event_handlers import OnShutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from nav2_common.launch import RewrittenYaml
@@ -211,6 +213,7 @@ def launch_setup(context, *args, **kwargs):
             'yaml_filename': map_yaml,
             'default_nav_to_pose_bt_xml': bt_xml,
             'topic': scan_topic,
+            'scan_topic': scan_topic,   # amcl 은 'topic' 이 아니라 'scan_topic' 키를 쓴다
         },
         convert_types=True,
     )
@@ -292,10 +295,91 @@ def launch_setup(context, *args, **kwargs):
                               # 코스트로 바꾸는 1차식이며 keepout 은 그대로 쓴다.
                               'type': 0,
                               'filter_info_topic': '/costmap_filter_info',
-                              'mask_topic': 'keepout_mask',
+                              # ★ 앞의 '/' 를 빼면 안 된다 (2026-08-19 실측 버그).
+                              #   이 문자열은 CostmapFilterInfo 메시지에 그대로 실려
+                              #   코스트맵으로 가고, 코스트맵이 그 이름으로 구독한다.
+                              #   그런데 코스트맵 노드는 /global_costmap, /local_costmap
+                              #   네임스페이스 안에 있어서, 상대 이름이면
+                              #       /global_costmap/keepout_mask
+                              #   로 풀린다. filter_mask_server 는 / 네임스페이스라
+                              #   /keepout_mask 로 발행하므로 **영영 안 만난다.**
+                              #   증상: 노드는 전부 active 인데 계속 이 경고만 뜬다
+                              #       KeepoutFilter: Filter mask was not received
+                              #   그리고 마스크가 코스트맵에 반영되지 않아 로봇이
+                              #   금지 영역(모형 배) 위를 그냥 지나간다. 조용한 실패다.
+                              'mask_topic': '/keepout_mask',
                               'base': 0.0,
                               'multiplier': 1.0}], **common),
         ]
+
+    # ---- AMCL 라이다 로컬라이제이션 (2026-08-15 추가) --------------------
+    # ★ TF 는 발행하지 않는다 (nav2_params.yaml 의 tf_broadcast: false).
+    #   /amcl_pose 만 내고, ekf_global 이 그것을 pose1 센서 입력으로 먹는다.
+    #   map->odom 발행자는 계속 ekf_global 하나뿐이라 TF 이중 발행이 없다.
+    #   근거와 배경은 nav2_params.yaml 의 amcl 블록 주석 참고.
+    #
+    # 시뮬에서는 켜지 않는다 — fake_global_localization 이 참값을 주므로
+    # AMCL 이 할 일이 없고, 오히려 실물과 다른 구조가 되어 이식이 어긋난다.
+    amcl_arg = LaunchConfiguration('amcl').perform(context).strip().lower()
+    if amcl_arg == '':
+        amcl_on = not is_sim          # 기본값: 실물이면 켠다
+        amcl_how = '(실물이라 자동으로 켬)'
+    else:
+        amcl_on = amcl_arg in ('true', '1', 'yes')
+        amcl_how = '(amcl 인자로 지정)'
+
+    if amcl_on:
+        # map_server 다음, controller_server 앞에 둔다 — 맵을 받아야 초기화된다.
+        lifecycle_nodes.insert(lifecycle_nodes.index('map_server') + 1, 'amcl')
+        nodes.append(Node(package='nav2_amcl', executable='amcl', name='amcl',
+                          parameters=node_params, **common))
+        # AMCL 은 초기 위치를 모르면 수렴하지 못한다. ekf_global(UWB) 추정치를
+        # 씨앗으로 한 번 넣어 주고 스스로 종료하는 노드.
+        nodes.append(Node(package='ship_ugv_navigation', executable='amcl_seed_node',
+                          name='amcl_seed_node',
+                          parameters=[{'use_sim_time': is_sim}], **common))
+        banner_amcl = f'사용 {amcl_how} — TF 미발행, /amcl_pose -> ekf_global pose1'
+    else:
+        banner_amcl = f'사용 안 함 {amcl_how}'
+
+    # ---- wheel_odom_bridge 의 heading_hold 끄기 (2026-08-17) --------------
+    # ★ 왜: wheel_odom_bridge 는 /cmd_vel 의 w 가 0 근처(|w| < 0.02)면
+    #   "직진 의도"로 보고 **발행자의 조향을 버리고 자기 PI 제어로 덮어쓴다.**
+    #   teleop·motion_controller 에게는 유용한 기능이지만(직진이 안 휘게 해준다),
+    #   Nav2 는 자기 컨트롤러가 이미 조향을 닫은 루프로 제어하고 있다.
+    #   그 위에 두 번째 제어 루프가 얹히면
+    #     ① Nav2 의 미세 조향(w=0.015 같은 값)이 통째로 버려져 경로 추종이 나빠지고
+    #     ② 두 루프가 서로 싸운다.
+    #   실제로 2026-08-17 에 이 heading_hold 가 상한 없는 w 를 만들어
+    #   **모터가 두 번 폭주했다** (wheel_odom_node.py 의 안전 수정 주석 참고).
+    #
+    # 노드를 재시작하지 않고 파라미터만 바꾸는 이유: wheel_odom_bridge 는
+    # localization.launch.py 소속이라 재시작하면 UWB 캘리브레이션까지 날아간다.
+    # 그래서 bridge 쪽에서 이 파라미터를 매 콜백마다 다시 읽도록 해 두었다.
+    #
+    # ⚠️ 반드시 재시도해야 한다 (2026-08-18 실측).
+    #   그냥 `ros2 param set` 을 한 번만 쏘면 **DDS 디스커버리가 끝나기 전에**
+    #   실행돼서 조용히 실패한다. 실제로 Nav2 시작 7초 뒤
+    #     [ERROR] process has died [exit code 1,
+    #             cmd 'ros2 param set /wheel_odom_bridge enable_heading_hold false']
+    #   가 찍혔고, heading_hold 가 true 로 남은 채 순찰이 돌아
+    #   **경로 추종이 통째로 망가졌다** (Nav2 조향과 bridge 조향이 서로 싸움).
+    #   런치 로그가 워낙 길어 이 ERROR 한 줄은 눈에 띄지도 않는다.
+    #   그래서 성공할 때까지 재시도하고, 끝내 실패하면 크게 찍는다.
+    nodes.append(_set_heading_hold('false', 'Nav2 시작', tries=30))
+
+    # ★ 그리고 Nav2 가 꺼질 때 반드시 되돌린다 (2026-08-17).
+    #   되돌리지 않으면 이런 함정이 생긴다:
+    #     Nav2 를 한 번 켰다 끔 -> heading_hold 가 false 로 남음
+    #     -> 그 상태로 재캘리브레이션하면 직진 보정 없이 주행해 크게 휨
+    #     -> 원인을 찾기 매우 어렵다 (아무 에러도 안 나고 조용히 휜다)
+    #   wheel_odom_bridge 는 localization.launch.py 소속이라 이 launch 를
+    #   껐다고 재시작되지 않는다. 그래서 여기서 명시적으로 복원해야 한다.
+    nodes.append(RegisterEventHandler(OnShutdown(on_shutdown=[
+        LogInfo(msg='Nav2 종료 — wheel_odom_bridge 의 heading_hold 를 다시 켠다 '
+                    '(teleop·캘리브레이션 직진 보정용)'),
+        _set_heading_hold('true', 'Nav2 종료', tries=10),
+    ])))
 
     nodes.append(
         Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
@@ -365,12 +449,42 @@ def launch_setup(context, *args, **kwargs):
         LogInfo(msg=f'  순찰         : {banner_patrol}'),
         LogInfo(msg=f'  이벤트 정지  : {banner_events}'),
         LogInfo(msg=f'  keepout      : {banner_keepout}'),
+        LogInfo(msg=f'  amcl         : {banner_amcl}'),
         LogInfo(msg='  cmd_vel 경로 : controller -> /cmd_vel_nav -> smoother -> /cmd_vel'),
         LogInfo(msg='─' * 60),
     ]
     banner += [LogInfo(msg=f'  ⚠️  {p}') for p in problems]
 
     return banner + nodes
+
+
+
+def _set_heading_hold(value: str, label: str, tries: int = 30):
+    """wheel_odom_bridge 의 enable_heading_hold 를 확실하게 바꾼다.
+
+    `ros2 param set` 은 상대 노드를 아직 디스커버리하지 못했으면 그냥 실패하고
+    끝난다. 런치 직후엔 이게 꽤 자주 일어난다 (2026-08-18 실측). 한 번 실패하면
+    heading_hold 가 의도와 반대로 남아 조용히 주행이 망가지므로, 성공을
+    확인할 때까지 1초 간격으로 재시도한다.
+    """
+    return ExecuteProcess(
+        cmd=['bash', '-c',
+             'for i in $(seq 1 %d); do '
+             '  if ros2 param set /wheel_odom_bridge enable_heading_hold %s '
+             '       2>/dev/null | grep -q successful; then '
+             '    echo "[heading_hold] %s: -> %s (${i}번째 시도에서 성공)"; '
+             '    exit 0; '
+             '  fi; '
+             '  sleep 1; '
+             'done; '
+             'echo "[heading_hold] ================================================"; '
+             'echo "[heading_hold] ❌ %s 를 %s 로 바꾸지 못했다."; '
+             'echo "[heading_hold]    wheel_odom_bridge 가 떠 있는지 확인할 것:"; '
+             'echo "[heading_hold]    ros2 node list | grep wheel_odom_bridge"; '
+             'echo "[heading_hold] ================================================"; '
+             'exit 1'
+             % (tries, value, label, value, 'enable_heading_hold', value)],
+        output='screen')
 
 
 def generate_launch_description():
@@ -406,6 +520,10 @@ def generate_launch_description():
             'events', default_value='',
             description='이벤트 정지 노드(event_gate_node) 실행. '
                         '비우면 patrol 값을 따라간다. 튜닝 중 끄려면 events:=false'),
+        DeclareLaunchArgument(
+            'amcl', default_value='',
+            description='AMCL 라이다 로컬라이제이션(TF 미발행, /amcl_pose 를 '
+                        'ekf_global 에 공급). 비우면 실물에서만 자동으로 켠다'),
         DeclareLaunchArgument(
             'use_rviz', default_value='false',
             description='Nav2 전용 RViz(nav.rviz) 동시 실행'),

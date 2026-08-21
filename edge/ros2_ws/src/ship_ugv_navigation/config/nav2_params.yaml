@@ -61,9 +61,15 @@
 #  과보호가 심하다. 반드시 다각형 footprint를 쓴다.
 #
 #  ── 속도 한계 ────────────────────────────────────────────────────────────
-#  슬램 담당자가 motion_controller_node.py에 정해둔 값을 그대로 따른다.
-#      max_linear_speed  0.15 m/s
-#      max_angular_speed 0.6  rad/s
+#  ★ 2026-08-18 갱신: 선속도 0.15 -> 0.25 m/s.
+#      max_linear_speed  0.25 m/s   (기존 0.15. 시연에 너무 느려 상향)
+#      max_angular_speed 0.6  rad/s (그대로)
+#      후진만 0.10 m/s 로 유지 — 후방 라이다가 필터로 잘려 뒤를 못 보기 때문
+#
+#  0.25 를 고른 근거: 아래 물리적 상한 표 기준 정격(0.806)의 31%.
+#  정지거리는 0.25^2/(2*0.8) = 3.9 cm 로 순찰 여유(0.30 m) 안쪽이다.
+#  motion_controller_node.py 는 여전히 0.15 로 동작한다 —
+#  그쪽은 캘리브레이션용 직진이라 느린 편이 정확하다. 일부러 다르게 둔다.
 #
 #  ⚠️ 중요: 이 제한은 motion_controller_node 안에서만 걸린다.
 #     /cmd_vel을 받는 wheel_odom_bridge에는 클램프가 없고 아두이노 펌웨어도
@@ -227,10 +233,23 @@ controller_server:
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
 
-      desired_linear_vel: 0.15         # = 담당자 속도 제한
+      # ★ 2026-08-18: 0.15 -> 0.25. 시연에서 "너무 느려 못 쓰겠다"는 판단.
+      #   JGB37-520 정격 최고속도가 0.806 m/s 라 0.25 는 31% 수준이고,
+      #   슬립 한계 가속(4.61 m/s^2) 대비 채택 가속(0.5)도 11% 라 여유가 크다.
+      #   정지거리는 0.25^2/(2*0.5) = 6.3 cm 로 순찰 여유(0.30 m) 안쪽이다.
+      desired_linear_vel: 0.25
       # 데드밴드(0.04) 위로 잡는다. 이보다 작으면 모터가 안 돈다.
       min_approach_linear_velocity: 0.05
-      approach_velocity_scaling_dist: 0.4
+      # ★★ 2026-08-18 — 순찰이 기어가던 진짜 원인 ★★
+      #   이 값은 "목표까지 이만큼 남으면 감속을 시작한다"는 거리다.
+      #   순찰 웨이포인트 간격은 원 둘레 / 개수 = 2*pi*0.75/12 = 0.39 m 인데
+      #   기존 값 0.4 m 가 그보다 커서, 로봇이 **한 번도 감속 구간을 벗어나지
+      #   못했다.** 늘 "목표에 접근 중"으로 판정되어 min_approach(0.05 m/s)
+      #   근처까지 계속 느려졌고, 최고 속도의 1/3 로 기어갔다.
+      #   도달 판정 반경(xy_goal_tolerance 0.15)에 맞춰 0.15 로 줄인다.
+      #   ⚠️ 웨이포인트 간격을 바꾸면 이 값도 같이 검토할 것 —
+      #      항상 '간격 > 이 값' 이어야 한다.
+      approach_velocity_scaling_dist: 0.15
 
       # ── 전방 주시 거리 (lookahead) ─────────────────────────────────────
       #   순수 추종은 경로 위 "앞의 한 점"을 향해 조향한다.
@@ -316,7 +335,38 @@ controller_server:
       use_rotate_to_heading: true
       rotate_to_heading_min_angle: 0.7        # 약 40도
       rotate_to_heading_angular_vel: 0.5
-      max_angular_accel: 1.2                  # = 0.6 / 0.5초
+      # ★★ 이 값은 "가속 제한"이 아니라 **제자리 회전을 시작할 수 있느냐**를 결정한다.
+      #     (2026-08-18, 로봇이 순찰 중 제자리에서 꿈틀대기만 하던 문제의 원인)
+      #
+      #  RPP 의 rotateToHeading() 은 목표 각속도(rotate_to_heading_angular_vel)를
+      #  그냥 내보내지 않고, **오도메트리가 알려주는 현재 각속도**를 기준으로
+      #  한 주기치만큼만 올려서 내보낸다:
+      #
+      #      angular_vel = clamp(0.5,
+      #                          측정각속도 - max_angular_accel * dt,
+      #                          측정각속도 + max_angular_accel * dt)
+      #
+      #  dt = 1 / controller_frequency = 1/20 = 0.05 초.
+      #  1.2 였을 때 첫 주기 출력은 0 + 1.2*0.05 = **0.06 rad/s**.
+      #  바퀴 속도로 환산하면 초당 9 mm 로, 우리 모터의 사구간보다 훨씬 작다.
+      #  -> 로봇이 안 돈다 -> 오도메트리가 계속 0 을 보고한다
+      #  -> 다음 주기도 또 0.06 -> **영원히 못 벗어나는 데드락**.
+      #  (실측: /odometry/local 의 angular.z 평균 0.003 rad/s, cmd 는 0.06 고정)
+      #
+      #  6.0 이면 첫 주기에 0 + 6.0*0.05 = 0.3 rad/s 를 요구한다. 이 값은
+      #  사구간을 넘으므로 로봇이 실제로 돌기 시작하고, 그때부터 오도메트리가
+      #  0 이 아닌 값을 돌려주면서 정상적으로 0.5 까지 올라간다.
+      #
+      #  ⚠️ 그렇다고 로봇이 급가속하지는 않는다. **실제 가속 제한은
+      #     velocity_smoother 가 담당**하기 때문이다 (max_accel 각속도 1.2 rad/s²).
+      #     smoother 는 측정값이 아니라 **자기 직전 출력**을 기준으로 램프하므로
+      #     같은 데드락에 빠지지 않는다. 그래서 여기서 족쇄를 푸는 것이 맞다.
+      #
+      #  ⚠️ 이 버그는 오랫동안 heading_hold 에 가려져 있었다. heading_hold 가
+      #     켜져 있으면 wheel_odom_bridge 가 RPP 의 각속도를 통째로 버리고
+      #     자기 값으로 덮어썼기 때문에 증상이 안 보였다. Nav2 실행 시
+      #     heading_hold 를 확실히 끄도록 고치자마자 드러났다.
+      max_angular_accel: 6.0
 
       allow_reversing: false                  # ⚠️ 아래 주석 참고
       max_robot_pose_search_dist: 5.0
@@ -519,11 +569,15 @@ velocity_smoother:
     #   속도·가속 제한을 걸 수 있는 곳이 여기뿐이다.
 
     #            [ x,    y,   theta]
-    max_velocity: [0.15, 0.0, 0.6]     # 담당자 속도 제한
+    # ★ 2026-08-18: 선속도 0.15 -> 0.25 (FollowPath 의 desired_linear_vel 과 맞춤).
+    #   후진은 뒤를 못 보므로 0.10 그대로 둔다 — 일부러 비대칭이다.
+    max_velocity: [0.25, 0.0, 0.6]
     min_velocity: [-0.10, 0.0, -0.6]   # 후진은 더 느리게 (뒤를 못 봄)
 
-    max_accel: [0.3, 0.0, 1.2]         # = 속도 / 0.5초
-    max_decel: [-0.5, 0.0, -1.5]       # 감속은 더 빠르게 (정지거리 2.25 cm)
+    # ★ 2026-08-18: 속도를 0.25 로 올린 만큼 가속도도 비례해서 올린다.
+    #   기준은 그대로 "0.5초에 최고속 도달". 감속은 여전히 더 빠르게 잡는다.
+    max_accel: [0.5, 0.0, 1.2]         # = 0.25 / 0.5초
+    max_decel: [-0.8, 0.0, -1.5]       # 정지거리 0.25^2/(2*0.8) = 3.9 cm
 
     # ★ deadband_velocity 는 반드시 0으로 둔다 (검토 후 확정, 2026-08-10)
     #
@@ -571,3 +625,90 @@ map_saver:
     save_map_timeout: 5.0
     free_thresh_default: 0.196     # 미탐사(205)가 자유공간으로 분류되지 않도록
     occupied_thresh_default: 0.65
+
+
+# ============================================================================
+#  amcl — 라이다-맵 스캔매칭 (2026-08-15 추가)
+# ============================================================================
+#  ★★ 이 노드는 TF 를 발행하지 않는다 (tf_broadcast: false) ★★
+#
+#  왜 이런 이상한 구성인가
+#  ------------------------
+#  보통 Nav2 는 AMCL 이 map->odom TF 를 소유한다. 이 프로젝트는 그 구조를
+#  쓰지 않는다 — TF 의 최종 권위자는 언제나 EKF 하나여야 한다는 원칙이 있고,
+#  실물에서는 ekf_global 이 그 역할을 한다 (설치가이드 7장).
+#  AMCL 이 TF 를 같이 쏘면 map->odom 이중 발행이 되어 TF 트리가 깨진다.
+#
+#  그래서 AMCL 을 "TF 주인"이 아니라 "센서 하나"로 쓴다.
+#      AMCL -> /amcl_pose -> ekf_global 의 pose1 입력 -> EKF 가 UWB 와 융합
+#  이러면 map->odom 발행자는 여전히 ekf_global 하나뿐이라 충돌이 없다.
+#
+#  무엇을 해결하려고 넣었나 (2026-08-15 실측)
+#  --------------------------------------------
+#  UWB 만으로 yaw 를 잡으면(heading_complementary_filter 의 course-over-ground)
+#  앵커 기하가 좁은 방에서 오차가 커서, 저장된 맵과 실시간 스캔이 수십 도씩
+#  틀어진 채 주행했다. 여유 0.075 m 짜리 순찰 원에서는 그만큼만 틀어져도
+#  통로가 막힌 것으로 판정되어 `Failed to make progress` 가 난다.
+#  라이다는 벽 모양을 직접 보므로 cm 급으로 정확하다. 둘을 EKF 에서 섞으면
+#  UWB(드리프트 없음) + 라이다(정밀) 의 장점만 남는다.
+#
+#  주의
+#  ----
+#  - 초기 위치 추정값이 있어야 수렴한다. amcl_seed_node 가 ekf_global 의
+#    현재 추정치를 /initialpose 로 한 번 넣어 준다 (UWB 가 AMCL 의 씨앗).
+#  - 후방 150도가 필터로 잘려 있어(공유기·UWB 판이 가림) 스캔이 210도뿐이다.
+#    360도일 때보다 매칭이 약하므로 update_min_* 를 작게 두어 자주 갱신한다.
+amcl:
+  ros__parameters:
+    use_sim_time: false
+
+    tf_broadcast: false          # ★ 절대 true 로 바꾸지 말 것 (ekf_global 과 이중 발행)
+    set_initial_pose: false      # amcl_seed_node 가 /initialpose 로 넣어 준다
+
+    global_frame_id: map
+    odom_frame_id: odom
+    base_frame_id: base_link
+    scan_topic: /scan_filtered   # navigation.launch.py 가 시뮬이면 /scan 으로 바꾼다
+
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
+    laser_model_type: "likelihood_field"
+
+    # 좁은 방 + 느린 로봇(0.15 m/s) 이라 자주 갱신해야 따라온다.
+    # 기본값(0.25 m / 0.2 rad)은 우리 순찰 반지름(0.30 m)에 비해 너무 크다.
+    # ★ 2026-08-18 재조정 0.10 -> 0.05.
+    #   AMCL 은 로봇이 이만큼 움직여야 스캔매칭을 한 번 돌린다. 그동안
+    #   heading 필터는 10 Hz 로 계속 측정을 밀어넣으므로, 정확도가 높은 AMCL 이
+    #   **횟수로 밀려** EKF 가 heading 쪽으로 끌려간다(실측: AMCL 이 공분산 6.5도로
+    #   수렴했는데도 EKF 가 29도 어긋남). 갱신을 잦게 해 그 불균형을 줄인다.
+    update_min_d: 0.05
+    update_min_a: 0.05
+    resample_interval: 1
+
+    min_particles: 500
+    max_particles: 2000
+
+    laser_min_range: 0.15        # laser_filter.yaml 의 range_filter 와 맞춤
+    laser_max_range: 12.0
+    max_beams: 60
+
+    # 오도메트리 노이즈 모델 (JGB37-520 + 캐스터, 실측 튜닝 여지 있음)
+    alpha1: 0.2
+    alpha2: 0.2
+    alpha3: 0.2
+    alpha4: 0.2
+    alpha5: 0.2
+
+    z_hit: 0.5
+    z_rand: 0.5
+    z_max: 0.05
+    z_short: 0.05
+    sigma_hit: 0.2
+    lambda_short: 0.1
+
+    pf_err: 0.05
+    pf_z: 0.99
+    recovery_alpha_fast: 0.0
+    recovery_alpha_slow: 0.0
+    save_pose_rate: 0.5
+    transform_tolerance: 1.0
+    always_reset_initial_pose: false

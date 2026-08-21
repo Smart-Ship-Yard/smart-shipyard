@@ -112,7 +112,14 @@ class PatrolMissionNode(Node):
             ('retry_delay_s', 2.0),
             ('max_consecutive_fails', 4),
             ('wait_retry_interval_s', 5.0),
-            ('goal_timeout_s', 60.0),
+            # ★ 60 -> 30 (2026-08-18 실측). 사람이 순찰 경로에 서 있을 때
+            #   60초는 너무 길었다 — 로봇이 회전/대기/후진을 반복하는 동안
+            #   웨이포인트가 하나도 안 넘어갔다.
+            #   BT(navigate_with_spin.xml)의 재시도를 3회로 줄여 20~25초면
+            #   FAILURE 가 돌아오므로, 이 값은 그게 안 돌아올 때를 위한
+            #   **안전망**이다. BT 보다 살짝 길게 둬서 정상 실패 경로를
+            #   가로채지 않도록 한다.
+            ('goal_timeout_s', 30.0),
             ('map_frame', 'map'),
             ('base_frame', 'base_link'),
             ('nav2_lifecycle_node', 'bt_navigator'),
@@ -145,6 +152,7 @@ class PatrolMissionNode(Node):
         self.state_cli = self.create_client(
             GetState, f'/{self.lifecycle_node}/get_state')
         self._state_future = None
+        self._state_future_sent_at = None
 
         self.create_subscription(Bool, '/event/active', self._event_cb, 10)
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -265,6 +273,13 @@ class PatrolMissionNode(Node):
 
         서비스 호출을 블로킹으로 하면 그 사이 /event/active 가 처리되지 않으므로
         future 를 들고 다니며 타이머마다 완료를 확인한다.
+
+        ★ 2026-08-15 실측으로 잡은 버그: bt_navigator 가 Configuring 등으로
+        바쁠 때 응답이 rmw 레벨에서 유실되면(`failed to send response ...
+        (timeout)`) future 가 영원히 done() 이 안 된다. 재시도 로직이 없으면
+        WAIT_NAV2 에서 영영 못 빠져나와 patrol_mission_node 를 수동으로
+        재시작해야 했다. 일정 시간 지나도 안 끝나면 버리고 다음 틱에 새로
+        요청한다.
         """
         if not self.nav.server_is_ready():
             return False
@@ -272,8 +287,14 @@ class PatrolMissionNode(Node):
             return False
         if self._state_future is None:
             self._state_future = self.state_cli.call_async(GetState.Request())
+            self._state_future_sent_at = self.get_clock().now()
             return False
         if not self._state_future.done():
+            elapsed = (self.get_clock().now() - self._state_future_sent_at).nanoseconds / 1e9
+            if elapsed > 3.0:
+                self.get_logger().warn(
+                    'get_state 응답 유실(3초 초과) — 재요청')
+                self._state_future = None
             return False
         try:
             state_id = self._state_future.result().current_state.id

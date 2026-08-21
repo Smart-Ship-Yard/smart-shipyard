@@ -94,20 +94,11 @@ def required_space(obs_x, obs_y, margin=DEFAULT_MARGIN):
 # ======================================================================
 # 맵 로딩
 # ======================================================================
-def load_map(yaml_path):
-    meta = {}
-    with open(yaml_path) as f:
-        for line in f:
-            line = line.split('#')[0].strip()
-            if ':' not in line:
-                continue
-            k, v = line.split(':', 1)
-            meta[k.strip()] = v.strip()
+def read_pgm(pgm_path):
+    """P5 PGM 을 (폭, 높이, 픽셀 bytearray) 로 읽는다. 주석 줄을 건너뛴다.
 
-    res = float(meta['resolution'])
-    origin = [float(x) for x in meta['origin'].strip('[]').split(',')]
-    pgm_path = os.path.join(os.path.dirname(os.path.abspath(yaml_path)), meta['image'])
-
+    bake_map_origin.py 도 이 함수를 쓴다 (맵 회전을 픽셀에 굽기 위해).
+    """
     d = open(pgm_path, 'rb').read()
     parts, i = [], 0
     while len(parts) < 4:                     # P5 / width / height / maxval
@@ -123,7 +114,24 @@ def load_map(yaml_path):
         parts.append(d[s:i])
     i += 1
     w, h = int(parts[1]), int(parts[2])
-    px = d[i:i + w * h]
+    return w, h, bytearray(d[i:i + w * h])
+
+
+def load_map(yaml_path):
+    meta = {}
+    with open(yaml_path) as f:
+        for line in f:
+            line = line.split('#')[0].strip()
+            if ':' not in line:
+                continue
+            k, v = line.split(':', 1)
+            meta[k.strip()] = v.strip()
+
+    res = float(meta['resolution'])
+    origin = [float(x) for x in meta['origin'].strip('[]').split(',')]
+    pgm_path = os.path.join(os.path.dirname(os.path.abspath(yaml_path)), meta['image'])
+
+    w, h, px = read_pgm(pgm_path)
 
     free = [[px[r * w + c] == FREE for c in range(w)] for r in range(h)]
     return {'w': w, 'h': h, 'res': res, 'ox': origin[0], 'oy': origin[1],
@@ -190,25 +198,90 @@ def clearance_at(m, x, y, cap=0.8):
     return cap
 
 
+# 로봇이 접선을 완벽히 따라가지 못하는 각도(도). 웨이포인트를 향해 틀어진다.
+#   2026-08-21 실측: 반지름 0.60 순찰 중 접선에서 26도 안쪽을 보고 있었고,
+#   그 바람에 앞으로 0.332 m 뻗은 차체가 마스크를 9 mm 밟아 갇혔다.
+#   접선만 가정하고 검사하면 "여유 0.325 m" 라고 통과시켜 버린다.
+HEADING_ERR_DEG = 30.0
+
+
 def check_circle(m, cx, cy, r, step_deg=2):
-    """반지름 r 원을 실제 footprint로 훑어 충돌 각도 수와 최소 여유를 반환."""
+    """반지름 r 원을 실제 footprint로 훑어 충돌 각도 수와 최소 여유를 반환.
+
+    ★ 접선 방향만 보지 않는다. ±HEADING_ERR_DEG 만큼 틀어진 자세도 함께 본다.
+      로봇은 웨이포인트를 향해 조금씩 안쪽을 보며 돌고, 차체가 앞으로
+      0.332 m 뻗어서 각도가 조금만 틀어져도 코끝이 크게 파고든다.
+      (여기서 보는 것은 **맵의 벽**이다. 배는 맵에 안 찍히므로
+       배와의 간격은 아래 min_patrol_radius 가 따로 지킨다)
+    """
     pts = footprint_points()
     bad, worst = 0, 99.0
     for a in range(0, 360, step_deg):
         th = math.radians(a)
         bx, by = cx + r * math.cos(th), cy + r * math.sin(th)
-        hd = th + math.pi / 2                      # 원의 접선 방향
-        ch, sh = math.cos(hd), math.sin(hd)
         hit = False
-        for px, py in pts:
-            X, Y = bx + px * ch - py * sh, by + px * sh + py * ch
-            if not is_free(m, X, Y):
-                hit = True
+        for err in (-HEADING_ERR_DEG, 0.0, HEADING_ERR_DEG):
+            hd = th + math.pi / 2 + math.radians(err)
+            ch, sh = math.cos(hd), math.sin(hd)
+            for px, py in pts:
+                X, Y = bx + px * ch - py * sh, by + px * sh + py * ch
+                if not is_free(m, X, Y):
+                    hit = True
+                    break
+                worst = min(worst, clearance_at(m, X, Y, cap=0.5))
+            if hit:
                 break
-            worst = min(worst, clearance_at(m, X, Y, cap=0.5))
         if hit:
             bad += 1
     return bad, (0.0 if worst > 90 else worst)
+
+
+def min_patrol_radius(mask_w, mask_h, margin, step=0.05):
+    """차체 어느 점도 마스크에 닿지 않는 최소 순찰 반지름.
+
+    ★ 2026-08-21 실측으로 다시 만든 규칙 ★
+    예전에는 "배 반대각 + 여유" 만 봤다(반지름 0.60 이 나왔다). 그런데
+      · 지켜야 할 것은 배가 아니라 **마스크**다 (배보다 사방 0.07 크다)
+      · 로봇은 접선을 완벽히 따라가지 못한다 (실측 26도 틀어져 있었다)
+      · 차체가 앞으로 0.332 m 뻗어서, 틀어지면 코끝이 원 안쪽으로 파고든다
+    이 셋을 빼먹어서 0.60 을 "여유 0.325 m" 로 통과시켰고, 실제로는 코끝이
+    마스크를 9 mm 밟아 로봇이 금지영역에 갇혔다. Nav2 는 충돌로 보고
+    복구 동작(spin -> 실패 -> wait)만 반복했다.
+
+    이제 실제 footprint 를 ±HEADING_ERR_DEG 로 돌려가며 마스크 사각형과의
+    간격을 직접 잰다.
+    """
+    pts = footprint_points()
+    hw, hh = mask_w / 2.0, mask_h / 2.0
+    r = 0.20
+    while r <= 2.0:
+        ok = True
+        for a in range(0, 360, 5):
+            th = math.radians(a)
+            bx, by = r * math.cos(th), r * math.sin(th)   # 마스크 중심 기준
+            for err in (-HEADING_ERR_DEG, 0.0, HEADING_ERR_DEG):
+                hd = th + math.pi / 2 + math.radians(err)
+                ch, sh = math.cos(hd), math.sin(hd)
+                for px, py in pts:
+                    X, Y = bx + px * ch - py * sh, by + px * sh + py * ch
+                    # 축정렬 사각형까지의 거리 (안이면 0)
+                    dx = max(hw - abs(X), 0.0) if abs(X) < hw else abs(X) - hw
+                    dy = max(hh - abs(Y), 0.0) if abs(Y) < hh else abs(Y) - hh
+                    inside = abs(X) < hw and abs(Y) < hh
+                    gap = -min(dx, dy) if inside else math.hypot(
+                        max(abs(X) - hw, 0.0), max(abs(Y) - hh, 0.0))
+                    if gap < margin:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if not ok:
+                break
+        if ok:
+            return r
+        r += step
+    return None
+
 
 
 # ======================================================================
@@ -324,7 +397,7 @@ def emit_patrol_yaml(path, map_name, cx, cy, radius, margin_val, tight):
     return n
 
 
-def emit_keepout_mask(path, m, bbox, map_name):
+def emit_keepout_mask(path, m, bbox, map_name, rect=None, pad_m=None):
     """Nav2 KeepoutFilter 용 마스크(.pgm + .yaml)를 만든다.
 
     왜 필요한가:
@@ -339,17 +412,49 @@ def emit_keepout_mask(path, m, bbox, map_name):
     """
     w, h, res = m['w'], m['h'], m['res']
     r0, r1, c0, c1 = bbox
-    pad = int(round(MASK_PAD / res))
+    pad_m = MASK_PAD if pad_m is None else pad_m
+    pad = int(round(pad_m / res))
     r0 = max(0, r0 - pad)
     r1 = min(h - 1, r1 + pad)
     c0 = max(0, c0 - pad)
     c1 = min(w - 1, c1 + pad)
 
     px = bytearray([FREE]) * (w * h)
-    for r in range(r0, r1 + 1):
-        base = r * w
-        for c in range(c0, c1 + 1):
-            px[base + c] = OCCUPIED
+
+    if rect is not None:
+        # ★ 기울어진 사각형을 **그대로** 칠한다 (2026-08-19).
+        #   예전에는 회전 사각형을 감싸는 축정렬 사각형(bbox)을 통째로 칠했다.
+        #   "넉넉한 편이 안전하다"는 이유였는데, 길쭉한 대상이 비스듬히 놓이면
+        #   낭비가 급격히 커진다. 당시(2026-08-19) 실측 사례:
+        #       배 0.80 x 0.18 m, yaw -15도   ← 그때 쓰던 값. 지금은
+        #                                        finalize_map.SHIP_SIZE_XY 참조
+        #       축정렬 방식 -> 마스크 0.95 x 0.55 m  (폭이 실제의 3배)
+        #       회전 방식   -> 마스크 0.90 x 0.28 m
+        #   그 0.27 m 차이 때문에 **캘리브레이션 시작 위치가 금지영역에 물려**
+        #   Nav2 가 "로봇이 충돌 상태"로 판단해 복구 동작만 반복했다.
+        #   좁은 방에서는 이 낭비가 곧 순찰 여유를 깎아먹는다.
+        rcx, rcy, rsx, rsy, ryaw = rect
+        hx = rsx / 2.0 + pad_m
+        hy = rsy / 2.0 + pad_m
+        cs, sn = math.cos(ryaw), math.sin(ryaw)
+        for r in range(r0, r1 + 1):
+            base = r * w
+            wy = m['oy'] + ((h - 1) - r) * res + res / 2.0
+            for c in range(c0, c1 + 1):
+                wx = m['ox'] + c * res + res / 2.0
+                dx, dy = wx - rcx, wy - rcy
+                # 사각형 로컬 좌표로 회전시켜 안에 드는지만 본다
+                lx = dx * cs + dy * sn
+                ly = -dx * sn + dy * cs
+                if abs(lx) <= hx and abs(ly) <= hy:
+                    px[base + c] = OCCUPIED
+    else:
+        # 맵의 장애물 섬으로 스냅한 경우. 그 bbox 는 이미 축정렬이라
+        # 회전 정보가 없다. 예전 방식 그대로 채운다.
+        for r in range(r0, r1 + 1):
+            base = r * w
+            for c in range(c0, c1 + 1):
+                px[base + c] = OCCUPIED
 
     pgm_path = os.path.splitext(path)[0] + '.pgm'
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -382,8 +487,20 @@ def emit_keepout_mask(path, m, bbox, map_name):
         ]))
 
     print(f'   🧱 keepout 마스크 생성: {path}')
-    print(f'      금지 영역 {(c1 - c0 + 1) * res:.2f} x {(r1 - r0 + 1) * res:.2f} m '
-          f'(대상 외곽 + 여유 {MASK_PAD} m)')
+    # ★ 실제로 칠한 면적을 찍는다 (2026-08-19).
+    #   예전에는 축정렬 범위(c1-c0, r1-r0)를 찍었는데, 회전 사각형을 칠하게 된
+    #   뒤로는 그 값이 실제보다 크다. 실측 예: 실제 0.90 x 0.40 인데 1.00 x 0.60
+    #   으로 찍혔다. "문구는 이렇게 말하는데 코드는 다르게 한다" 는 오늘 여러 번
+    #   사람을 헤매게 만들었다. 숫자는 실제와 같아야 한다.
+    filled = sum(1 for v in px if v == OCCUPIED)
+    if rect is not None:
+        print(f'      금지 영역 {rsx + 2 * pad_m:.2f} x {rsy + 2 * pad_m:.2f} m '
+              f'({math.degrees(ryaw):.0f}도 기울어진 사각형, '
+              f'대상 {rsx:.2f} x {rsy:.2f} + 여유 {pad_m} m 사방)')
+        print(f'      칠한 셀 {filled}개 = {filled * res * res:.3f} m^2')
+    else:
+        print(f'      금지 영역 {(c1 - c0 + 1) * res:.2f} x {(r1 - r0 + 1) * res:.2f} m '
+              f'(대상 외곽 + 여유 {pad_m} m)')
 
 
 def _wrap(text, width):
@@ -420,8 +537,37 @@ def rect_bbox(m, cx, cy, sx, sy, yaw):
             max(0, int(math.floor(min(cols)))), min(m['w'] - 1, int(math.ceil(max(cols)))))
 
 
+def _print_radius_howto(cands, best, map_name):
+    """다른 반지름으로 바꾸는 법을 그대로 복사해 쓸 수 있게 찍는다.
+
+    표에 ★ 가 여러 개인데 자동으로 하나가 골라지면, 나머지를 어떻게
+    쓰는지 알 길이 없다. 웨이포인트 개수가 반지름에 맞물려 계산되므로
+    patrol yaml 을 손으로 고치면 간격 규칙이 깨진다. 반드시 다시 만들어야 한다.
+    """
+    others = [c for c in cands if abs(c[0] - best[0]) > 0.001]
+    if not others:
+        return
+    print()
+    print('   다른 반지름으로 바꾸려면 — 아래를 그대로 복사해서 쓰면 된다:')
+    print()
+    print('     cd ~/smart-shipyard/edge/ros2_ws/src/ship_ugv_navigation')
+    print(f'     python3 scripts/finalize_map.py {map_name} --radius <반지름>')
+    print()
+    print('     고를 수 있는 값: '
+          + ', '.join(f'{c[0]:.2f}' for c in cands) + '  (m)')
+    print(f'     예)  python3 scripts/finalize_map.py {map_name} '
+          f'--radius {others[-1][0]:.2f}')
+    print()
+    print('   ※ patrol_*.yaml 을 손으로 고치지 말 것. 웨이포인트 개수가')
+    print('     반지름에 맞물려 계산되므로 반지름만 바꾸면 간격 규칙이 깨진다.')
+    print('   ※ 반지름을 바꿔도 맵과 마스크는 그대로다. 순찰 설정만 다시 쓴다.')
+
+
 def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
-                emit_mask=None, mask_size=None, mask_yaw=0.0):
+                emit_mask=None, mask_size=None, mask_yaw=0.0, mask_pad=None,
+                max_radius=1.00, pick_radius=None):
+    mask_pad = MASK_PAD if mask_pad is None else mask_pad
+    mask_rect = None   # (cx, cy, sx, sy, yaw) — 회전 사각형으로 칠할 때만 채워진다
     m = load_map(yaml_path)
     res, w, h = m['res'], m['w'], m['h']
     n_free = sum(sum(row) for row in m['free'])
@@ -505,9 +651,19 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
             # 대상 크기를 직접 받은 경우. 라이다에 안 잡히는 대상(모형 배)은
             # 맵에 섬이 없으므로 이 경로로만 마스크를 만들 수 있다.
             bbox = rect_bbox(m, cx, cy, mask_size[0], mask_size[1], mask_yaw)
-            print(f'  대상 크기 {mask_size[0]:.2f} x {mask_size[1]:.2f} m '
-                  f'(yaw {math.degrees(mask_yaw):.0f}도) 를 함께 받았다 — 마스크에 사용')
-            print('  좌표도 지정값을 그대로 쓴다 (맵의 장애물로 스냅하지 않음)')
+            mask_rect = (cx, cy, mask_size[0], mask_size[1], mask_yaw)
+            # "함께 받았다" 라고 찍었더니 측량이 재서 넘겨준 값처럼 읽혔다.
+            # 실제로는 줄자로 재서 코드에 박아둔 상수다(2026-08-20 정정).
+            print(f'  배 크기는 이미 알고 있다 — 사용자가 줄자로 재서 넣어둔 '
+                  f'{mask_size[0]:.2f} x {mask_size[1]:.2f} m (yaw {math.degrees(mask_yaw):.0f}도)')
+            print('  같은 모형 배만 쓰므로 매번 같다.')
+            print('  중심 좌표는 measure_ship_center.py 로 실측한 값을 쓴다:')
+            print('    cd ~/smart-shipyard/edge/ros2_ws/src/ship_ugv_navigation')
+            print('    python3 scripts/measure_ship_center.py')
+            print('  (YOLO 로 배 표면점을 모아 중심을 추정하던 옛 측량법은 안 쓴다 —')
+            print('   같은 배를 1.68 x 0.35 m 로 재는 등 못 믿을 값이 나왔다)')
+            print('  맵에서 배를 찾아 그쪽으로 좌표를 옮기는 보정도 하지 않는다.')
+            print('  배가 라이다(21 cm)보다 낮아(19 cm) 맵에 아예 안 찍히기 때문이다.')
 
         # 크기를 못 받았으면 "어느 물체냐"를 고르는 용도로만 좌표를 쓴다.
         # 중심 좌표 자체는 그 물체의 픽셀 무게중심으로 바꾼다 — 사람이 눈대중으로
@@ -530,29 +686,37 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
             print('     지정한 좌표를 그대로 순찰 중심으로 쓰고, 마스크는 만들지 않는다')
     print()
 
+    # ★ 마스크를 여기서 먼저 만든다 (2026-08-20).
+    #   예전에는 "완주 가능한 반지름을 찾았을 때"에만 만들었다. 그래서 순찰이
+    #   불가능한 맵에서는 마스크가 아예 안 나왔고, 그 상태로 Nav2 를 켜면
+    #   launch 가 "마스크 없음"으로 판단해 **배를 밟고 지나간다.**
+    #   마스크는 대상이 어디 있느냐의 문제일 뿐, 순찰이 되느냐와 무관하다.
+    map_name = os.path.splitext(os.path.basename(yaml_path))[0]
+    if emit_mask and bbox is not None:
+        emit_keepout_mask(emit_mask, m, bbox, map_name,
+                          rect=mask_rect, pad_m=mask_pad)
+        print()
+
     good = []       # 완주 + 여유 충분
     passable = []   # 완주는 되나 여유 부족
     r = 0.20
 
     # ★ 대상이 라이다에 안 잡히면 맵에는 아무것도 없다. 그러면 check_circle 이
     #   "빈 공간이니 아무 반지름이나 된다"고 판정해 **대상을 관통하는 원**이 뽑힌다.
-    #   (실제로 0.79 m 짜리 배에 반지름 0.20 m 가 나온 적이 있다 — 배 속을 도는 셈)
+    #   (실제로 0.79 m 짜리 배에 반지름 0.20 m 가 나온 적이 있다 — 배 속을 도는 셈.
+    #    2026-08-19 사례라 치수는 그때 값이다)
     #   크기를 아는 경우에는 차체 안쪽 끝이 대상 모서리를 넘지 않도록 직접 막는다.
     if mask_size:
-        reach = math.hypot(mask_size[0] / 2.0, mask_size[1] / 2.0)
-        need_inner = reach + margin
-        min_r = None
-        rr = 0.20
-        while rr <= 1.60:
-            if sweep_bounds(rr)[0] >= need_inner:
-                min_r = rr
-                break
-            rr += 0.05
-        print(f'대상이 맵에 없어 크기로 최소 반지름을 정한다: '
-              f'중심에서 모서리까지 {reach:.3f} m + 여유 {margin} m '
-              f'= 차체 안쪽이 {need_inner:.3f} m 밖에 있어야 함')
+        # 지켜야 할 것은 배가 아니라 **마스크**다. Nav2 가 금지영역으로 보는
+        # 것이 마스크이고, 배보다 사방 mask_pad 만큼 크다.
+        mw, mh = mask_size[0] + 2 * mask_pad, mask_size[1] + 2 * mask_pad
+        min_r = min_patrol_radius(mw, mh, margin)
+        print(f'대상이 맵에 없어 마스크 크기로 최소 반지름을 정한다: '
+              f'마스크 {mw:.2f} x {mh:.2f} m 에서 사방 {margin} m 를 띄운다')
+        print(f'  차체를 접선 ±{HEADING_ERR_DEG:.0f}도 로 돌려가며 실제로 재본 값이다 '
+              f'— 로봇이 접선을 완벽히 따라가지 못하기 때문이다')
         if min_r is None:
-            print('❌ 1.60 m 까지 봐도 차체 안쪽이 대상을 비켜가지 못한다 — 대상이 너무 크다')
+            print('❌ 2.0 m 까지 봐도 차체가 마스크를 비켜가지 못한다 — 대상이 너무 크다')
             return 1
         print(f'  -> {min_r:.2f} m 부터 검사한다 (그 미만은 대상을 관통하므로 제외)')
         print()
@@ -561,7 +725,13 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
     print(' 반지름 | 완주 | 최소여유 | 판정')
     print('--------+------+----------+---------------------------')
 
-    while r <= 1.60:
+    # 1.60 m 까지 무조건 훑던 것을 줄인다 (2026-08-21).
+    #   배가 0.77 m 로 고정이라 그보다 훨씬 큰 반지름은 쓸 일이 없고,
+    #   표가 20줄 넘게 나와 정작 볼 값이 묻힌다. 두 가지로 자른다.
+    #     · max_radius 까지만 (기본 1.00 m, --max-radius 로 변경)
+    #     · 한 번이라도 되던 것이 3연속 실패하면 거기서 끝 (경계만 보여준다)
+    fail_streak = 0
+    while r <= max_radius + 1e-9:
         bad, worst = check_circle(m, cx, cy, r)
         if bad == 0:
             passable.append((r, worst))
@@ -569,29 +739,43 @@ def analyze_map(yaml_path, center=None, margin=DEFAULT_MARGIN, emit_patrol=None,
             if worst >= margin:
                 good.append((r, worst))
             print(f'  {r:.2f}m |  OK  |  {worst:.3f}m | {verdict}')
+            fail_streak = 0
         else:
             print(f'  {r:.2f}m |  --  |  {worst:.3f}m | {bad}개 각도에서 충돌')
+            fail_streak += 1
+            if passable and fail_streak >= 3:
+                print('  (여기부터 계속 막힌다 — 더 안 본다)')
+                break
         r += 0.05
 
     def report(cands, radius_label, tight):
+        # 기본은 "여유가 가장 큰 것". 사람이 --radius 로 고르면 그것을 쓴다.
         best = max(cands, key=lambda t: t[1])
         lo, hi = cands[0][0], cands[-1][0]
         print(f'   {radius_label} {lo:.2f} ~ {hi:.2f} m')
         print(f'   권장: {best[0]:.2f} m (여유 {best[1]:.3f} m)')
+        if pick_radius is not None:
+            hit = min(cands, key=lambda t: abs(t[0] - pick_radius))
+            if abs(hit[0] - pick_radius) > 0.001:
+                print(f'   ⚠️ --radius {pick_radius:.2f} m 는 쓸 수 있는 값이 아니다 '
+                      f'— 가장 가까운 {hit[0]:.2f} m 로 간다')
+            else:
+                print(f'   ▶ --radius 로 {hit[0]:.2f} m 를 골랐다 '
+                      f'(여유 {hit[1]:.3f} m)')
+            best = hit
         print()
         if emit_patrol:
-            map_name = os.path.splitext(os.path.basename(yaml_path))[0]
             emit_patrol_yaml(emit_patrol, map_name, cx, cy, best[0], best[1], tight)
+            _print_radius_howto(cands, best, map_name)
             if emit_mask:
                 if bbox is not None:
-                    emit_keepout_mask(emit_mask, m, bbox, map_name)
                     # 마스크는 대상 외곽에 MASK_PAD 만큼 더 부풀린다. 좁은 맵에서는
                     # 그 여유가 순찰 여유를 거의 다 먹어 경로가 금지영역에 닿는다.
                     # 조용히 두면 "왜 갑자기 경로가 안 나오지" 로 헤매게 된다.
-                    if MASK_PAD >= best[1] - 0.03:
+                    if mask_pad >= best[1] - 0.03:
                         print()
                         print('   ' + '=' * 62)
-                        print(f'   ⚠️ 마스크 여유({MASK_PAD} m)가 순찰 여유'
+                        print(f'   ⚠️ 마스크 여유({mask_pad} m)가 순찰 여유'
                               f'({best[1]:.3f} m)를 거의 다 먹는다')
                         print(f'      남는 폭 {best[1] - MASK_PAD:.3f} m — '
                               f'순찰 경로가 금지영역에 닿을 수 있다.')
@@ -650,6 +834,11 @@ def main():
                     help='순찰 중심 map 좌표 (생략 시 자동 탐지)')
     ap.add_argument('--obstacle', nargs=2, type=float, metavar=('X', 'Y'),
                     help='중앙 물체 크기(m). 맵 없이 필요 공터만 계산')
+    ap.add_argument('--max-radius', type=float, default=1.00, metavar='M',
+                    help='순찰 반지름을 여기까지만 훑는다 (기본 1.00 m). '
+                         '배가 0.77 m 로 고정이라 그보다 큰 원은 쓸 일이 없다')
+    ap.add_argument('--radius', type=float, default=None, metavar='M',
+                    help='순찰 반지름을 직접 고른다. 안 주면 여유가 가장 큰 것을 쓴다')
     ap.add_argument('--margin', type=float, default=DEFAULT_MARGIN,
                     help=f'안전여유 m (기본 {DEFAULT_MARGIN})')
     ap.add_argument('--emit-patrol', metavar='PATH',
@@ -662,6 +851,11 @@ def main():
     ap.add_argument('--mask-size', nargs=2, type=float, metavar=('W', 'H'),
                     help='마스크에 그릴 대상 크기(m). 대상이 라이다에 안 잡혀 '
                          '맵에서 크기를 알 수 없을 때 쓴다. --center 와 함께 준다')
+    ap.add_argument('--mask-pad', type=float, default=None, metavar='M',
+                    help=f'마스크를 대상 외곽에서 이만큼 더 부풀린다(m). '
+                         f'기본 {MASK_PAD}. 측량 중심에 오차가 있을 때 그만큼 키워서 '
+                         f'덮는 용도다. 키울수록 순찰 여유를 깎아먹으니 '
+                         f'경고가 뜨면 줄일 것.')
     ap.add_argument('--mask-yaw', type=float, default=0.0, metavar='RAD',
                     help='대상 방향각(라디안). --mask-size 와 함께 쓴다. '
                          '회전 사각형을 감싸는 축정렬 사각형으로 그린다')
@@ -676,8 +870,9 @@ def main():
             print('❌ --mask-size 는 --center 와 함께 줘야 한다 '
                   '(어디에 그릴지 알 수 없음)')
             return 3
-        return analyze_map(a.map, a.center, a.margin, a.emit_patrol, a.emit_mask,
-                           a.mask_size, a.mask_yaw)
+        return analyze_map(a.map, a.center, a.margin, a.emit_patrol,
+                           a.emit_mask, a.mask_size, a.mask_yaw, a.mask_pad,
+                           max_radius=a.max_radius, pick_radius=a.radius)
     ap.print_help()
     return 3
 

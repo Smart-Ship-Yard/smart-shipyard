@@ -1,0 +1,14 @@
+{
+  "x": 0.14904225619111666,
+  "y": -1.0415,
+  "yaw_deg": 0.0,
+  "frame": "map",
+  "source": "measure_ship_center.py",
+  "timestamp": 1787303147.663072,
+  "depth_m": 0.9,
+  "x_cam": -0.014042256191116605,
+  "samples": 14,
+  "class_id": "\uc911\uc559\ud0d0\uce68 \uc720\ud6a80.936",
+  "thickness_m": 0.105,
+  "via_tf": false
+}

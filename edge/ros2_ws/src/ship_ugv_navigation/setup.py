@@ -27,6 +27,11 @@ setup(
             glob('maps/*.yaml') + glob('maps/*.pgm')),
         # keepout 마스크. finalize_map.py 가 맵마다 만들며, 없을 수도 있다
         # (라이다에 잡히는 대상만 있는 맵). glob 이 빈 목록이어도 문제없다.
+        # 캘리브레이션 기록. 전원이 나가면 노드 메모리의 map<-uwb_frame 이
+        # 날아가는데, 이 파일을 불러오면 되살릴 수 있다(재매핑 불필요).
+        #   ros2 launch ship_ugv_localization localization.launch.py calib:=<맵이름>
+        (os.path.join('share', package_name, 'maps', 'calibration_records'),
+            glob('maps/calibration_records/*.json')),
         (os.path.join('share', package_name, 'masks'),
             glob('masks/*.yaml') + glob('masks/*.pgm')),
         (os.path.join('share', package_name, 'worlds'), glob('worlds/*.world')),
@@ -57,10 +62,21 @@ setup(
             'ship_ugv_navigation.fake_global_localization:main',
 
             # ── [시뮬·실물 공용] 아래 둘은 양쪽에서 그대로 실행한다 ─────────
+            # 실측한 배 중심을 켜질 때마다 서버로 보낸다. 매핑을 안 하는
+            # 날에도 프론트엔드가 배 위치를 받게 하려는 것이다.
+            'ship_pose_publisher = '
+            'ship_ugv_navigation.ship_pose_publisher:main',
+
             'patrol_mission_node = '
             'ship_ugv_navigation.patrol_mission_node:main',
             'event_gate_node = '
             'ship_ugv_navigation.event_gate_node:main',
+
+            # ── [실물 전용] AMCL 에 초기 위치를 한 번 넣고 스스로 종료한다 ──
+            #   시뮬은 fake_global_localization 이 참값을 주므로 AMCL 자체를
+            #   띄우지 않는다 (navigation.launch.py 가 실물에서만 켠다).
+            'amcl_seed_node = '
+            'ship_ugv_navigation.amcl_seed_node:main',
         ],
     },
 )
