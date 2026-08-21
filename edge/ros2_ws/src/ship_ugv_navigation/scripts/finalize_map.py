@@ -426,8 +426,16 @@ def main():
         else:
             return 1
 
-    if align_src is None:          # --force 인 경우 최신 것으로 진행
+    if align_src is None and all_aligns:   # --force 인 경우 최신 것으로 진행
         align_src = all_aligns[-1]
+    if align_src is None:
+        # 정합 기록이 아예 없다 (/tmp 가 비워졌을 때). 이미 마무리된 맵이면
+        # [2/4] 를 건너뛸 것이라 문제없다 — 순찰 설정만 다시 만들면 된다.
+        if not already_baked:
+            print('❌ 정합 기록이 없어 origin 보정을 할 수 없다.')
+            return 1
+        print('  정합 기록이 없지만 이미 마무리된 맵이라 그냥 넘어간다.')
+        align_dst = os.path.join(records, f'align_{name}.json')
 
     # 고른 기록이 맵보다 한참 오래됐으면 다른 세션의 것일 수 있다.
     # 잘못된 변환이 적용된 맵은 겉보기에 멀쩡해서 Nav2를 돌려봐야 알게 되므로
