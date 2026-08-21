@@ -1,3 +1,4 @@
+cat > ~/smart-shipyard/edge/ros2_ws/src/ship_ugv_perception/ship_ugv_perception/yolo_depth_publisher.py << 'PYEOF'
 #!/usr/bin/env python3
 """
 yolo_depth_publisher.py
@@ -5,18 +6,24 @@ yolo_depth_publisher.py
 Astra+ 카메라로 Color+Depth를 받아 YOLO로 객체를 검출하고,
 검출된 각 객체의 (u, v, depth, depth_xyz)를 /event_detection/uvd 토픽에 발행한다.
 
-[2026-07-14 지연 문제 근본 해결]
-기존에는 카메라 캡처 -> 원본 발행 -> YOLO 추론 -> 주석 발행이 전부 하나의
-콜백(타이머) 안에서 순차 실행되어, "원본을 먼저 발행"하더라도 다음 프레임을
-가져오는 시점 자체가 YOLO 추론 속도에 종속되어 있었음 (추론이 느리면 전체
-루프가 느려져서 원본 영상도 결과적으로 버벅임).
+[캡처 스레드 분리 - 지연 문제 해결]
+캡처 스레드: 카메라 최대 속도로 계속 프레임을 읽어 원본을 즉시 발행하고,
+최신 프레임을 락으로 보호된 공유 변수에 저장. ROS2 타이머(메인 스레드)는
+공유 변수에서 최신 프레임을 꺼내 YOLO 추론 + 주석 영상 발행 + 이벤트 발행을
+수행하며, 이 처리가 느려도 캡처/원본발행 속도에 전혀 영향 주지 않음.
 
-이번 수정: 카메라 캡처 전담 스레드를 분리함.
-- 캡처 스레드: 카메라 최대 속도로 계속 프레임을 읽어 원본을 즉시 발행하고,
-  최신 프레임을 락으로 보호된 공유 변수에 저장.
-- ROS2 타이머(메인 스레드): 공유 변수에서 최신 프레임을 꺼내 YOLO 추론 +
-  주석 영상 발행 + 이벤트 발행을 수행. 이 처리가 느려도 캡처/원본발행 속도에
-  전혀 영향 주지 않음.
+[2단계 검출 - person crop 확대 재검출]
+person이 검출되면, 그 영역만 잘라서(crop) 비율 유지한 채 확대(resize) 후
+같은 모델로 다시 helmet/no_helmet만 검출한다. 화면 전체 기준으로는 안전모가
+너무 작아 YOLO 내부 특징맵에서 정보가 손실되는 문제(작은 객체 탐지 취약점)를
+완화하기 위함 (SAHI와 유사한 원리 - 새 정보를 만드는 게 아니라, 모델이 기존
+정보를 놓치지 않게 '공간적 여유'를 늘려주는 것). cv2.resize는 단순 보간이라
+원본에 없는 디테일을 만들어내진 않음(슈퍼레졸루션과는 다름).
+crop에서 나온 좌표는 원본 프레임 좌표로 환산해서, 기존 1차 필터
+(track_id/fallback 중복 방지) + depth 계산 + 발행 로직을 공통 함수
+(_evaluate_box)로 재사용한다. crop 쪽 검출은 track_id가 없어 자동으로
+fallback(위치 기반) 경로를 타며, 메인 검출과 위치가 겹치면 기존 dedup
+로직이 자연스럽게 중복을 걸러준다.
 """
 
 import json
@@ -73,11 +80,15 @@ class YoloDepthPublisher(Node):
         self.declare_parameter('raw_image_topic', '/camera/color/compressed_raw')
         self.declare_parameter('annotated_image_topic', '/camera/color/compressed')
         self.declare_parameter('raw_image_jpeg_quality', 60)
-        # ★ YOLO 처리 주기 (카메라 fps와 분리됨, 이 값만큼만 추론 시도)
         self.declare_parameter('inference_interval_s', 0.1)
         # bbox 내 유효 depth 픽셀 비율이 이 값 미만이면 해당 검출 폐기
         # (작은 소품은 배경 depth가 섞여 median이 오염되는 실패 모드 방지)
         self.declare_parameter('min_valid_ratio', 0.2)
+
+        # ★ person crop 2단계 검출 관련
+        self.declare_parameter('person_crop_enabled', True)
+        self.declare_parameter('person_crop_target_size', 640)
+        self.declare_parameter('person_crop_min_size_px', 20)
 
         weights_path = self.get_parameter('weights_path').value
         topic = self.get_parameter('detection_topic').value
@@ -92,8 +103,23 @@ class YoloDepthPublisher(Node):
         inference_interval = self.get_parameter('inference_interval_s').value
         self.min_valid_ratio = self.get_parameter('min_valid_ratio').value
 
+        self.person_crop_enabled = self.get_parameter('person_crop_enabled').value
+        self.person_crop_target_size = self.get_parameter('person_crop_target_size').value
+        self.person_crop_min_size_px = self.get_parameter('person_crop_min_size_px').value
+
         self.model = YOLO(weights_path)
         self.get_logger().info(f"모델 클래스 목록: {self.model.names}")
+
+        # helmet/no_helmet 클래스 인덱스 미리 찾아둠 (2단계 검출을 이걸로만 제한 -> 속도 절약)
+        self._helmet_class_ids = [
+            idx for idx, name in self.model.names.items()
+            if name in ('helmet', 'no_helmet')
+        ]
+        if self.person_crop_enabled and not self._helmet_class_ids:
+            self.get_logger().warn(
+                "person_crop_enabled=True인데 모델에 helmet/no_helmet 클래스가 없음 - 2단계 검출 비활성화")
+            self.person_crop_enabled = False
+
         self.pub = self.create_publisher(String, topic, 10)
         self.raw_image_pub = self.create_publisher(
             CompressedImage, raw_image_topic, LOW_LATENCY_QOS)
@@ -131,7 +157,8 @@ class YoloDepthPublisher(Node):
         self.get_logger().info(
             f"YOLO+Depth publisher 시작, weights={weights_path}, "
             f"raw_topic={raw_image_topic}(캡처 스레드, 항상 빠름), "
-            f"annotated_topic={annotated_image_topic}(YOLO 처리 주기 종속)"
+            f"annotated_topic={annotated_image_topic}(YOLO 처리 주기 종속), "
+            f"person_crop_enabled={self.person_crop_enabled}"
         )
 
         # ★ 캡처 전담 스레드 시작 (카메라 최대 속도로 계속 실행)
@@ -142,6 +169,7 @@ class YoloDepthPublisher(Node):
         # ★ YOLO 처리는 이 타이머로만, 캡처 속도와 무관
         self.timer = self.create_timer(inference_interval, self._process_frame)
 
+    # ------------------------------------------------------------------
     def _match_nearby(self, records, class_name, u, v):
         for r in records:
             if r['class'] != class_name:
@@ -203,11 +231,156 @@ class YoloDepthPublisher(Node):
                     self._latest_depth = depth_image
             except Exception as e:
                 self.get_logger().error(f"캡처 스레드 예외 (계속 재시도): {e}")
+
     def _get_latest_frame(self):
         with self._frame_lock:
             if self._latest_color is None or self._latest_depth is None:
                 return None, None
             return self._latest_color.copy(), self._latest_depth.copy()
+
+    # ------------------------------------------------------------------
+    # ★ 개별 박스 하나를 처리(1차 필터 -> depth 계산 -> 발행)하는 공통 로직.
+    # track_id가 있는 박스(메인 검출)와, 없는 박스(person crop 2단계 검출) 둘 다
+    # 이 함수를 거쳐서 동일하게 처리된다.
+    def _evaluate_box(self, class_name, conf, x1, y1, x2, y2, track_id,
+                       depth_image, display_image):
+        if conf < self.conf_threshold:
+            if self.debug_log:
+                self.get_logger().info(
+                    f"[디버그] conf 미달 스킵: class={class_name} conf={conf:.2f}")
+            return
+
+        u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
+
+        publish_ok = False
+        key_info = ""
+
+        if is_level_class(class_name):
+            publish_ok = True
+            key_info = "level(항상발행)"
+
+        elif track_id is not None:
+            if track_id in self.reported_tids:
+                self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
+                return
+            if self._match_nearby(self.reported_fallbacks, class_name, u, v):
+                self.reported_tids.add(track_id)
+                self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
+                return
+            self.reported_tids.add(track_id)
+            publish_ok = True
+            key_info = f"tid={track_id}"
+
+        else:
+            if self._match_nearby(self.reported_fallbacks, class_name, u, v):
+                self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
+                return
+            cand = self._match_nearby(self.fallback_candidates, class_name, u, v)
+            if cand is None:
+                self.fallback_candidates.append({'class': class_name, 'u': u, 'v': v, 'count': 1})
+                self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
+                if self.debug_log:
+                    self.get_logger().info(
+                        f"[디버그] fallback 후보 신규: class={class_name} conf={conf:.2f} ({u},{v})")
+                return
+            cand['count'] += 1
+            cand['u'], cand['v'] = u, v
+            if self.debug_log:
+                self.get_logger().info(
+                    f"[디버그] fallback 카운트: class={class_name} conf={conf:.2f} "
+                    f"count={cand['count']}/{self.fallback_confirm_frames}")
+            if cand['count'] < self.fallback_confirm_frames:
+                self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
+                return
+            self.fallback_candidates.remove(cand)
+            self.reported_fallbacks.append({'class': class_name, 'u': u, 'v': v})
+            publish_ok = True
+            key_info = f"fallback({u},{v})"
+
+        if not publish_ok:
+            return
+
+        box_w, box_h = int(x2 - x1), int(y2 - y1)
+        y_min = max(0, v - box_h // 4)
+        y_max = min(depth_image.shape[0], v + box_h // 4)
+        x_min = max(0, u - box_w // 4)
+        x_max = min(depth_image.shape[1], u + box_w // 4)
+        depth_roi = depth_image[y_min:y_max, x_min:x_max]
+        valid_depths = depth_roi[depth_roi > 0]
+        valid_ratio = len(valid_depths) / depth_roi.size if depth_roi.size > 0 else 0.0
+
+        if valid_ratio < self.min_valid_ratio:
+            if self.debug_log:
+                self.get_logger().debug(
+                    f"[{class_name}] 유효 depth 비율 {valid_ratio:.2f} < "
+                    f"{self.min_valid_ratio} - 검출 폐기"
+                )
+            self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
+            return
+
+        z_m = float(np.median(valid_depths)) / 1000.0
+        X = (u - self.cx) * z_m / self.fx
+        Y = (v - self.cy) * z_m / self.fy
+
+        self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, z_m)
+
+        if self.debug_log:
+            self.get_logger().info(
+                f"[발행] class={class_name} {key_info} conf={conf:.2f} "
+                f"xyz=({X:.3f},{Y:.3f},{z_m:.3f})m"
+            )
+
+        msg = String()
+        msg.data = json.dumps({
+            'u': u, 'v': v, 'depth': z_m,
+            'depth_xyz': [X, Y, z_m],
+            'class_id': class_name, 'confidence': conf,
+        })
+        self.pub.publish(msg)
+
+    # ------------------------------------------------------------------
+    # ★ person 영역을 crop -> 비율 유지 확대 -> helmet/no_helmet만 재검출
+    def _detect_helmet_in_person_crop(self, color_image, px1, py1, px2, py2,
+                                       depth_image, display_image):
+        crop_w, crop_h = px2 - px1, py2 - py1
+        if crop_w < self.person_crop_min_size_px or crop_h < self.person_crop_min_size_px:
+            return
+
+        person_crop = color_image[py1:py2, px1:px2]
+        if person_crop.size == 0:
+            return
+
+        scale = self.person_crop_target_size / max(crop_w, crop_h)
+        new_w, new_h = max(1, int(crop_w * scale)), max(1, int(crop_h * scale))
+        person_crop_resized = cv2.resize(person_crop, (new_w, new_h))
+
+        helmet_results = self.model(
+            person_crop_resized, verbose=False, classes=self._helmet_class_ids
+        )[0]
+
+        if helmet_results.boxes is None:
+            return
+
+        for hbox in helmet_results.boxes:
+            hx1, hy1, hx2, hy2 = hbox.xyxy[0].cpu().numpy()
+            hconf = float(hbox.conf[0])
+            hcls = int(hbox.cls[0])
+            hclass_name = self.model.names[hcls]
+
+            orig_x1 = px1 + hx1 / scale
+            orig_y1 = py1 + hy1 / scale
+            orig_x2 = px1 + hx2 / scale
+            orig_y2 = py1 + hy2 / scale
+
+            if self.debug_log:
+                self.get_logger().info(
+                    f"[디버그][person crop] class={hclass_name} conf={hconf:.2f} "
+                    f"(원본좌표로 환산됨)")
+
+            self._evaluate_box(
+                hclass_name, hconf, orig_x1, orig_y1, orig_x2, orig_y2,
+                None, depth_image, display_image
+            )
 
     # ------------------------------------------------------------------
     # YOLO 처리 (캡처 스레드가 채워둔 최신 프레임을 가져다 씀, 카메라 속도와 무관)
@@ -217,10 +390,7 @@ class YoloDepthPublisher(Node):
             return
 
         results = self.model.track(
-            color_image,
-            persist=True,
-            verbose=False,
-            tracker=self.tracker_config
+            color_image, persist=True, verbose=False, tracker=self.tracker_config
         )[0]
 
         display_image = color_image.copy()
@@ -233,95 +403,29 @@ class YoloDepthPublisher(Node):
             self._encode_and_publish(self.annotated_image_pub, display_image)
             return
 
+        # ★ 1단계: 메인 프레임 전체 기준 검출
+        person_boxes = []
         for box in results.boxes:
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
             cls = int(box.cls[0])
             conf = float(box.conf[0])
             class_name = self.model.names[cls]
+            track_id = int(box.id[0]) if box.id is not None else None
 
-            if conf < self.conf_threshold:
-                continue
+            self._evaluate_box(class_name, conf, x1, y1, x2, y2, track_id,
+                                depth_image, display_image)
 
-            u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
+            if class_name == 'person' and self.person_crop_enabled:
+                person_boxes.append((int(x1), int(y1), int(x2), int(y2)))
 
-            publish_ok = False
-            key_info = ""
-
-            if is_level_class(class_name):
-                publish_ok = True
-                key_info = "level(항상발행)"
-
-            elif box.id is not None:
-                track_id = int(box.id[0])
-                if track_id in self.reported_tids:
-                    self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
-                    continue
-                if self._match_nearby(self.reported_fallbacks, class_name, u, v):
-                    self.reported_tids.add(track_id)
-                    self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
-                    continue
-                self.reported_tids.add(track_id)
-                publish_ok = True
-                key_info = f"tid={track_id}"
-
-            else:
-                if self._match_nearby(self.reported_fallbacks, class_name, u, v):
-                    self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
-                    continue
-                cand = self._match_nearby(self.fallback_candidates, class_name, u, v)
-                if cand is None:
-                    self.fallback_candidates.append({'class': class_name, 'u': u, 'v': v, 'count': 1})
-                    self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
-                    continue
-                cand['count'] += 1
-                cand['u'], cand['v'] = u, v
-                if cand['count'] < self.fallback_confirm_frames:
-                    self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
-                    continue
-                self.fallback_candidates.remove(cand)
-                self.reported_fallbacks.append({'class': class_name, 'u': u, 'v': v})
-                publish_ok = True
-                key_info = f"fallback({u},{v})"
-
-            if not publish_ok:
-                continue
-
-            box_w, box_h = int(x2 - x1), int(y2 - y1)
-            y_min = max(0, v - box_h // 4)
-            y_max = min(depth_image.shape[0], v + box_h // 4)
-            x_min = max(0, u - box_w // 4)
-            x_max = min(depth_image.shape[1], u + box_w // 4)
-            depth_roi = depth_image[y_min:y_max, x_min:x_max]
-            valid_depths = depth_roi[depth_roi > 0]
-            valid_ratio = len(valid_depths) / depth_roi.size if depth_roi.size > 0 else 0.0
-
-            if valid_ratio < self.min_valid_ratio:
-                if self.debug_log:
-                    self.get_logger().debug(
-                        f"[{class_name}] 유효 depth 비율 {valid_ratio:.2f} < "
-                        f"{self.min_valid_ratio} - 검출 폐기"
-                    )
-                self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
-                continue
-
-            z_m = float(np.median(valid_depths)) / 1000.0
-            X = (u - self.cx) * z_m / self.fx
-            Y = (v - self.cy) * z_m / self.fy
-
-            self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, z_m)
-
-            if self.debug_log:
-                self.get_logger().info(
-                    f"[발행] class={class_name} {key_info} conf={conf:.2f} xyz=({X:.3f},{Y:.3f},{z_m:.3f})m"
-                )
-
-            msg = String()
-            msg.data = json.dumps({
-                'u': u, 'v': v, 'depth': z_m,
-                'depth_xyz': [X, Y, z_m],
-                'class_id': class_name, 'confidence': conf,
-            })
-            self.pub.publish(msg)
+        # ★ 2단계: person 영역마다 crop 확대 후 helmet/no_helmet 재검출
+        for (px1, py1, px2, py2) in person_boxes:
+            px1 = max(0, px1)
+            py1 = max(0, py1)
+            px2 = min(color_image.shape[1], px2)
+            py2 = min(color_image.shape[0], py2)
+            self._detect_helmet_in_person_crop(
+                color_image, px1, py1, px2, py2, depth_image, display_image)
 
         self._encode_and_publish(self.annotated_image_pub, display_image)
 
@@ -346,3 +450,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+PYEOF
