@@ -85,7 +85,12 @@ class ChangePointDetector(Node):
         self.declare_parameter('tf_timeout_s', 0.3)
 
         # ★ 2차 필터 파라미터
-        self.declare_parameter('dedup_radius_m', 0.5)   # 같은 이벤트로 볼 거리 반경
+        # ★ 2026-08-24 0.5m -> 1.0m로 확대: 지지대상 실측으로 같은 자리에
+        #   정지 안 한 불을 로봇이 도는 각도만 바뀌어도 map 좌표가 0.5m 넘게
+        #   흔들렸다(이 프로젝트의 헤딩 추정 오차 ±30도가 그대로 위치 오차로
+        #   번짐). 그 결과 "같은 불"이 각도 바뀔 때마다 새 이벤트로 잡혀
+        #   clear-재생성이 반복됐다. 반경을 실측 흔들림보다 넉넉히 키운다.
+        self.declare_parameter('dedup_radius_m', 1.0)   # 같은 이벤트로 볼 거리 반경
         self.declare_parameter('event_ttl_s', 600.0)    # 이 시간 이상 재감지 없으면 "새 이벤트"로 취급
 
         # ★ 2026-08-21 신설 — 능동 클리어링.
@@ -104,8 +109,14 @@ class ChangePointDetector(Node):
         #   넘게 남아 있게 된다. 그래서 **로봇이 그 자리를 다시 지나가며
         #   지켜봤는데 안 보이면** 즉시 event_cleared 를 쏴서 핑을 지운다.
         self.declare_parameter('clear_topic', '/event_detection/cleared')
-        self.declare_parameter('clear_radius_m', 0.6)    # 이 반경 안이면 "지나간다"로 본다
-        self.declare_parameter('clear_watch_s', 3.0)     # 그 안에서 이만큼 재감지가 없으면 지운다
+        # ★ 2026-08-24: 0.6m/3.0s 로는 부족했다. 실측: 계속 잡히던 fire가
+        #   순찰 각도 바뀌는 중 ~2.45초간 재검출이 비어 clear 오판 -> 24초 뒤
+        #   같은 불이 "새 이벤트"로 재등록되는 사고가 실측됨. dedup_radius_m
+        #   과 같은 이유(헤딩 오차로 인한 위치 흔들림)로 반경을 키우고,
+        #   실측된 순간적 미검출 구간(약 2.5초)보다 넉넉하게 watch 시간도
+        #   늘린다.
+        self.declare_parameter('clear_radius_m', 1.2)    # 이 반경 안이면 "지나간다"로 본다
+        self.declare_parameter('clear_watch_s', 5.0)     # 그 안에서 이만큼 재감지가 없으면 지운다
         self.declare_parameter('clear_check_hz', 2.0)
 
         self.map_frame = self.get_parameter('map_frame_id').value
