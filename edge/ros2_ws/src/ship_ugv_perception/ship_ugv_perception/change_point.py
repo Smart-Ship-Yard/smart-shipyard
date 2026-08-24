@@ -27,45 +27,43 @@ from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs  # noqa: F401  (PointStamped 변환을 위해 필요한 등록)
 
 
-def clear_verdict(dist_m, range_entered_at_s, last_seen_s, now_s,
+def clear_verdict(dist_m, last_seen_s, now_s,
                   clear_radius_m, clear_watch_s, first_seen_s, min_age_s):
-    """이벤트 클리어 상태기계의 순수 핵심부. ROS 없이 검증하려고 뽑아냈다.
+    """치워짐 판정의 순수 핵심부. ROS 없이 검증하려고 뽑아냈다.
 
-    반환: (verdict, 다음 range_entered_at_s)
-      'reset' — 판정 범위 밖. 다음 기회를 위해 range_entered_at 을 지운다.
-      'wait'  — 아직 판정 시간이 안 됐거나, 이번 관찰 중 다시 보였거나,
-                이벤트가 너무 어려서 아직 판정할 자격이 안 된다.
-      'clear' — 확정. 지켜보는 동안 한 번도 안 보였다.
+    반환: 'clear' 또는 'wait'.
 
-    ★ has_left_once 를 왜 걷어냈나 (2026-08-24 실측 사고) ★
-    예전에는 "로봇이 clear_radius 를 한 번이라도 벗어난 적이 있어야
-    판정을 시작한다"는 조건을 썼다. 원래 목적은 "막 보고해서 로봇이 그
-    옆에 서 있는 동안 오판해 지워버리는 것"을 막는 것이었다.
-    그런데 이 조건은 **순찰 기하에 통째로 의존한다.** 실측:
-        순찰 중심 (0.149,-1.042) 반지름 1.00, 불이 중심에서 0.30m
-        -> 로봇~불 거리가 0.70 ~ 1.30 m 사이를 오갈 뿐
-        -> clear_radius_m=2.0 을 **영원히 못 벗어남**
-        -> has_left_once 가 영영 False -> clear 가 아예 발동 못 함
-    그 결과 이벤트가 목록에서 안 지워지고 계속 쌓여, 나중에는 그 근처
-    어디에 불을 놓아도 "기존 이벤트"로 먹혀 정지조차 안 하게 됐다.
+    판정은 딱 세 가지만 본다:
+      · 로봇이 판정할 만큼 가까운가        (dist_m <= clear_radius_m)
+      · 이벤트가 판정할 만큼 늙었는가      (now - first_seen >= min_age_s)
+      · 마지막으로 본 지 충분히 지났는가   (now - last_seen >= clear_watch_s)
 
-    그래서 기하와 무관한 **나이 조건(min_age_s)** 으로 바꾼다. 이벤트가
-    생긴 지 이만큼은 지나야 클리어 판정 대상이 된다. 원래 막으려던
-    "보고 직후 오판" 은 이걸로 충분히 막히고, 순찰 반지름을 바꿔도
-    깨지지 않는다. 카메라가 실제로 그쪽을 보고 있는지는 호출부의
-    in_camera_fov 게이트가 따로 본다.
+    ★ 왜 이렇게 단순해졌나 (2026-08-24) ★
+    예전에는 range_entered_at("이번 관찰을 언제 시작했나")을 따로 들고
+    다니며 last_seen 과 비교했다. 그런데 그 값은 **한 번 켜지면 다시
+    켜지지 않아서**, 그 뒤로 검출이 한 번이라도 있으면
+    last_seen >= range_entered_at 이 영원히 참이 되어 clear 가 절대
+    발동하지 못했다(실측: 불을 치워도 cleared 가 안 나감). 유일한 재무장
+    경로가 "FOV 이탈 시 리셋"이었는데 그건 헤딩 오차에 따라 불규칙해서
+    clear_watch_s 를 채우지 못했다.
+
+    "마지막으로 본 지 얼마나 됐나"만 보면 재무장이 필요 없다. 불이
+    그대로 있으면 검출될 때마다 last_seen 이 갱신돼 판정이 계속 밀리고,
+    치우면 갱신이 멈춰 자연히 시간이 쌓인다. 배에 가려 안 보이는
+    구간(실측 약 30초)은 clear_watch_s(60초)보다 짧아 그대로 넘어간다.
+
+    그 이전에 쓰던 has_left_once("반경을 한 번은 벗어나야 판정 시작")도
+    같은 이유로 걷어냈다. 그 조건은 순찰 기하에 의존해서, 반지름 1.00 에
+    불이 중심 0.30m 면 로봇~불 거리가 0.70~1.30m 라 clear_radius 2.0 을
+    영영 못 벗어나 clear 가 아예 발동 못 했다.
     """
     if dist_m > clear_radius_m:
-        return 'reset', None
+        return 'wait'
     if (now_s - first_seen_s) < min_age_s:
-        return 'wait', range_entered_at_s   # 아직 너무 어리다
-    if range_entered_at_s is None:
-        return 'wait', now_s
-    if (now_s - range_entered_at_s) < clear_watch_s:
-        return 'wait', range_entered_at_s
-    if last_seen_s >= range_entered_at_s:
-        return 'wait', range_entered_at_s
-    return 'clear', range_entered_at_s
+        return 'wait'
+    if (now_s - last_seen_s) < clear_watch_s:
+        return 'wait'
+    return 'clear'
 
 
 def quat_to_yaw(x, y, z, w):
@@ -272,17 +270,19 @@ class ChangePointDetector(Node):
 
     # ------------------------------------------------------------------
     def _check_clear(self):
-        """이미 보고한 이벤트 자리를 로봇이 **다시 지나가며** 지켜본다.
+        """이미 보고한 이벤트 자리를 지켜보다가, 안 보인 지 clear_watch_s
+        이상 지나면 "치워졌다"고 알린다.
 
-        clear_radius 를 한 번이라도 벗어난 적이 있는 이벤트에 한해서만,
-        재진입 후 clear_watch 이상 지켜봤는데 재검출이 없으면 "치워졌다"고
-        알린다. 벗어난 적이 아직 없으면(막 보고돼서 로봇이 그 옆에 서 있는
-        중이면) 판정을 시작하지 않는다 — 그렇지 않으면 정지-확인 사이 몇
-        초만으로 방금 보고한 이벤트를 "재방문했는데 없다"고 오판해 곧장
-        지워버린다(2026-08-22 실측: 프론트 핑이 반짝하고 꺼짐).
+        판정 조건은 clear_verdict 참고. 여기서는 그 앞에 두 가지 게이트를
+        더 둔다:
+          · 카메라가 실제로 그 방향을 보고 있을 때만 판정한다
+            (in_camera_fov — 등 돌린 채 "안 보이네"라고 하면 안 된다)
+          · 판정이 나면 목록에서 지운다. 같은 자리에 나중에 새로 불을
+            놓으면 완전히 새 이벤트로 다시 보고돼야 하기 때문이다.
 
-        치워진 이벤트는 목록에서 지운다. 같은 자리에 나중에 새로 불이 나면
-        (모형을 다시 놓으면) 완전히 새 이벤트로 다시 보고돼야 하기 때문이다.
+        ★ in_camera_fov 는 각도만 본다 — 배에 가려 안 보이는 것(occlusion)은
+        모른다. 그래서 가림 구간(실측 약 30초)을 clear_watch_s(60초)로
+        덮는다. 자세한 근거는 docs/이벤트_중복제거_튜닝.md 참고.
         """
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -301,62 +301,16 @@ class ChangePointDetector(Node):
         for ev in self.reported_events:
             dist = math.hypot(rx - ev['x'], ry - ev['y'])
 
-            # ★ 2026-08-24 (주현 진단): 반경 안이어도 카메라가 실제로 이
-            #   방향을 보고 있지 않으면 "지켜봤는데 없었다"로 셀 수 없다.
-            #   clear_verdict 자체는 순수함수로 두고 호출 여부만 게이트한다.
-            #
-            #   ★ 그리고 이때 시계(range_entered_at)를 **리셋한다.**
-            #   안 그러면 관찰이 끊긴 동안에도 벽시계는 계속 흘러서,
-            #   clear_watch_s 가 "카메라가 지켜본 시간"이 아니라 그냥
-            #   "흐른 시간"이 된다. 그러면 이런 오판이 난다:
-            #       t=0  검출됨, 시계 켜짐
-            #       t=1~6 헤딩 오차로 카메라가 딴 데 봄 (틱 스킵, 시계는 감)
-            #       t=6  FOV 복귀 직후, 아직 검출이 도착하기 전에 틱이 돎
-            #            -> 6초 >= clear_watch_s 라 "안 보였다"고 확정
-            #   불이 멀쩡히 그 자리에 있는데 지워지고, 곧 재검출돼 새
-            #   이벤트로 등록되면서 **한 바퀴 돌 때마다 다시 정지**한다.
-            #   기하상 실제로 일어날 수 있다: 순찰반경 1.0, 불이 중심에서
-            #   0.30m 면 각도 편차가 asin(0.3/1.0)=17.5도로 half-FOV 37도
-            #   안이지만, 헤딩 오차 ±30도가 붙으면 47.5도로 벗어난다.
-            #   리셋하면 clear_watch_s 는 "연속으로 지켜본 시간"이 된다.
-            if dist <= self.clear_radius and not in_camera_fov(
-                    robot_yaw, self.cam_yaw, self.hfov, rx, ry, ev['x'], ev['y']):
-                ev['range_entered_at'] = None
+            if not in_camera_fov(robot_yaw, self.cam_yaw, self.hfov,
+                                 rx, ry, ev['x'], ev['y']):
                 survivors.append(ev)
                 continue
 
-            range_s = (ev['range_entered_at'].nanoseconds / 1e9
-                      if ev['range_entered_at'] is not None else None)
-            last_seen_s = ev['last_seen'].nanoseconds / 1e9
-
-            verdict, next_range_s = clear_verdict(
-                dist, range_s, last_seen_s, now_s,
+            verdict = clear_verdict(
+                dist, ev['last_seen'].nanoseconds / 1e9, now_s,
                 self.clear_radius, clear_watch_s,
                 ev['first_seen'].nanoseconds / 1e9, self.min_event_age)
 
-            ev['range_entered_at'] = (
-                None if next_range_s is None
-                else (now if next_range_s == now_s else ev['range_entered_at']))
-
-            # ★ 2026-08-24: 치워짐 판정이 틀리면 dedup 기록까지 같이
-            #   사라져서 같은 자리의 같은 불이 곧바로 "새 이벤트"로
-            #   재등록되고 로봇이 한 바퀴마다 다시 정지했다(실측):
-            #       20:53:20 fire@0.37,-1.12  등록
-            #       20:53:48 cleared          (불은 그대로 있는데 판정됨)
-            #       20:54:10 fire@0.40,-1.12  3.5cm 옆에 재등록 -> 재정지
-            #       20:54:45 cleared ... 무한 반복
-            #
-            #   판정이 왜 틀리나: in_camera_fov 는 "카메라가 그 방향을
-            #   향하는가"만 본다. 순찰 원 중심에 배가 있어 반대편에서는
-            #   **배에 가려** 안 보이는데, 각도상으론 FOV 안이라 통과된다.
-            #   가림과 진짜 없어짐을 구분할 방법이 없다(실측: 검출이
-            #   20:53:40 에 끊기고 8초 뒤 clear).
-            #
-            #   한때 "cleared 표시만 하고 목록에 남기기"로 막아봤으나,
-            #   그러면 **불을 원래 자리로 도로 옮겼을 때** 기존 기록에
-            #   매칭돼 정지도 핑도 안 뜨는 새 문제가 생긴다. 그래서 목록
-            #   제거는 그대로 두고, 대신 clear_watch_s 를 가림 시간보다
-            #   충분히 길게(60초) 잡아 오판 자체가 안 나게 한다.
             if verdict != 'clear':
                 survivors.append(ev)
                 continue
@@ -371,7 +325,7 @@ class ChangePointDetector(Node):
             self.clear_pub.publish(msg)
             self.get_logger().info(
                 f"[{ev['class_id']}] 치워짐 확인 — event_id={ev['event_id']} "
-                f"({now_s - range_s:.1f}초 지켜봄, 재검출 없음)")
+                f"(안 보인 지 {now_s - ev['last_seen'].nanoseconds/1e9:.0f}초)")
             # survivors 에 안 넣는다 -> 목록에서 제거됨
 
         self.reported_events = survivors
@@ -485,7 +439,6 @@ class ChangePointDetector(Node):
             'y': map_y,
             'last_seen': now,
             'first_seen': now,          # min_event_age_s 판정용
-            'range_entered_at': None,   # _check_clear 가 쓴다
         })
 
         position_uncertainty_m = self._estimate_position_uncertainty()
