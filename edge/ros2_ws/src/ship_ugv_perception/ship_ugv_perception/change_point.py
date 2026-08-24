@@ -185,6 +185,20 @@ class ChangePointDetector(Node):
         #   한 프레임짜리 오탐도 그대로 새 이벤트로 등록 -> 불필요한 정지를
         #   유발했다. websocket_client 가 이미 쓰는 기준(0.5)과 맞춘다.
         self.declare_parameter('min_confidence', 0.5)
+        # ★ 2026-08-24: depth 상한이 아예 없어서 쓰레기 depth 가 그대로
+        #   map 좌표로 투영되고 있었다. 실측(21:42):
+        #       로봇(-0.78,-0.42) -> 불 추정(+5.13,-2.52), 계산상 6.27m
+        #       맵 경계가 x:-4.60~4.95 인데 x=5.13 은 맵 밖이다.
+        #   같은 시간대 로봇 위치(ekf_global)는 18개 샘플 전부 순찰중심에서
+        #   0.93~1.14m 로 궤도에 정확히 붙어 있었다 — 즉 로컬라이제이션은
+        #   멀쩡하고, YOLO 가 멀리 있는 무언가를 fire 로 잡아(conf 0.64~0.93)
+        #   ROI 중앙값 depth 가 5~6m 로 나온 것이 원인이다.
+        #   event_gate_node 는 max_trigger_depth_m=2.5 가 있어 정지는 안
+        #   했지만, 프론트·DB 로는 다 나가 맵 전체에 유령 핑이 찍혔다.
+        #   순찰 반지름 1.0 + 불이 배 위(중심에서 ~0.4m)면 로봇~불 거리는
+        #   0.6~1.4m 다. 2.5m 면 넉넉하고, event_gate_node 와 같은 값이라
+        #   "정지는 안 하는데 핑만 찍히는" 불일치도 사라진다.
+        self.declare_parameter('max_depth_m', 2.5)
         # ★ 2026-08-24: 이벤트가 생긴 지 이만큼은 지나야 클리어 판정 대상이
         #   된다. 예전의 has_left_once(순찰 기하에 의존해 영영 발동 못 하던
         #   조건)를 대체한다 — clear_verdict 주석 참고.
@@ -212,6 +226,7 @@ class ChangePointDetector(Node):
         self.clear_watch = Duration(seconds=self.get_parameter('clear_watch_s').value)
         self.min_confidence = self.get_parameter('min_confidence').value
         self.min_event_age = self.get_parameter('min_event_age_s').value
+        self.max_depth = self.get_parameter('max_depth_m').value
 
         # ★ 2차 필터: 이미 보고한 이벤트 기록
         # 각 항목: {'class_id': str, 'x': float, 'y': float, 'last_seen': rclpy.time.Time}
@@ -376,6 +391,12 @@ class ChangePointDetector(Node):
 
         if depth <= 0.0:
             self.get_logger().debug("depth<=0, 무효 감지 스킵")
+            return
+
+        if depth > self.max_depth:
+            self.get_logger().debug(
+                f"[{class_id}] depth {depth:.2f}m > {self.max_depth}m — "
+                f"쓰레기 depth 로 보고 버린다")
             return
 
         # ★ 2026-08-24: confidence 필터. 실측 0.468짜리 한 프레임 오탐이
