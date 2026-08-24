@@ -115,8 +115,21 @@ class ChangePointDetector(Node):
         #   과 같은 이유(헤딩 오차로 인한 위치 흔들림)로 반경을 키우고,
         #   실측된 순간적 미검출 구간(약 2.5초)보다 넉넉하게 watch 시간도
         #   늘린다.
-        self.declare_parameter('clear_radius_m', 1.2)    # 이 반경 안이면 "지나간다"로 본다
-        self.declare_parameter('clear_watch_s', 5.0)     # 그 안에서 이만큼 재감지가 없으면 지운다
+        #
+        #   ★ 2026-08-24 2차: 1.2m/5.0s 로 넓혀도 주기만 20초->4분대로
+        #   늘었을 뿐 완전히 없어지지 않았다(실측: 같은 자리 fire가 4분
+        #   19초 뒤 다시 clear->재등록). 데모 전까지는 "안 멈추는 것"보다
+        #   "이미 확인한 걸 가끔 또 세운다"가 훨씬 안전하다는 판단으로,
+        #   재발 빈도를 더 낮추기 위해 한 번 더 넉넉하게 키운다. 여전히
+        #   0이 되진 않지만(로봇이 그 자리를 몇 분 이상 안 지나가면 결국
+        #   반경 안에서 몇 초는 재검출 없이 지나갈 수 있다), 데모 시간
+        #   내에는 거의 안 걸릴 정도로 늘린다.
+        self.declare_parameter('clear_radius_m', 2.0)    # 이 반경 안이면 "지나간다"로 본다
+        self.declare_parameter('clear_watch_s', 15.0)    # 그 안에서 이만큼 재감지가 없으면 지운다
+        # ★ 2026-08-24: confidence 필터가 아예 없어서 저신뢰도(실측 0.468)
+        #   한 프레임짜리 오탐도 그대로 새 이벤트로 등록 -> 불필요한 정지를
+        #   유발했다. websocket_client 가 이미 쓰는 기준(0.5)과 맞춘다.
+        self.declare_parameter('min_confidence', 0.5)
         self.declare_parameter('clear_check_hz', 2.0)
 
         self.map_frame = self.get_parameter('map_frame_id').value
@@ -136,6 +149,7 @@ class ChangePointDetector(Node):
         self.event_ttl = Duration(seconds=self.get_parameter('event_ttl_s').value)
         self.clear_radius = self.get_parameter('clear_radius_m').value
         self.clear_watch = Duration(seconds=self.get_parameter('clear_watch_s').value)
+        self.min_confidence = self.get_parameter('min_confidence').value
 
         # ★ 2차 필터: 이미 보고한 이벤트 기록
         # 각 항목: {'class_id': str, 'x': float, 'y': float, 'last_seen': rclpy.time.Time}
@@ -255,6 +269,16 @@ class ChangePointDetector(Node):
 
         if depth <= 0.0:
             self.get_logger().debug("depth<=0, 무효 감지 스킵")
+            return
+
+        # ★ 2026-08-24: confidence 필터. 실측 0.468짜리 한 프레임 오탐이
+        #   그대로 새 이벤트(정지 유발)로 등록된 사고가 있었다. YOLO
+        #   confidence 는 프레임마다 크게 흔들리는 게 이미 확인된
+        #   문제라(같은 세션 실측 0.026~0.201), 낮은 신뢰도 감지는 아예
+        #   위치 계산·매칭 단계까지 안 보낸다.
+        if confidence is not None and confidence < self.min_confidence:
+            self.get_logger().debug(
+                f"[{class_id}] confidence {confidence:.2f} < {self.min_confidence}, 무시")
             return
 
         # --- 1) (u, v, depth) -> 카메라 좌표계 ---
