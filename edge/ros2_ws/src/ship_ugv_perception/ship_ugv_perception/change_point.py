@@ -28,27 +28,34 @@ import tf2_geometry_msgs  # noqa: F401  (PointStamped 변환을 위해 필요한
 
 
 def clear_verdict(dist_m, range_entered_at_s, last_seen_s, now_s,
-                  clear_radius_m, clear_watch_s):
+                  clear_radius_m, clear_watch_s, has_left_once):
     """이벤트 클리어 상태기계의 순수 핵심부. ROS 없이 검증하려고 뽑아냈다.
 
-    반환: (verdict, 다음 range_entered_at_s)
+    반환: (verdict, 다음 range_entered_at_s, 다음 has_left_once)
       'reset' — 반경 밖. 다음 방문을 위해 range_entered_at 을 지운다.
-      'wait'  — 아직 판정 시간이 안 됐거나, 이번 방문 중 다시 보였다.
-      'clear' — 확정. 이번 방문 동안 한 번도 안 보였다.
+      'wait'  — 아직 판정 시간이 안 됐거나, 이번 방문 중 다시 보였거나,
+                애초에 판정을 시작할 자격이 안 된다.
+      'clear' — 확정. 자리를 한 번 떠났다가 다시 들어와 지켜봤는데 없었다.
 
-    range_entered_at_s 가 None 이면 "방금 반경에 들어왔다"로 취급해 시계를
-    새로 켠다. last_seen_s 가 range_entered_at_s 이후 값이면(이번 방문 중에
-    갱신됐으면) 아직 거기 있는 것이다 — 그 전 방문의 last_seen 은 안 친다.
+    ★ has_left_once 가 왜 필요한가 (2026-08-22 실측 사고로 발견) ★
+    불을 처음 발견해서 **정지한 그 순간부터 이미 반경 안**이다. 로봇이
+    자리를 뜬 적이 한 번도 없는데 판정 시계가 그냥 시작해버리면, 정지-확인
+    사이에 흐른 몇 초만으로 "재방문했는데 없다"고 오판해 방금 막 보고한
+    이벤트를 곧장 지워버린다(프론트 핑이 반짝하고 꺼지는 것으로 관측됨).
+    그래서 **반경을 한 번이라도 벗어난 적이 있어야만** 그다음 재진입을
+    "재방문"으로 인정하고 시계를 켠다.
     """
     if dist_m > clear_radius_m:
-        return 'reset', None
+        return 'reset', None, True   # 벗어났다 -> 이제부터는 재방문 자격 있음
+    if not has_left_once:
+        return 'wait', range_entered_at_s, has_left_once   # 아직 첫 방문 중
     if range_entered_at_s is None:
-        return 'wait', now_s
+        return 'wait', now_s, has_left_once
     if (now_s - range_entered_at_s) < clear_watch_s:
-        return 'wait', range_entered_at_s
+        return 'wait', range_entered_at_s, has_left_once
     if last_seen_s >= range_entered_at_s:
-        return 'wait', range_entered_at_s
-    return 'clear', range_entered_at_s
+        return 'wait', range_entered_at_s, has_left_once
+    return 'clear', range_entered_at_s, has_left_once
 
 
 class ChangePointDetector(Node):
@@ -163,12 +170,14 @@ class ChangePointDetector(Node):
 
     # ------------------------------------------------------------------
     def _check_clear(self):
-        """이미 보고한 이벤트 자리를 로봇이 다시 지나가며 지켜본다.
+        """이미 보고한 이벤트 자리를 로봇이 **다시 지나가며** 지켜본다.
 
-        clear_radius 안에 clear_watch 이상 머물렀는데 그동안 재검출
-        (last_seen 갱신)이 한 번도 없었으면 "치워졌다"고 보고 알린다.
-        `range_entered_at` 이전의 last_seen 은 그 전 방문 때 값이라 인정하지
-        않는다 — 그래야 "이번 방문에서 못 봤다"만 정확히 잡는다.
+        clear_radius 를 한 번이라도 벗어난 적이 있는 이벤트에 한해서만,
+        재진입 후 clear_watch 이상 지켜봤는데 재검출이 없으면 "치워졌다"고
+        알린다. 벗어난 적이 아직 없으면(막 보고돼서 로봇이 그 옆에 서 있는
+        중이면) 판정을 시작하지 않는다 — 그렇지 않으면 정지-확인 사이 몇
+        초만으로 방금 보고한 이벤트를 "재방문했는데 없다"고 오판해 곧장
+        지워버린다(2026-08-22 실측: 프론트 핑이 반짝하고 꺼짐).
 
         치워진 이벤트는 목록에서 지운다. 같은 자리에 나중에 새로 불이 나면
         (모형을 다시 놓으면) 완전히 새 이벤트로 다시 보고돼야 하기 때문이다.
@@ -191,13 +200,14 @@ class ChangePointDetector(Node):
                       if ev['range_entered_at'] is not None else None)
             last_seen_s = ev['last_seen'].nanoseconds / 1e9
 
-            verdict, next_range_s = clear_verdict(
+            verdict, next_range_s, next_left = clear_verdict(
                 dist, range_s, last_seen_s, now_s,
-                self.clear_radius, clear_watch_s)
+                self.clear_radius, clear_watch_s, ev['has_left_once'])
 
             ev['range_entered_at'] = (
                 None if next_range_s is None
                 else (now if next_range_s == now_s else ev['range_entered_at']))
+            ev['has_left_once'] = next_left
 
             if verdict != 'clear':
                 survivors.append(ev)
@@ -312,6 +322,7 @@ class ChangePointDetector(Node):
             'y': map_y,
             'last_seen': now,
             'range_entered_at': None,   # _check_clear 가 쓴다
+            'has_left_once': False,     # 처음엔 아직 반경을 벗어난 적이 없다
         })
 
         position_uncertainty_m = self._estimate_position_uncertainty()
