@@ -5,16 +5,20 @@ event_gate_node.py — 이벤트 정지/재개 판정 (Step 7)
 "지금 멈춰야 하나"만 판단해서 `/event/active` 하나를 발행한다.
 로봇을 직접 멈추지는 않는다 — 그건 patrol_mission_node 가 한다.
 
-    [YOLO]  /event_detection/uvd ─┐
-    [관제]  /server/inbound      ─┼─> event_gate_node ─> /event/active ─> 순찰 노드
-    [수동]  /event/ack           ─┘
+    [change_point]  /event_detection/map_point ─┐
+    [관제]          /server/inbound            ─┼─> event_gate_node ─> /event/active ─> 순찰 노드
+    [수동]          /event/ack                 ─┘
 
-인터페이스 (nav2_작업_정리.md 7-2절 표 그대로)
------------------------------------------------
-    구독  /event_detection/uvd  std_msgs/String  욜로 감지(JSON). 위험 클래스면 정지
-    구독  /server/inbound       std_msgs/String  서버 수신분(JSON). event_ack 면 재개
-    구독  /event/ack            std_msgs/Empty   수동 재개 (시연 폴백·디버깅)
-    발행  /event/active         std_msgs/Bool    true=정지, false=주행
+인터페이스
+-----------
+    구독  /event_detection/map_point  std_msgs/String  change_point_detector 가 위치 기반
+                                                        중복 제거를 마친 검출(JSON). 위험 클래스면 정지
+    구독  /server/inbound             std_msgs/String  서버 수신분(JSON). event_ack 면 재개
+    구독  /event/ack                  std_msgs/Empty   수동 재개 (시연 폴백·디버깅)
+    발행  /event/active               std_msgs/Bool    true=정지, false=주행
+
+    ★ 2026-08-21: 원본 /event_detection/uvd 대신 change_point_detector 의
+      출력을 본다. 아래 "히스테리시스가 없는 이유" 참고 — 이유가 바뀌었다.
 
 ★ 정지와 재개가 비대칭이다 (2026-08-07 확정 설계)
 --------------------------------------------------
@@ -27,13 +31,27 @@ event_gate_node.py — 이벤트 정지/재개 판정 (Step 7)
        버튼의 의미는 "해결"이 아니라 "확인(ack)"이다.
        한 번 걸리면 ack 가 올 때까지 계속 true 를 유지한다(래치).
 
-★ 히스테리시스가 없는 이유
----------------------------
-욜로 발행기(yolo_depth_publisher.py)가 **track_id 로 이미 중복을 제거**한다.
-`reported_tids` 집합에 들어간 객체는 다시 발행되지 않으므로,
-`/event_detection/uvd` 는 연속 스트림이 아니라 **새 객체당 한 번**만 온다.
-떨림을 뗄 대상이 애초에 없다. 신뢰도(0.2)도 발행기가 이미 거른다.
-반복 수신이 생겨도 이미 true 이므로 무해하다.
+★ 히스테리시스가 없는 이유 — 그리고 2026-08-21에 드러난 착각
+----------------------------------------------------------------
+원래 근거는 "욜로 발행기(yolo_depth_publisher.py)가 track_id 로 이미
+중복을 제거한다" 였다. **틀렸다.** 실측 사고: fire 를 정지-확인-재개했더니
+반바퀴도 못 가서 같은 불로 다시 정지했다. track_id 기반 제거는 움직이는
+로봇에서는 안 통한다.
+    · 추론이 4 Hz 라 프레임 사이 화면 이동이 커서 ByteTrack 의 IoU 매칭이
+      끊기고 새 id 가 붙는다
+    · 이 모델은 신뢰도가 프레임마다 0.03~0.20 으로 흔들려 검출이 껐다
+      켜졌다 한다
+    · track_buffer 60프레임(=15초)인데 반바퀴 도는 데 그보다 오래 걸려서
+      한 바퀴마다 id 가 만료된다
+
+진짜 고정 장치는 **위치**다. change_point_detector(change_point.py)가
+map 좌표 기준으로 "이미 보고한 자리(반경 dedup_radius_m)면 다시 안 낸다"를
+이미 구현해 갖고 있었는데, 이 노드가 그걸 거치지 않고 원본
+`/event_detection/uvd` 를 직접 봐서 무용지물이었다. 이제 이 노드가
+`/event_detection/map_point`(그 중복 제거를 거친 스트림)를 본다 — 같은
+자리의 같은 불은 애초에 여기까지 안 온다. 히스테리시스가 필요 없는 이유는
+여전히 같다: 걸러진 스트림은 새 위치당 한 번만 오고, 반복 수신이 생겨도
+이미 true 이므로 무해하다.
 
 ★ 정지 대상 클래스
 --------------------
@@ -93,7 +111,10 @@ class EventGateNode(Node):
             ('max_trigger_depth_m', 2.5),
             ('republish_period_s', 1.0),
             ('fallback_auto_resume_s', 0.0),
-            ('detection_topic', '/event_detection/uvd'),
+            # ★ 2026-08-21: /event_detection/uvd(원본) -> /event_detection/map_point
+            #   (change_point_detector 가 위치 기반 중복 제거를 마친 스트림).
+            #   위 "히스테리시스가 없는 이유" 참고.
+            ('detection_topic', '/event_detection/map_point'),
             ('server_inbound_topic', '/server/inbound'),
         ])
         g = self.get_parameter
@@ -218,7 +239,9 @@ class EventGateNode(Node):
             return
 
         where = f' {depth:.2f} m 앞' if isinstance(depth, (int, float)) else ''
-        self._stop(f'{cls} 감지{where} (conf {conf})')
+        eid = d.get('event_id')
+        idtxt = f' [{eid}]' if eid else ''
+        self._stop(f'{cls} 감지{where} (conf {conf}){idtxt}')
 
     def _inbound_cb(self, msg: String):
         """서버에서 온 것을 그대로 받는다. event_ack 만 우리 관심사다."""

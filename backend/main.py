@@ -80,6 +80,10 @@ FALLEN_PERSON = "fallen_person"  # 작업자 쓰러짐
 FIRE = "fire"                    # 화재
 BLOCK_LEVEL = "block_level"      # 블록 조립 단계 변화 (block_id, level 필드 포함)
 SHIP_POSE = "ship_pose"          # 배 위치 측량 결과 (block_id, map_xy, yaw 필드 포함)
+# 위험 이벤트가 치워졌음(더 이상 안 보임) 확인 (interface.md v1.6, 2026-08-21)
+# block_id, cls, map_xy, event_id 필드 포함. cls 로 어느 위험 종류였는지 담는다
+# (이 메시지 자체의 event_type 은 "event_cleared" 고정이라 종류를 따로 실어야 함).
+EVENT_CLEARED = "event_cleared"
 
 # 프론트→서버→젯슨 방향 명령 (DB 저장 대상 아님).
 # 프론트가 영상 팝업을 열/닫을 때 젯슨의 영상 화질을 전환시키는 명령.
@@ -122,7 +126,7 @@ KST = timezone(timedelta(hours=9))
 # DB 저장 대상 이벤트 목록 — 위험 이벤트 4종 + 공정 단계 변화 + 배 위치 측량.
 # block_level/ship_pose는 '바뀔 때만' 오는 희소 이벤트라 저장량 부담이 없고,
 # 최신 값을 init-data 상태 복원에 쓰므로 저장 대상에 포함.
-LOGGED_EVENT_TYPES = {SHIP_DEFECT, NO_HELMET, FALLEN_PERSON, FIRE, BLOCK_LEVEL, SHIP_POSE}
+LOGGED_EVENT_TYPES = {SHIP_DEFECT, NO_HELMET, FALLEN_PERSON, FIRE, BLOCK_LEVEL, SHIP_POSE, EVENT_CLEARED}
 
 # =========================================================
 # [서버 수명 주기 구역]

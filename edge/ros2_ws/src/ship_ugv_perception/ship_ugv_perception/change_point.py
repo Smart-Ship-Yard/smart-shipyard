@@ -27,6 +27,30 @@ from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs  # noqa: F401  (PointStamped 변환을 위해 필요한 등록)
 
 
+def clear_verdict(dist_m, range_entered_at_s, last_seen_s, now_s,
+                  clear_radius_m, clear_watch_s):
+    """이벤트 클리어 상태기계의 순수 핵심부. ROS 없이 검증하려고 뽑아냈다.
+
+    반환: (verdict, 다음 range_entered_at_s)
+      'reset' — 반경 밖. 다음 방문을 위해 range_entered_at 을 지운다.
+      'wait'  — 아직 판정 시간이 안 됐거나, 이번 방문 중 다시 보였다.
+      'clear' — 확정. 이번 방문 동안 한 번도 안 보였다.
+
+    range_entered_at_s 가 None 이면 "방금 반경에 들어왔다"로 취급해 시계를
+    새로 켠다. last_seen_s 가 range_entered_at_s 이후 값이면(이번 방문 중에
+    갱신됐으면) 아직 거기 있는 것이다 — 그 전 방문의 last_seen 은 안 친다.
+    """
+    if dist_m > clear_radius_m:
+        return 'reset', None
+    if range_entered_at_s is None:
+        return 'wait', now_s
+    if (now_s - range_entered_at_s) < clear_watch_s:
+        return 'wait', range_entered_at_s
+    if last_seen_s >= range_entered_at_s:
+        return 'wait', range_entered_at_s
+    return 'clear', range_entered_at_s
+
+
 class ChangePointDetector(Node):
 
     def __init__(self):
@@ -54,8 +78,28 @@ class ChangePointDetector(Node):
         self.declare_parameter('tf_timeout_s', 0.3)
 
         # ★ 2차 필터 파라미터
-        self.declare_parameter('dedup_radius_m', 1.0)   # 같은 이벤트로 볼 거리 반경
+        self.declare_parameter('dedup_radius_m', 0.5)   # 같은 이벤트로 볼 거리 반경
         self.declare_parameter('event_ttl_s', 600.0)    # 이 시간 이상 재감지 없으면 "새 이벤트"로 취급
+
+        # ★ 2026-08-21 신설 — 능동 클리어링.
+        #   순찰 중 fire 를 정지-확인-재개했는데, 반바퀴도 못 가서 **같은 자리의
+        #   같은 불**로 다시 정지하는 사고가 있었다. 원인은 event_gate_node 와
+        #   websocket_client 가 이 노드를 거치지 않고 원본 /event_detection/uvd
+        #   를 각자 직접 구독해서, 여기서 이미 만들어둔 위치 기반 중복 제거가
+        #   실제 정지/서버전송 경로에는 전혀 적용되지 않고 있었다는 것이다.
+        #   (이 노드는 그동안 ship_survey_node 용으로만 쓰였다)
+        #   -> event_gate_node·websocket_client 를 이 노드의 출력
+        #      (/event_detection/map_point, 이미 중복 제거된 스트림)을 보도록
+        #      바꿨다. 그러면 같은 자리의 같은 불은 애초에 다시 발행되지 않는다.
+        #
+        #   그런데 "TTL 600초 뒤에 조용히 잊는다" 만으로는 부족하다. 로봇이
+        #   불을 치운 자리를 곧장 다시 지나가도 프론트 화면의 빨간 핑이 9분
+        #   넘게 남아 있게 된다. 그래서 **로봇이 그 자리를 다시 지나가며
+        #   지켜봤는데 안 보이면** 즉시 event_cleared 를 쏴서 핑을 지운다.
+        self.declare_parameter('clear_topic', '/event_detection/cleared')
+        self.declare_parameter('clear_radius_m', 0.6)    # 이 반경 안이면 "지나간다"로 본다
+        self.declare_parameter('clear_watch_s', 3.0)     # 그 안에서 이만큼 재감지가 없으면 지운다
+        self.declare_parameter('clear_check_hz', 2.0)
 
         self.map_frame = self.get_parameter('map_frame_id').value
         self.base_frame = self.get_parameter('base_frame_id').value
@@ -72,6 +116,8 @@ class ChangePointDetector(Node):
 
         self.dedup_radius = self.get_parameter('dedup_radius_m').value
         self.event_ttl = Duration(seconds=self.get_parameter('event_ttl_s').value)
+        self.clear_radius = self.get_parameter('clear_radius_m').value
+        self.clear_watch = Duration(seconds=self.get_parameter('clear_watch_s').value)
 
         # ★ 2차 필터: 이미 보고한 이벤트 기록
         # 각 항목: {'class_id': str, 'x': float, 'y': float, 'last_seen': rclpy.time.Time}
@@ -87,6 +133,10 @@ class ChangePointDetector(Node):
             self._detection_cb, 10)
         self.pub = self.create_publisher(
             String, self.get_parameter('output_topic').value, 10)
+        self.clear_pub = self.create_publisher(
+            String, self.get_parameter('clear_topic').value, 10)
+        clear_hz = max(0.1, self.get_parameter('clear_check_hz').value)
+        self.create_timer(1.0 / clear_hz, self._check_clear)
 
         self.get_logger().info(
             "change_point_detector 시작: map->base_link TF 조회 기반 + "
@@ -110,6 +160,64 @@ class ChangePointDetector(Node):
             ev for ev in self.reported_events
             if (now - ev['last_seen']) < self.event_ttl
         ]
+
+    # ------------------------------------------------------------------
+    def _check_clear(self):
+        """이미 보고한 이벤트 자리를 로봇이 다시 지나가며 지켜본다.
+
+        clear_radius 안에 clear_watch 이상 머물렀는데 그동안 재검출
+        (last_seen 갱신)이 한 번도 없었으면 "치워졌다"고 보고 알린다.
+        `range_entered_at` 이전의 last_seen 은 그 전 방문 때 값이라 인정하지
+        않는다 — 그래야 "이번 방문에서 못 봤다"만 정확히 잡는다.
+
+        치워진 이벤트는 목록에서 지운다. 같은 자리에 나중에 새로 불이 나면
+        (모형을 다시 놓으면) 완전히 새 이벤트로 다시 보고돼야 하기 때문이다.
+        """
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.map_frame, self.base_frame, Time(), timeout=self.tf_timeout)
+        except Exception:
+            return   # 위치추정이 아직 없다 — 다음 주기에 다시 시도
+        rx = transform.transform.translation.x
+        ry = transform.transform.translation.y
+
+        now = self.get_clock().now()
+        now_s = now.nanoseconds / 1e9
+        clear_watch_s = self.clear_watch.nanoseconds / 1e9
+        survivors = []
+        for ev in self.reported_events:
+            dist = math.hypot(rx - ev['x'], ry - ev['y'])
+            range_s = (ev['range_entered_at'].nanoseconds / 1e9
+                      if ev['range_entered_at'] is not None else None)
+            last_seen_s = ev['last_seen'].nanoseconds / 1e9
+
+            verdict, next_range_s = clear_verdict(
+                dist, range_s, last_seen_s, now_s,
+                self.clear_radius, clear_watch_s)
+
+            ev['range_entered_at'] = (
+                None if next_range_s is None
+                else (now if next_range_s == now_s else ev['range_entered_at']))
+
+            if verdict != 'clear':
+                survivors.append(ev)
+                continue
+
+            # ★ 확정: 이번 방문 동안 한 번도 안 잡혔다 — 치워졌다.
+            out = {
+                'class_id': ev['class_id'],
+                'event_id': ev['event_id'],
+                'map_x': ev['x'],
+                'map_y': ev['y'],
+            }
+            msg = String(); msg.data = json.dumps(out)
+            self.clear_pub.publish(msg)
+            self.get_logger().info(
+                f"[{ev['class_id']}] 치워짐 확인 — event_id={ev['event_id']} "
+                f"({now_s - range_s:.1f}초 지켜봄, 재검출 없음)")
+            # survivors 에 안 넣는다 -> 목록에서 제거됨
+
+        self.reported_events = survivors
 
     # ------------------------------------------------------------------
     def _detection_cb(self, msg: String):
@@ -190,12 +298,20 @@ class ChangePointDetector(Node):
             )
             return
 
+        # ★ event_id 는 이 위치에 처음 보고된 좌표로 고정한다(반올림 좌표).
+        #   재검출마다 map_x/map_y 가 몇 cm씩 흔들려도 프론트가 같은 핑으로
+        #   식별할 수 있어야 하기 때문이다. 프론트엔드에 이 형식 그대로
+        #   전달하기로 합의했다: "<class_id>@<x>,<y>" (소수 2자리).
+        event_id = f"{class_id}@{map_x:.2f},{map_y:.2f}"
+
         # 새 이벤트로 확정 → 기록하고 발행
         self.reported_events.append({
             'class_id': class_id,
+            'event_id': event_id,
             'x': map_x,
             'y': map_y,
             'last_seen': now,
+            'range_entered_at': None,   # _check_clear 가 쓴다
         })
 
         position_uncertainty_m = self._estimate_position_uncertainty()
@@ -203,9 +319,11 @@ class ChangePointDetector(Node):
         out = {
             'stamp': self.get_clock().now().to_msg().sec,
             'class_id': class_id,
+            'event_id': event_id,
             'confidence': confidence,
             'map_x': map_x,
             'map_y': map_y,
+            'depth': depth,
             'position_uncertainty_m': position_uncertainty_m,
         }
         out_msg = String()
@@ -213,7 +331,8 @@ class ChangePointDetector(Node):
         self.pub.publish(out_msg)
 
         self.get_logger().info(
-            f"[{class_id}] 새 이벤트 발행: map=({map_x:.2f}, {map_y:.2f})"
+            f"[{class_id}] 새 이벤트 발행: map=({map_x:.2f}, {map_y:.2f}) "
+            f"event_id={event_id}"
         )
 
     # ------------------------------------------------------------------
