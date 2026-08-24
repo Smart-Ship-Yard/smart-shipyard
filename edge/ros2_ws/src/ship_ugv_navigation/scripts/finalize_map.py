@@ -437,35 +437,43 @@ def main():
         print('  정합 기록이 없지만 이미 마무리된 맵이라 그냥 넘어간다.')
         align_dst = os.path.join(records, f'align_{name}.json')
 
-    # 고른 기록이 맵보다 한참 오래됐으면 다른 세션의 것일 수 있다.
-    # 잘못된 변환이 적용된 맵은 겉보기에 멀쩡해서 Nav2를 돌려봐야 알게 되므로
-    # 경고만 하지 않고 중단한다 (아직 아무 파일도 고치지 않은 시점).
-    gap_min = (pgm_mtime - os.path.getmtime(align_src)) / 60.0
-    if gap_min > 30 and not a.force:
-        show_candidates()
-        print()
-        print(f'  ⛔ 중단: 고른 정합 기록이 맵 저장보다 {gap_min:.0f}분 앞선다.')
-        print('     다른 매핑 세션의 기록일 가능성이 있다.')
-        print('     (정상 절차라면 align 직후 맵을 저장하므로 몇 분 이내여야 한다)')
-        print()
-        print_recovery_options(name)
-        print()
-        print('  판단 근거: 아래 값이 매핑 때 본 tf2_echo map slam_map 과 같은지 확인')
-        print('  ' + '-' * 56)
-        for line in open(align_src).read().splitlines():
-            print('  ' + line)
-        if already_baked:
-            print('  (이미 마무리된 맵이라 무시하고 넘어간다)')
-        else:
-            return 1
+    # ★ 2026-08-24: 여기부터는 정합 기록이 **실제로 있을 때만** 볼 수 있다.
+    #   예전에는 이 블록이 무조건 돌아서, 위에서 "이미 마무리된 맵이라
+    #   무시하고 넘어간다" 고 출력해놓고 정작 넘어가지 않고 그대로 내려와
+    #   align_src=None 으로 os.path.getmtime(None) 을 불러 죽었다:
+    #       TypeError: stat: path should be string, ... not NoneType
+    #   /tmp 가 재부팅으로 비워진 뒤 반지름만 바꾸려고 돌리면 항상 이랬다
+    #   (실측 2026-08-24). 안내 문구가 거짓말이 되지 않도록 실제로 건너뛴다.
+    if align_src is not None:
+        # 고른 기록이 맵보다 한참 오래됐으면 다른 세션의 것일 수 있다.
+        # 잘못된 변환이 적용된 맵은 겉보기에 멀쩡해서 Nav2를 돌려봐야 알게 되므로
+        # 경고만 하지 않고 중단한다 (아직 아무 파일도 고치지 않은 시점).
+        gap_min = (pgm_mtime - os.path.getmtime(align_src)) / 60.0
+        if gap_min > 30 and not a.force:
+            show_candidates()
+            print()
+            print(f'  ⛔ 중단: 고른 정합 기록이 맵 저장보다 {gap_min:.0f}분 앞선다.')
+            print('     다른 매핑 세션의 기록일 가능성이 있다.')
+            print('     (정상 절차라면 align 직후 맵을 저장하므로 몇 분 이내여야 한다)')
+            print()
+            print_recovery_options(name)
+            print()
+            print('  판단 근거: 아래 값이 매핑 때 본 tf2_echo map slam_map 과 같은지 확인')
+            print('  ' + '-' * 56)
+            for line in open(align_src).read().splitlines():
+                print('  ' + line)
+            if already_baked:
+                print('  (이미 마무리된 맵이라 무시하고 넘어간다)')
+            else:
+                return 1
 
-    if len(all_aligns) > 1:
-        show_candidates()
-        print()
+        if len(all_aligns) > 1:
+            show_candidates()
+            print()
 
-    align_dst = os.path.join(records, f'align_{name}.json')
-    copy_record(align_src, align_dst)
-    print(f'  정합    {align_src}\n       -> {align_dst}')
+        align_dst = os.path.join(records, f'align_{name}.json')
+        copy_record(align_src, align_dst)
+        print(f'  정합    {align_src}\n       -> {align_dst}')
 
     if calib_src is not None:
         calib_dst = os.path.join(records, f'calib_{name}.json')
