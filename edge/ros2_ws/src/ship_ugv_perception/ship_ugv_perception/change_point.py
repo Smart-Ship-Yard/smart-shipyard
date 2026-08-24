@@ -283,11 +283,25 @@ class ChangePointDetector(Node):
 
             # ★ 2026-08-24 (주현 진단): 반경 안이어도 카메라가 실제로 이
             #   방향을 보고 있지 않으면 "지켜봤는데 없었다"로 셀 수 없다.
-            #   이번 틱은 정보 없음으로 보고 state 를 그대로 둔다(진행도
-            #   되돌리기도 안 함) — clear_verdict 자체는 순수함수로 두고
-            #   호출 여부만 게이트한다.
+            #   clear_verdict 자체는 순수함수로 두고 호출 여부만 게이트한다.
+            #
+            #   ★ 그리고 이때 시계(range_entered_at)를 **리셋한다.**
+            #   안 그러면 관찰이 끊긴 동안에도 벽시계는 계속 흘러서,
+            #   clear_watch_s 가 "카메라가 지켜본 시간"이 아니라 그냥
+            #   "흐른 시간"이 된다. 그러면 이런 오판이 난다:
+            #       t=0  검출됨, 시계 켜짐
+            #       t=1~6 헤딩 오차로 카메라가 딴 데 봄 (틱 스킵, 시계는 감)
+            #       t=6  FOV 복귀 직후, 아직 검출이 도착하기 전에 틱이 돎
+            #            -> 6초 >= clear_watch_s 라 "안 보였다"고 확정
+            #   불이 멀쩡히 그 자리에 있는데 지워지고, 곧 재검출돼 새
+            #   이벤트로 등록되면서 **한 바퀴 돌 때마다 다시 정지**한다.
+            #   기하상 실제로 일어날 수 있다: 순찰반경 1.0, 불이 중심에서
+            #   0.30m 면 각도 편차가 asin(0.3/1.0)=17.5도로 half-FOV 37도
+            #   안이지만, 헤딩 오차 ±30도가 붙으면 47.5도로 벗어난다.
+            #   리셋하면 clear_watch_s 는 "연속으로 지켜본 시간"이 된다.
             if dist <= self.clear_radius and not in_camera_fov(
                     robot_yaw, self.cam_yaw, self.hfov, rx, ry, ev['x'], ev['y']):
+                ev['range_entered_at'] = None
                 survivors.append(ev)
                 continue
 
