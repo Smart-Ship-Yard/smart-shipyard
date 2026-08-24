@@ -170,7 +170,12 @@ class ChangePointDetector(Node):
         #   반경 안에서 몇 초는 재검출 없이 지나갈 수 있다), 데모 시간
         #   내에는 거의 안 걸릴 정도로 늘린다.
         self.declare_parameter('clear_radius_m', 2.0)    # 이 반경 안이면 "지나간다"로 본다
-        self.declare_parameter('clear_watch_s', 15.0)    # 그 안에서 이만큼 재감지가 없으면 지운다
+        #   ★ 2026-08-24 3차: 15초는 데모에서 너무 길다(불 치우고 핑이
+        #   사라지기까지 30~45초). 실측된 최악의 순간적 미검출 구간이
+        #   2.45초였으므로 5초면 약 2배 여유다. 대신 이만큼 짧으면
+        #   "카메라가 보고 있는데 YOLO 가 5초 연속 놓치는" 경우 오판이
+        #   날 수 있다 — FOV 게이트와 min_confidence 가 그 위험을 줄인다.
+        self.declare_parameter('clear_watch_s', 5.0)     # 그 안에서 이만큼 재감지가 없으면 지운다
         # ★ 2026-08-24: confidence 필터가 아예 없어서 저신뢰도(실측 0.468)
         #   한 프레임짜리 오탐도 그대로 새 이벤트로 등록 -> 불필요한 정지를
         #   유발했다. websocket_client 가 이미 쓰는 기준(0.5)과 맞춘다.
@@ -178,7 +183,9 @@ class ChangePointDetector(Node):
         # ★ 2026-08-24: 이벤트가 생긴 지 이만큼은 지나야 클리어 판정 대상이
         #   된다. 예전의 has_left_once(순찰 기하에 의존해 영영 발동 못 하던
         #   조건)를 대체한다 — clear_verdict 주석 참고.
-        self.declare_parameter('min_event_age_s', 30.0)
+        #   30초는 clear_watch_s 와 합쳐 체감 30~45초가 되어 너무 길었다.
+        #   10초면 정지-확인 순간을 덮으면서 체감 지연은 최대 15초다.
+        self.declare_parameter('min_event_age_s', 10.0)
         self.declare_parameter('clear_check_hz', 2.0)
 
         self.map_frame = self.get_parameter('map_frame_id').value
