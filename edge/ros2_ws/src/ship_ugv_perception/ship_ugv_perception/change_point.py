@@ -170,12 +170,17 @@ class ChangePointDetector(Node):
         #   반경 안에서 몇 초는 재검출 없이 지나갈 수 있다), 데모 시간
         #   내에는 거의 안 걸릴 정도로 늘린다.
         self.declare_parameter('clear_radius_m', 2.0)    # 이 반경 안이면 "지나간다"로 본다
-        #   ★ 2026-08-24 3차: 15초는 데모에서 너무 길다(불 치우고 핑이
-        #   사라지기까지 30~45초). 실측된 최악의 순간적 미검출 구간이
-        #   2.45초였으므로 5초면 약 2배 여유다. 대신 이만큼 짧으면
-        #   "카메라가 보고 있는데 YOLO 가 5초 연속 놓치는" 경우 오판이
-        #   날 수 있다 — FOV 게이트와 min_confidence 가 그 위험을 줄인다.
-        self.declare_parameter('clear_watch_s', 5.0)     # 그 안에서 이만큼 재감지가 없으면 지운다
+        #   ★ 2026-08-24 4차 (실측으로 결론). 5초로 줄였더니 한 바퀴마다
+        #   오판이 났다. 원인은 **배가 불을 가리는 시간**이다:
+        #       20:53:40 검출 끊김(배 뒤로 들어감) -> 20:54:10 재개
+        #       = 가림 구간 약 30초, 한 바퀴 약 50초
+        #   in_camera_fov 는 각도만 보므로 가림을 모른다. 가림과 진짜
+        #   없어짐은 **더 긴 시간으로만** 구분된다 — 가려진 것은 다음
+        #   바퀴에 반드시 다시 보이고, 치운 것은 영영 안 보인다.
+        #   그래서 실측 가림 시간(30초)의 2배인 60초로 잡는다.
+        #   대가: 불을 진짜 치웠을 때 핑이 사라지기까지 최대 1분쯤 걸린다.
+        #   그 대신 "가려졌다고 핑이 깜빡 사라지는" 일이 없어진다.
+        self.declare_parameter('clear_watch_s', 60.0)    # 그 안에서 이만큼 재감지가 없으면 지운다
         # ★ 2026-08-24: confidence 필터가 아예 없어서 저신뢰도(실측 0.468)
         #   한 프레임짜리 오탐도 그대로 새 이벤트로 등록 -> 불필요한 정지를
         #   유발했다. websocket_client 가 이미 쓰는 기준(0.5)과 맞춘다.
@@ -318,10 +323,9 @@ class ChangePointDetector(Node):
                 None if next_range_s is None
                 else (now if next_range_s == now_s else ev['range_entered_at']))
 
-            # ★ 2026-08-24: 치워짐 판정이 나도 **목록에서 지우지 않는다.**
-            #   예전에는 지웠는데, 그러면 dedup 기록까지 같이 사라져서
-            #   같은 자리의 같은 불이 곧바로 "새 이벤트"로 재등록되고
-            #   로봇이 한 바퀴마다 다시 정지했다(실측):
+            # ★ 2026-08-24: 치워짐 판정이 틀리면 dedup 기록까지 같이
+            #   사라져서 같은 자리의 같은 불이 곧바로 "새 이벤트"로
+            #   재등록되고 로봇이 한 바퀴마다 다시 정지했다(실측):
             #       20:53:20 fire@0.37,-1.12  등록
             #       20:53:48 cleared          (불은 그대로 있는데 판정됨)
             #       20:54:10 fire@0.40,-1.12  3.5cm 옆에 재등록 -> 재정지
@@ -333,19 +337,15 @@ class ChangePointDetector(Node):
             #   가림과 진짜 없어짐을 구분할 방법이 없다(실측: 검출이
             #   20:53:40 에 끊기고 8초 뒤 clear).
             #
-            #   그래서 두 목적을 분리한다:
-            #     · 프론트 핑 지우기  -> 틀려도 시각적 문제뿐 (계속 보냄)
-            #     · 재정지 방지(dedup) -> 틀리면 안 됨 (기록을 남긴다)
-            #   cleared 로 표시만 하고 목록에 남기면, 같은 자리 불은
-            #   _find_matching_event 에 계속 걸려 재발행되지 않는다.
-            #   진짜로 치워진 자리는 재검출이 없으니 event_ttl_s 뒤에
-            #   정상적으로 사라진다.
-            survivors.append(ev)
-
-            if verdict != 'clear' or ev.get('cleared'):
+            #   한때 "cleared 표시만 하고 목록에 남기기"로 막아봤으나,
+            #   그러면 **불을 원래 자리로 도로 옮겼을 때** 기존 기록에
+            #   매칭돼 정지도 핑도 안 뜨는 새 문제가 생긴다. 그래서 목록
+            #   제거는 그대로 두고, 대신 clear_watch_s 를 가림 시간보다
+            #   충분히 길게(60초) 잡아 오판 자체가 안 나게 한다.
+            if verdict != 'clear':
+                survivors.append(ev)
                 continue
 
-            ev['cleared'] = True
             out = {
                 'class_id': ev['class_id'],
                 'event_id': ev['event_id'],
@@ -356,8 +356,8 @@ class ChangePointDetector(Node):
             self.clear_pub.publish(msg)
             self.get_logger().info(
                 f"[{ev['class_id']}] 치워짐 확인 — event_id={ev['event_id']} "
-                f"({now_s - range_s:.1f}초 지켜봄, 재검출 없음). "
-                f"핑만 지우고 중복 제거 기록은 남긴다")
+                f"({now_s - range_s:.1f}초 지켜봄, 재검출 없음)")
+            # survivors 에 안 넣는다 -> 목록에서 제거됨
 
         self.reported_events = survivors
 
@@ -464,7 +464,6 @@ class ChangePointDetector(Node):
             'y': map_y,
             'last_seen': now,
             'first_seen': now,          # min_event_age_s 판정용
-            'cleared': False,           # event_cleared 를 이미 보냈는지
             'range_entered_at': None,   # _check_clear 가 쓴다
         })
 
