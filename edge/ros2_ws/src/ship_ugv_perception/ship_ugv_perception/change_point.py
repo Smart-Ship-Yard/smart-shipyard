@@ -28,34 +28,44 @@ import tf2_geometry_msgs  # noqa: F401  (PointStamped 변환을 위해 필요한
 
 
 def clear_verdict(dist_m, range_entered_at_s, last_seen_s, now_s,
-                  clear_radius_m, clear_watch_s, has_left_once):
+                  clear_radius_m, clear_watch_s, first_seen_s, min_age_s):
     """이벤트 클리어 상태기계의 순수 핵심부. ROS 없이 검증하려고 뽑아냈다.
 
-    반환: (verdict, 다음 range_entered_at_s, 다음 has_left_once)
-      'reset' — 반경 밖. 다음 방문을 위해 range_entered_at 을 지운다.
-      'wait'  — 아직 판정 시간이 안 됐거나, 이번 방문 중 다시 보였거나,
-                애초에 판정을 시작할 자격이 안 된다.
-      'clear' — 확정. 자리를 한 번 떠났다가 다시 들어와 지켜봤는데 없었다.
+    반환: (verdict, 다음 range_entered_at_s)
+      'reset' — 판정 범위 밖. 다음 기회를 위해 range_entered_at 을 지운다.
+      'wait'  — 아직 판정 시간이 안 됐거나, 이번 관찰 중 다시 보였거나,
+                이벤트가 너무 어려서 아직 판정할 자격이 안 된다.
+      'clear' — 확정. 지켜보는 동안 한 번도 안 보였다.
 
-    ★ has_left_once 가 왜 필요한가 (2026-08-22 실측 사고로 발견) ★
-    불을 처음 발견해서 **정지한 그 순간부터 이미 반경 안**이다. 로봇이
-    자리를 뜬 적이 한 번도 없는데 판정 시계가 그냥 시작해버리면, 정지-확인
-    사이에 흐른 몇 초만으로 "재방문했는데 없다"고 오판해 방금 막 보고한
-    이벤트를 곧장 지워버린다(프론트 핑이 반짝하고 꺼지는 것으로 관측됨).
-    그래서 **반경을 한 번이라도 벗어난 적이 있어야만** 그다음 재진입을
-    "재방문"으로 인정하고 시계를 켠다.
+    ★ has_left_once 를 왜 걷어냈나 (2026-08-24 실측 사고) ★
+    예전에는 "로봇이 clear_radius 를 한 번이라도 벗어난 적이 있어야
+    판정을 시작한다"는 조건을 썼다. 원래 목적은 "막 보고해서 로봇이 그
+    옆에 서 있는 동안 오판해 지워버리는 것"을 막는 것이었다.
+    그런데 이 조건은 **순찰 기하에 통째로 의존한다.** 실측:
+        순찰 중심 (0.149,-1.042) 반지름 1.00, 불이 중심에서 0.30m
+        -> 로봇~불 거리가 0.70 ~ 1.30 m 사이를 오갈 뿐
+        -> clear_radius_m=2.0 을 **영원히 못 벗어남**
+        -> has_left_once 가 영영 False -> clear 가 아예 발동 못 함
+    그 결과 이벤트가 목록에서 안 지워지고 계속 쌓여, 나중에는 그 근처
+    어디에 불을 놓아도 "기존 이벤트"로 먹혀 정지조차 안 하게 됐다.
+
+    그래서 기하와 무관한 **나이 조건(min_age_s)** 으로 바꾼다. 이벤트가
+    생긴 지 이만큼은 지나야 클리어 판정 대상이 된다. 원래 막으려던
+    "보고 직후 오판" 은 이걸로 충분히 막히고, 순찰 반지름을 바꿔도
+    깨지지 않는다. 카메라가 실제로 그쪽을 보고 있는지는 호출부의
+    in_camera_fov 게이트가 따로 본다.
     """
     if dist_m > clear_radius_m:
-        return 'reset', None, True   # 벗어났다 -> 이제부터는 재방문 자격 있음
-    if not has_left_once:
-        return 'wait', range_entered_at_s, has_left_once   # 아직 첫 방문 중
+        return 'reset', None
+    if (now_s - first_seen_s) < min_age_s:
+        return 'wait', range_entered_at_s   # 아직 너무 어리다
     if range_entered_at_s is None:
-        return 'wait', now_s, has_left_once
+        return 'wait', now_s
     if (now_s - range_entered_at_s) < clear_watch_s:
-        return 'wait', range_entered_at_s, has_left_once
+        return 'wait', range_entered_at_s
     if last_seen_s >= range_entered_at_s:
-        return 'wait', range_entered_at_s, has_left_once
-    return 'clear', range_entered_at_s, has_left_once
+        return 'wait', range_entered_at_s
+    return 'clear', range_entered_at_s
 
 
 def quat_to_yaw(x, y, z, w):
@@ -165,6 +175,10 @@ class ChangePointDetector(Node):
         #   한 프레임짜리 오탐도 그대로 새 이벤트로 등록 -> 불필요한 정지를
         #   유발했다. websocket_client 가 이미 쓰는 기준(0.5)과 맞춘다.
         self.declare_parameter('min_confidence', 0.5)
+        # ★ 2026-08-24: 이벤트가 생긴 지 이만큼은 지나야 클리어 판정 대상이
+        #   된다. 예전의 has_left_once(순찰 기하에 의존해 영영 발동 못 하던
+        #   조건)를 대체한다 — clear_verdict 주석 참고.
+        self.declare_parameter('min_event_age_s', 30.0)
         self.declare_parameter('clear_check_hz', 2.0)
 
         self.map_frame = self.get_parameter('map_frame_id').value
@@ -185,6 +199,7 @@ class ChangePointDetector(Node):
         self.clear_radius = self.get_parameter('clear_radius_m').value
         self.clear_watch = Duration(seconds=self.get_parameter('clear_watch_s').value)
         self.min_confidence = self.get_parameter('min_confidence').value
+        self.min_event_age = self.get_parameter('min_event_age_s').value
 
         # ★ 2차 필터: 이미 보고한 이벤트 기록
         # 각 항목: {'class_id': str, 'x': float, 'y': float, 'last_seen': rclpy.time.Time}
@@ -273,14 +288,14 @@ class ChangePointDetector(Node):
                       if ev['range_entered_at'] is not None else None)
             last_seen_s = ev['last_seen'].nanoseconds / 1e9
 
-            verdict, next_range_s, next_left = clear_verdict(
+            verdict, next_range_s = clear_verdict(
                 dist, range_s, last_seen_s, now_s,
-                self.clear_radius, clear_watch_s, ev['has_left_once'])
+                self.clear_radius, clear_watch_s,
+                ev['first_seen'].nanoseconds / 1e9, self.min_event_age)
 
             ev['range_entered_at'] = (
                 None if next_range_s is None
                 else (now if next_range_s == now_s else ev['range_entered_at']))
-            ev['has_left_once'] = next_left
 
             if verdict != 'clear':
                 survivors.append(ev)
@@ -404,8 +419,8 @@ class ChangePointDetector(Node):
             'x': map_x,
             'y': map_y,
             'last_seen': now,
+            'first_seen': now,          # min_event_age_s 판정용
             'range_entered_at': None,   # _check_clear 가 쓴다
-            'has_left_once': False,     # 처음엔 아직 반경을 벗어난 적이 없다
         })
 
         position_uncertainty_m = self._estimate_position_uncertainty()
