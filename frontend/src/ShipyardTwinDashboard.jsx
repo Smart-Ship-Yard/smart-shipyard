@@ -124,8 +124,17 @@ function serverToWorld(blockId, local = { x: 0.5, y: 1, z: 0.5 }) {
  *      실제 배 모형을 측량한 값(이한종님 쪽 ship_survey_node 결과)으로
  *      반드시 교체할 것 — 지금 값으로는 Ping이 엉뚱한 구획에 찍힐 수 있다.
  * ------------------------------------------------------------------------- */
-const SHIP_REAL_LENGTH_M = 0.8; // TODO: 실측값으로 교체
-const SHIP_REAL_BEAM_M = 0.17;   // TODO: 실측값으로 교체
+const SHIP_REAL_LENGTH_M = 0.77; // 실측값 (finalize_map의 SHIP_SIZE_XY 상수 기준, 이정기님 확인)
+const SHIP_REAL_BEAM_M = 0.14;   // 실측값 (finalize_map의 SHIP_SIZE_XY 상수 기준, 이정기님 확인)
+
+// 로봇(UGV) 실측 크기 — URDF 기준, 전선 돌출부 포함 유효 길이 (이정기님 확인)
+const UGV_REAL_LENGTH_M = 0.401;
+const UGV_REAL_WIDTH_M = 0.178;
+// base_link(회전 중심)가 로봇 뒤쪽 끝에서부터 이만큼 떨어진 지점에 있다.
+// 로봇 기하학적 중심이 아니라 이 지점을 축으로 화면에서 회전시켜야
+// 실제 로봇이 제자리 회전할 때와 어색하지 않게 맞는다.
+const UGV_BASE_LINK_FROM_BACK_M = 0.069;
+
 // 임시 보정값(캘리브레이션): ship_survey_node가 재는 yaw 기준과 로봇 EKF가
 // 재는 yaw 기준이 서로 다른 것 같아서(2026-08-20 실측 1건 기준 약 58도 차이),
 // 화면에 실제 위치와 최대한 비슷하게 나오도록 임시로 더해주는 값이다.
@@ -134,7 +143,7 @@ const SHIP_REAL_BEAM_M = 0.17;   // TODO: 실측값으로 교체
 // 나오는지 확인해서, 안 맞으면 이 숫자를 조금씩 조절해야 한다.
 // 근본적으로는 이정기님/이한종님 쪽에 배 측량 시스템과 로봇 EKF가 같은
 // 지도 기준(0도 방향)을 쓰고 있는지 확인 요청 필요.
-const CALIBRATION_YAW_OFFSET_DEG = 0;
+const CALIBRATION_YAW_OFFSET_DEG = 0; // FALLBACK_SHIP_POSE.yaw 자체를 캘리브레이션된 값으로 바꿔서 이제 0으로 둠
 const CALIBRATION_YAW_OFFSET_RAD = CALIBRATION_YAW_OFFSET_DEG * Math.PI / 180;
 
 /* 서버 절대좌표(mapXY)를, "배를 기준으로 한" 상대 좌표(미터)로 바꾸는 공용 변환.
@@ -212,6 +221,7 @@ function mapXYToUgvWorld(mapXY, ugvYaw, shipPose) {
 
   return { x: worldX, z: worldZ, yaw: relativeYaw };
 }
+
 /* ---------------------------------------------------------------------------
  * 2. 모의 이벤트 소스 — 실제 WebSocket과 동일한 페이로드 형태
  *    payload: { id, ts, cls, blockId, local{x,y,z}, conf }
@@ -285,7 +295,18 @@ function connectRealEventSource(url, handlers) {
     handlers.onMessage?.(data);
   };
 
-  return () => ws.close();
+  // 반환값은 그대로 "닫는 함수"라 기존 호출부(off())를 안 건드려도 되지만,
+  // 함수도 객체라 속성을 붙일 수 있어서 off.send(obj)로 같은 소켓에 메시지도
+  // 보낼 수 있게 해준다 (event_ack 등 — 새 연결 필요 없음).
+  const close = () => ws.close();
+  close.send = (obj) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    } else {
+      console.warn("[이벤트 채널] 소켓이 열려있지 않아 전송 실패:", obj);
+    }
+  };
+  return close;
 }
 
 /* ---------------------------------------------------------------------------
@@ -635,19 +656,30 @@ class SceneManager {
   }
 
   _buildUGV() {
-    // RC카(UGV) 표식 — 배 크기 대비 실제 축척에 맞게 작게 만든다 (RC카는 배보다 훨씬 작음)
+    // RC카(UGV) 표식 — 배 크기 대비 실제 축척에 맞게 작게 만든다 (RC카는 배보다 훨씬 작음).
+    // ⚠️ 로봇을 실제 축척 그대로 그리면(0.4m는 0.77m 배의 절반이나 됨) 배보다도
+    // 큰 판때기로 보여서, 시각적 크기는 원래 쓰던 고정 아이콘 크기를 그대로 쓰고
+    // base_link(회전 중심) 위치만 로봇 실측 "비율"(전체 길이 대비 회전축 위치)을
+    // 반영해서 자연스럽게 제자리 회전하도록 만든다.
     const g = new THREE.Group();
+    const VISUAL_LEN = 0.5;
+    const VISUAL_WIDTH = 0.34;
+    // base_link가 로봇 중심에서 앞으로 얼마나 떨어져 있는지를 "비율"로 계산해서
+    // (뒤에서 0.069m / 전체 0.401m 기준), 고정 아이콘 크기에 그 비율만 적용한다.
+    const baseLinkRatioFromCenter = (UGV_REAL_LENGTH_M / 2 - UGV_BASE_LINK_FROM_BACK_M) / (UGV_REAL_LENGTH_M / 2);
+    const centerOffsetFromBaseLink = baseLinkRatioFromCenter * (VISUAL_LEN / 2);
     const body = new THREE.Mesh(
-      new THREE.BoxGeometry(0.34, 0.14, 0.5),
+      new THREE.BoxGeometry(VISUAL_WIDTH, 0.14, VISUAL_LEN),
       new THREE.MeshStandardMaterial({ color: "#38bdf8", metalness: 0.4, roughness: 0.4, emissive: "#0c4a6e", emissiveIntensity: 0.4 })
     );
-    body.position.y = 0.14; body.castShadow = true;
+    body.position.set(0, 0.14, centerOffsetFromBaseLink); body.castShadow = true;
     g.add(body);
     const cam = new THREE.Mesh(
       new THREE.CylinderGeometry(0.05, 0.05, 0.08, 12),
       new THREE.MeshStandardMaterial({ color: "#0ea5e9" })
     );
-    cam.rotation.x = Math.PI / 2; cam.position.set(0, 0.22, 0.2);
+    cam.rotation.x = Math.PI / 2;
+    cam.position.set(0, 0.22, centerOffsetFromBaseLink + VISUAL_LEN / 2 - 0.05);
     g.add(cam);
     this.ugv = g;
     this.ugvAngle = 0;
@@ -711,14 +743,74 @@ class SceneManager {
     const pole = new THREE.Line(poleGeo, poleMat);
     this.scene.add(pole);
 
-    const ttl = meta.severity === SEVERITY.DANGER ? 9000 : 5500;
-    this.pings.push({ core, ring, pole, born: performance.now(), ttl, sev: meta.severity, blockId: payload.blockId });
+    // DANGER(화재/사고)는 시간이 지나도 자동으로 안 사라진다 — 핑 수명은 이제 프론트가
+    // 타이머로 정하지 않고 젯슨이 관리한다: 로봇이 그 자리를 다시 지나가서 "이제 없다"고
+    // 확인해줄 때(event_cleared) 지운다. 관제사가 확인 버튼/ESC를 누르면 그때도 즉시 지운다
+    // (사람이 직접 처리했다고 판단한 경우를 위한 보조 수단, clearBlockPing).
+    // WARN(안전모 미착용/선박 결함)은 기존처럼 잠깐 떴다가 자동으로 사라진다.
+    const persistent = meta.severity === SEVERITY.DANGER;
+    const ttl = persistent ? Infinity : 5500;
+    this.pings.push({
+      core, ring, pole, born: performance.now(), ttl,
+      sev: meta.severity, blockId: payload.blockId, cls: payload.cls,
+      eventId: payload.eventId ?? null, // 젯슨이 만든 고유 id — event_cleared 매칭용
+      persistent,
+    });
 
-    // DANGER면 해당 블록을 잠시 강조
+    // DANGER면 해당 블록을 강조 (지워지기 전까지 계속 빨갛게 남아있음)
     if (meta.severity === SEVERITY.DANGER) {
       const rec = this.blockMeshes.get(payload.blockId);
       if (rec) rec.mesh.material.emissive = new THREE.Color("#ff3b47");
     }
+  }
+
+  // 해당 구획의 지속(persistent) 핑들을 화면에서 지우고, 남은 위험 핑이 없으면
+  // 블록의 빨간 강조도 원래대로 되돌린다. core/ring/pole 정리는 공용 헬퍼로 뺐다.
+  _disposePing(p) {
+    this.scene.remove(p.core, p.ring, p.pole);
+    p.core.geometry.dispose(); p.ring.geometry.dispose(); p.pole.geometry.dispose();
+  }
+
+  _resetBlockEmissiveIfClear(blockId) {
+    const stillDanger = this.pings.some((p) => p.blockId === blockId && p.persistent);
+    if (!stillDanger) {
+      const rec = this.blockMeshes.get(blockId);
+      if (rec) rec.mesh.material.emissive = new THREE.Color("#000000");
+    }
+  }
+
+  // 관제사가 "확인"(버튼 또는 ESC)을 눌렀을 때 호출 — 해당 구획에 남아있던
+  // DANGER 핑(들)을 화면에서 지우고, 블록의 빨간 강조도 원래대로 되돌린다.
+  clearBlockPing(blockId) {
+    this.pings = this.pings.filter((p) => {
+      if (p.blockId !== blockId || !p.persistent) return true;
+      this._disposePing(p);
+      return false;
+    });
+    this._resetBlockEmissiveIfClear(blockId);
+  }
+
+  // 젯슨이 event_cleared를 보냈을 때 호출 — eventId가 일치하는 핑 하나만 지운다.
+  // eventId가 없는(구버전) 메시지거나 매칭되는 핑이 없으면, block_id + cls가 같은
+  // 핑으로 대신 매칭한다(안전망). 그래도 못 찾으면 아무것도 안 지운다.
+  clearPingByEventId(eventId, fallback = {}) {
+    let removed = false;
+    let touchedBlockId = null;
+    this.pings = this.pings.filter((p) => {
+      const matchById = eventId && p.eventId && p.eventId === eventId;
+      const matchByFallback = !eventId && fallback.blockId && fallback.cls &&
+        p.blockId === fallback.blockId && p.cls === fallback.cls;
+      if (!matchById && !matchByFallback) return true;
+      this._disposePing(p);
+      removed = true;
+      touchedBlockId = p.blockId;
+      return false;
+    });
+    if (removed && touchedBlockId) this._resetBlockEmissiveIfClear(touchedBlockId);
+    if (!removed) {
+      console.warn("[event_cleared] 일치하는 핑을 못 찾음 — 이미 확인 버튼으로 지워졌거나, event_id가 안 맞을 수 있음", { eventId, fallback });
+    }
+    return removed;
   }
 
   _initOrbit() {
@@ -1098,17 +1190,23 @@ function LivePanel({ ugvBlock, warnEvent, onExpand }) {
 
 /* 확대 팝업 — 위험(빨강) 자동 송출 + 클릭 시 표시 공용.
  * ESC 키로도 닫을 수 있게 한다 (X 버튼 클릭 없이 키보드로 종료). */
-function CctvPopup({ block, event, auto, onClose }) {
+function CctvPopup({ block, event, auto, onClose, onAck }) {
   const cvRef = useRef(null);
   const isDirect = USE_REAL_VIDEO && VIDEO_MODE === "direct";
   useCctvCanvas(cvRef, !!block && !isDirect, event, block ? block.name : "");
 
   useEffect(() => {
     if (!block) return;
-    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    // ESC: 확인 버튼이 있는 경우(onAck 존재) ESC도 "확인"과 동일하게 동작 — 확인 이벤트 전송 후 닫힘.
+    // 확인 버튼이 없는 팝업(onAck 없음)은 기존처럼 그냥 닫기만 한다.
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      if (onAck) onAck();
+      else onClose();
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [block, onClose]);
+  }, [block, onClose, onAck]);
 
   if (!block) return null;
   const meta = event ? CLASS_META[event.cls] : null;
@@ -1143,6 +1241,13 @@ function CctvPopup({ block, event, auto, onClose }) {
             <div><span className="k">상태</span><span className="v">정상 — 활성 경보 없음</span></div>
           )}
         </div>
+        {onAck && (
+          <div className="popup-actions">
+            <button type="button" className="popup-ack-btn" onClick={onAck}>
+              확인 — 위험 확인, 순찰 재개
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1165,19 +1270,82 @@ export default function ShipyardTwinDashboard() {
   const [warnEvent, setWarnEvent] = useState(null);      // 라이브 패널 경고 표시
   const [ugvBlock, setUgvBlock] = useState(BLOCKS[0]);   // UGV가 보고 있는 구역
   const warnTimer = useRef(null);
- const FALLBACK_SHIP_POSE = {
-  map_xy: [1.0778516278314955, -0.740519236385165],
-  yaw: 0.35384,
-  block_id: null,
+  // TODO(임시): websocket_client.py → 백엔드 중계 경로에서 ship_pose가 아직 안 오고 있어서,
+  // 직접 로봇을 배 뱃머리/선미 두 지점에 놓고 실측해서 역산한 값을 임시 기본값으로 넣어둠
+  // (2026-08-20 22:50~22:51 캘리브레이션, ros2 topic echo로 받은 최초 측량값의 yaw가
+  // 실제와 많이 달라서 — 아마 ship_survey_node와 로봇 EKF가 서로 다른 방향 기준을
+  // 쓰고 있는 것으로 추정 — 이 값으로 대체함).
+  // 중계가 고쳐져서 실제 ship_pose 이벤트가 오면 아래 onMessage 핸들러가 이 값을 자동으로 덮어씀 —
+  // 중계 고쳐지면 이 기본값은 지워도 됨 (아래 FALLBACK_SHIP_POSE 상수 포함째로 삭제).
+  const FALLBACK_SHIP_POSE = {
+    map_xy: [1.0778516278314955, -0.740519236385165],
+    yaw: 0.35384,
+    block_id: null,
   };
-  const shipPoseRef = useRef(FALLBACK_SHIP_POSE);
+  const shipPoseRef = useRef(FALLBACK_SHIP_POSE); // 최신 ship_pose(map_xy, yaw) — 좌표 변환에 씀
   const seenEventTypesRef = useRef(new Set()); // 디버깅용 — 어떤 event_type이 실제로 오는지 콘솔에 한 번씩만 찍기
+  const wsControlRef = useRef(null); // 지금 연결된 소켓의 close()/send() — event_ack 보낼 때 씀 (진짜 백엔드 모드에서만 채워짐)
+  // 구획(blockId)별 "아직 확인 안 한" 최신 위험 이벤트 저장소.
+  // 자동 팝업이 아니라 사용자가 블록을 직접 클릭(Click & View)했을 때도,
+  // 그 구획에 현재 위험 이벤트가 떠 있으면 확인 버튼이 보이게 하려고 따로 기억해둔다.
+  // (state로 안 하고 ref로 하는 이유: handlePickBlock을 다시 만들지 않아도 되게 하려고 — 씬 재생성 방지)
+  const dangerByBlockRef = useRef({});
+
+  // 조립 단계(1~5)를 "아래에서 N번째 구획까지 완성"으로 화면에 반영하는 공용 함수.
+  // block_level 웹소켓 이벤트, /api/init-data 초기 로딩 둘 다 이 함수를 같이 쓴다.
+  // ⚠️ 배가 한 척(B1)뿐이라 구획별이 아니라 "몇 번째 구획까지 끝났는지"로 계산한다 —
+  // 젯슨이 보내는 block_id("B1")는 배 자체의 id지, BLOCKS의 S1~S5(구획)가 아니다.
+  const applyStageProgress = useCallback((stage) => {
+    const clamped = Math.max(0, Math.min(BLOCKS.length, Number(stage) || 0));
+    setProgress((prev) => {
+      const next = { ...prev };
+      BLOCKS.forEach((b, i) => {
+        const p = i < clamped ? 1 : 0;
+        next[b.id] = p;
+        if (sceneRef.current) sceneRef.current.setBlockProgress(b.id, p);
+      });
+      return next;
+    });
+  }, []);
+
+  // /api/init-data를 REST로 읽어서 배 위치(ship_pose)와 조립 단계(level) 초기값을 반영한다.
+  // ship_pose는 측량 끝나는 순간 딱 1번만 웹소켓으로 나가서, 그 타이밍에
+  // 연결이 안 돼있으면 영영 놓친다 — 그래서 백엔드가 MongoDB에 저장해둔 최신값을
+  // REST로 받아오는 게 훨씬 안전하다. 페이지 열 때 1번 + 웹소켓이 (재)연결될 때마다
+  // 다시 호출한다 (연결 끊긴 동안 놓친 갱신을 따라잡기 위해).
+  const fetchInitData = useCallback(() => {
+    if (!USE_REAL_BACKEND) return;
+    const initDataUrl = `http://${SERVER_HOST}/api/init-data`;
+    fetch(initDataUrl)
+      .then((res) => res.json())
+      .then((data) => {
+        const blocks = Array.isArray(data?.blocks) ? data.blocks : [];
+        const b1 = blocks.find((b) => b && b.id === "B1");
+        if (b1 && b1.x != null && b1.y != null && b1.yaw != null) {
+          shipPoseRef.current = { map_xy: [b1.x, b1.y], yaw: b1.yaw, block_id: b1.id };
+          console.log("[초기 데이터] /api/init-data에서 배 위치를 불러왔습니다 — 이제부터 진짜 실측값 사용", shipPoseRef.current);
+        } else {
+          console.warn("[초기 데이터] /api/init-data 응답에서 B1(배) 항목을 못 찾았습니다 — 임시값(FALLBACK_SHIP_POSE) 계속 사용", data);
+        }
+        if (b1 && b1.level != null) {
+          applyStageProgress(b1.level);
+          console.log("[초기 데이터] /api/init-data에서 조립 단계(level)도 반영함:", b1.level);
+        }
+      })
+      .catch((err) => {
+        console.warn(`[초기 데이터] ${initDataUrl} 불러오기 실패 — 임시값(FALLBACK_SHIP_POSE) 계속 사용`, err);
+      });
+  }, [applyStageProgress]);
+
+  useEffect(() => { fetchInitData(); }, [fetchInitData]);
 
   const handlePickBlock = useCallback((blockId) => {
     const block = BLOCKS.find((b) => b.id === blockId);
     setActiveBlock(block);
     setAutoPopup(false);
-    setActiveEvent((prev) => prev && prev.blockId === blockId ? prev : null);
+    // 이 구획에 아직 확인 안 한 위험 이벤트가 있으면 그걸 같이 띄운다 —
+    // 그래야 직접 클릭해서 봤을 때도(자동 팝업이 아니어도) 확인 버튼이 보인다.
+    setActiveEvent(dangerByBlockRef.current[blockId] || null);
     if (sceneRef.current) sceneRef.current.highlightBlock(blockId);
   }, []);
 
@@ -1201,6 +1369,9 @@ export default function ShipyardTwinDashboard() {
 
     if (meta.severity === SEVERITY.DANGER) {
       const block = BLOCKS.find((b) => b.id === payload.blockId);
+      // 이 구획의 "확인 대기중" 위험 이벤트로 기억해둠 — 나중에 사용자가 이 블록을
+      // 직접 클릭해서 봐도(자동 팝업을 놓쳤어도) 확인 버튼이 뜨게 하기 위함.
+      dangerByBlockRef.current = { ...dangerByBlockRef.current, [payload.blockId]: { ...payload, _meta: meta } };
       setActiveBlock(block);
       setActiveEvent({ ...payload, _meta: meta });
       setAutoPopup(true);
@@ -1232,7 +1403,13 @@ export default function ShipyardTwinDashboard() {
     // === 진짜 백엔드 모드 ===
     console.log(`[이벤트 채널] 연결 시도: ${EVENT_WS_URL}`);
     const off = connectRealEventSource(EVENT_WS_URL, {
-      onOpen: () => { console.log("[이벤트 채널] 연결 성공"); setConnected(true); },
+      onOpen: () => {
+        console.log("[이벤트 채널] 연결 성공");
+        setConnected(true);
+        // 연결이 끊긴 동안 놓쳤을 수 있는 갱신(배 위치/조립 단계)을 따라잡기 위해
+        // (재)연결될 때마다 최신 스냅샷을 다시 읽는다.
+        fetchInitData();
+      },
       onClose: () => { console.log("[이벤트 채널] 연결 끊김"); setConnected(false); },
       onError: () => setConnected(false),
       onMessage: (data) => {
@@ -1272,12 +1449,31 @@ export default function ShipyardTwinDashboard() {
         }
 
         // ③ 조립 단계 — Ping이 아니라 공정률 색상으로 반영
+        // ⚠️ level은 1~5 (5단계 만점, /3이 아니라 /5), block_id("B1")는 BLOCKS의
+        // S1~S5(구획)가 아니라 배 자체의 id라서 그대로 매칭하면 아무 데도 안 붙는다.
+        // applyStageProgress가 "몇 번째 구획까지 완성"으로 알아서 변환해준다.
         if (type === "block_level") {
-          const p = Math.max(0, Math.min(1, Number(data.level) / 3));
-          setProgress((prev) => {
-            if (sceneRef.current) sceneRef.current.setBlockProgress(data.block_id, p);
-            return { ...prev, [data.block_id]: p };
-          });
+          applyStageProgress(data.level);
+          return;
+        }
+
+        // ④ 위험 해제 — 로봇이 그 자리를 다시 지나가면서 확인했는데 대상이 이미 없어졌을 때
+        // 젯슨이 보냄: {"event_type":"event_cleared","block_id":"B1","cls":"fire","map_xy":[...],"event_id":"fire@0.40,-0.99"}
+        // 해당 event_id를 가진 핑만 화면에서 지운다 (핑 수명을 이제 프론트가 아니라 젯슨이 관리).
+        if (type === "event_cleared") {
+          if (sceneRef.current) {
+            sceneRef.current.clearPingByEventId(data.event_id ?? null, { blockId: data.block_id, cls: data.cls });
+          }
+          // "확인 대기중" 기록도 같은 event_id일 때만 같이 정리 — 그 사이에 같은 구획에서
+          // 다른 새 위험이 또 감지됐다면(다른 event_id) 그건 그대로 남겨둬야 하니까.
+          if (data.block_id) {
+            const cur = dangerByBlockRef.current[data.block_id];
+            if (cur && (!data.event_id || cur.eventId === data.event_id)) {
+              const next = { ...dangerByBlockRef.current };
+              delete next[data.block_id];
+              dangerByBlockRef.current = next;
+            }
+          }
           return;
         }
 
@@ -1296,11 +1492,17 @@ export default function ShipyardTwinDashboard() {
           blockId,
           local,
           conf: data.confidence ?? 0,
+          eventId: data.event_id ?? null, // 젯슨이 만든 고유 id — 나중에 event_cleared로 이 핑만 콕 집어 지울 때 씀
         });
       },
     });
+    wsControlRef.current = off; // event_ack 보낼 때 이 소켓으로 보냄
 
-    return () => { off(); clearTimeout(warnTimer.current); };
+    return () => {
+      off();
+      wsControlRef.current = null;
+      clearTimeout(warnTimer.current);
+    };
   }, [handleDetectionEvent]);
 
   // 초기 공정률을 씬에 반영
@@ -1322,6 +1524,26 @@ export default function ShipyardTwinDashboard() {
   const closePopup = () => {
     setActiveBlock(null); setActiveEvent(null); setAutoPopup(false);
     if (sceneRef.current) sceneRef.current.highlightBlock(null);
+  };
+
+  // 위험 이벤트 팝업의 "확인" 버튼 — 지금 쓰는 이벤트 소켓(/ws/frontend) 그대로
+  // {"event_type":"event_ack"} 한 줄만 보내고 팝업을 닫는다. 새 연결/새 API 없음.
+  // 응답은 안 기다림 — 서버가 젯슨으로 전달, 젯슨이 Nav2에 순찰 재개 신호를 보냄(백엔드 완료).
+  // 위험물이 안 치워졌으면 다음 바퀴(~40초 후)에 팝업이 다시 뜨는 게 의도된 동작.
+  const handleAck = () => {
+    wsControlRef.current?.send?.({ event_type: "event_ack" });
+    console.log("[이벤트 채널] event_ack 전송");
+    // 확인했으니 이 구획의 "확인 대기중" 위험 이벤트 기록도 지운다 —
+    // 안 지우면 나중에 이 블록을 다시 클릭했을 때 이미 처리된 옛날 이벤트로
+    // 확인 버튼이 또 뜨게 된다.
+    if (activeBlock) {
+      const next = { ...dangerByBlockRef.current };
+      delete next[activeBlock.id];
+      dangerByBlockRef.current = next;
+      // 화면에 계속 남아있던 위험 핑(화재/사고 표시)도 확인한 지금 지운다.
+      if (sceneRef.current) sceneRef.current.clearBlockPing(activeBlock.id);
+    }
+    closePopup();
   };
 
   const dangerCount = stats.danger;
@@ -1432,6 +1654,7 @@ export default function ShipyardTwinDashboard() {
         event={activeEvent}
         auto={autoPopup}
         onClose={closePopup}
+        onAck={handleAck}
       />
     </div>
   );
@@ -1582,6 +1805,13 @@ const CSS = `
 .popup-meta > div { display:flex; justify-content:space-between; font-size:12px; border-bottom:1px solid #161f2e; padding-bottom:7px; }
 .popup-meta .k { color:#7d8aa3; }
 .popup-meta .v { color:#e6edf6; font-weight:600; }
+.popup-actions { padding:0 16px 16px; }
+.popup-ack-btn {
+  width:100%; padding:12px; border-radius:9px; border:1px solid #2dd4bf;
+  background:rgba(45,212,191,.12); color:#2dd4bf; font-size:13px; font-weight:700;
+  letter-spacing:.3px; cursor:pointer; transition:background .15s ease;
+}
+.popup-ack-btn:hover { background:rgba(45,212,191,.22); }
 
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.25} }
 @keyframes fade { from{opacity:0} to{opacity:1} }
