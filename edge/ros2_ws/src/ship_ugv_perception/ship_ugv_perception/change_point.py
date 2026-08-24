@@ -318,11 +318,34 @@ class ChangePointDetector(Node):
                 None if next_range_s is None
                 else (now if next_range_s == now_s else ev['range_entered_at']))
 
-            if verdict != 'clear':
-                survivors.append(ev)
+            # ★ 2026-08-24: 치워짐 판정이 나도 **목록에서 지우지 않는다.**
+            #   예전에는 지웠는데, 그러면 dedup 기록까지 같이 사라져서
+            #   같은 자리의 같은 불이 곧바로 "새 이벤트"로 재등록되고
+            #   로봇이 한 바퀴마다 다시 정지했다(실측):
+            #       20:53:20 fire@0.37,-1.12  등록
+            #       20:53:48 cleared          (불은 그대로 있는데 판정됨)
+            #       20:54:10 fire@0.40,-1.12  3.5cm 옆에 재등록 -> 재정지
+            #       20:54:45 cleared ... 무한 반복
+            #
+            #   판정이 왜 틀리나: in_camera_fov 는 "카메라가 그 방향을
+            #   향하는가"만 본다. 순찰 원 중심에 배가 있어 반대편에서는
+            #   **배에 가려** 안 보이는데, 각도상으론 FOV 안이라 통과된다.
+            #   가림과 진짜 없어짐을 구분할 방법이 없다(실측: 검출이
+            #   20:53:40 에 끊기고 8초 뒤 clear).
+            #
+            #   그래서 두 목적을 분리한다:
+            #     · 프론트 핑 지우기  -> 틀려도 시각적 문제뿐 (계속 보냄)
+            #     · 재정지 방지(dedup) -> 틀리면 안 됨 (기록을 남긴다)
+            #   cleared 로 표시만 하고 목록에 남기면, 같은 자리 불은
+            #   _find_matching_event 에 계속 걸려 재발행되지 않는다.
+            #   진짜로 치워진 자리는 재검출이 없으니 event_ttl_s 뒤에
+            #   정상적으로 사라진다.
+            survivors.append(ev)
+
+            if verdict != 'clear' or ev.get('cleared'):
                 continue
 
-            # ★ 확정: 이번 방문 동안 한 번도 안 잡혔다 — 치워졌다.
+            ev['cleared'] = True
             out = {
                 'class_id': ev['class_id'],
                 'event_id': ev['event_id'],
@@ -333,8 +356,8 @@ class ChangePointDetector(Node):
             self.clear_pub.publish(msg)
             self.get_logger().info(
                 f"[{ev['class_id']}] 치워짐 확인 — event_id={ev['event_id']} "
-                f"({now_s - range_s:.1f}초 지켜봄, 재검출 없음)")
-            # survivors 에 안 넣는다 -> 목록에서 제거됨
+                f"({now_s - range_s:.1f}초 지켜봄, 재검출 없음). "
+                f"핑만 지우고 중복 제거 기록은 남긴다")
 
         self.reported_events = survivors
 
@@ -441,6 +464,7 @@ class ChangePointDetector(Node):
             'y': map_y,
             'last_seen': now,
             'first_seen': now,          # min_event_age_s 판정용
+            'cleared': False,           # event_cleared 를 이미 보냈는지
             'range_entered_at': None,   # _check_clear 가 쓴다
         })
 
