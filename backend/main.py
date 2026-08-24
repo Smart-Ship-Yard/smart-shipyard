@@ -80,6 +80,10 @@ FALLEN_PERSON = "fallen_person"  # 작업자 쓰러짐
 FIRE = "fire"                    # 화재
 BLOCK_LEVEL = "block_level"      # 블록 조립 단계 변화 (block_id, level 필드 포함)
 SHIP_POSE = "ship_pose"          # 배 위치 측량 결과 (block_id, map_xy, yaw 필드 포함)
+# 위험 이벤트가 치워졌음(더 이상 안 보임) 확인 (interface.md v1.6, 2026-08-21)
+# block_id, cls, map_xy, event_id 필드 포함. cls 로 어느 위험 종류였는지 담는다
+# (이 메시지 자체의 event_type 은 "event_cleared" 고정이라 종류를 따로 실어야 함).
+EVENT_CLEARED = "event_cleared"
 
 # 프론트→서버→젯슨 방향 명령 (DB 저장 대상 아님).
 # 프론트가 영상 팝업을 열/닫을 때 젯슨의 영상 화질을 전환시키는 명령.
@@ -122,7 +126,7 @@ KST = timezone(timedelta(hours=9))
 # DB 저장 대상 이벤트 목록 — 위험 이벤트 4종 + 공정 단계 변화 + 배 위치 측량.
 # block_level/ship_pose는 '바뀔 때만' 오는 희소 이벤트라 저장량 부담이 없고,
 # 최신 값을 init-data 상태 복원에 쓰므로 저장 대상에 포함.
-LOGGED_EVENT_TYPES = {SHIP_DEFECT, NO_HELMET, FALLEN_PERSON, FIRE, BLOCK_LEVEL, SHIP_POSE}
+LOGGED_EVENT_TYPES = {SHIP_DEFECT, NO_HELMET, FALLEN_PERSON, FIRE, BLOCK_LEVEL, SHIP_POSE, EVENT_CLEARED}
 
 # =========================================================
 # [서버 수명 주기 구역]
@@ -417,9 +421,24 @@ async def get_init_data():
     block_level 이벤트는 단계가 '바뀔 때만' 오기 때문에, 변화 이후에
     새로 열린 대시보드는 그 메시지를 놓친다 → 최신 상태는 이 REST로 복원.
     """
-    # 지금은 하드코딩된 예시 데이터. 추후 선박 블록 좌표는 DB나 설정 파일에서
-    # 읽어오도록 확장 예정 (블록 개수/좌표가 늘어날 것이므로).
-    blocks = [{"id": "B1", "x": 10, "y": 20}, {"id": "B2", "x": 50, "y": 80}]
+    # 하드코딩된 블록 목록. 추후 DB나 설정 파일에서 읽도록 확장 예정.
+    #
+    # x, y 는 ship_pose 기록이 아직 없을 때만 쓰이는 자리표시값이다. 아래에서
+    # MongoDB 의 최신 ship_pose 로 덮어쓴다(젯슨이 실측해서 보낸 map 좌표, 미터).
+    #
+    # ※ B2 는 2026-08-20 에 주석 처리했다.
+    #   지금 현장에는 선박 블록이 **한 대(B1)뿐**이고, 프론트엔드도 B2 를
+    #   그리지 않는다(프론트의 S1~S5 는 배 두 척이 아니라 B1 한 척의 다섯
+    #   구획이다 — 선수/전방/중앙/후방/선미). 그래서 B2 는 측량값이 영영
+    #   안 들어오고, 자리표시값 (50, 80) 이 그대로 응답에 실려 나갔다.
+    #   실제 좌표가 미터 단위인데 저 값만 단위가 달라 혼동을 준다.
+    #   ▶ 블록이 늘어나면(공정이 여러 대로 확장되면) 아래 줄의 주석을 풀고
+    #     id 를 추가하면 된다. 젯슨이 그 id 로 ship_pose / block_level 을
+    #     보내기 시작하면 좌표와 단계가 자동으로 채워진다.
+    blocks = [
+        {"id": "B1", "x": 10, "y": 20},
+        # {"id": "B2", "x": 50, "y": 80},
+    ]
 
     # 블록마다 DB에 저장된 '가장 최근' block_level 이벤트를 찾아 현재 단계를 채움.
     # 아직 기록이 없는 블록(한 번도 감지 안 됨)은 초기 단계인 1로 간주.

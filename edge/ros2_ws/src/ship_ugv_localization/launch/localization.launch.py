@@ -11,9 +11,13 @@ ship_ugv_localization/launch/localization.launch.py
 """
 
 import os
+import sys
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+import subprocess
+
+from launch.actions import LogInfo
 from launch_ros.actions import Node
 
 
@@ -35,11 +39,31 @@ def generate_launch_description():
         }],
     )
 
+    # ---- 저장된 캘리브레이션 되살리기 (2026-08-20 신설) ----
+    #   ros2 launch ship_ugv_localization localization.launch.py calib:=shipyard_map_hall_v3
+    #
+    #   map<-uwb_frame 은 방에 고정된 값이다(UWB 앵커가 벽에 붙어 있다).
+    #   그런데 노드 메모리에만 있어서, 배터리가 나가면 — 모터와 젯슨이 배터리
+    #   하나를 같이 쓴다 — 같이 날아가고, 그 좌표계로 만든 맵까지 통째로
+    #   못 쓰게 되어 매핑을 처음부터 다시 해야 했다. 불러오면 그럴 필요가 없다.
+    #
+    #   이 런치 파일은 OpaqueFunction 없이 즉시 조립하는 방식이라
+    #   LaunchConfiguration 을 여기서 풀 수 없다. 그래서 argv 를 직접 본다.
+    #   (사람이 직접 실행하는 파일이고, 다른 런치가 include 하지 않는다)
+    calib_arg = next((a.split(':=', 1)[1] for a in sys.argv
+                      if a.startswith('calib:=')), '')
+    calib_file = ''
+    if calib_arg:
+        calib_file = calib_arg if calib_arg.endswith('.json') else os.path.join(
+            get_package_share_directory('ship_ugv_navigation'),
+            'maps', 'calibration_records', f'calib_{calib_arg}.json')
+
     uwb_calibration_node = Node(
         package='uwb_map_calibration',
         executable='calibration_node',
         name='uwb_map_calibration',
         output='screen',
+        parameters=[{'load_calibration_file': calib_file}],
     )
 
     heading_filter_node = Node(
@@ -47,6 +71,24 @@ def generate_launch_description():
         executable='complementary_filter_node',
         name='heading_complementary_filter',
         output='screen',
+        parameters=[{
+            # ★ 2026-08-15 실측 반영: 노드 기본값 0.01(rad^2)은 "yaw 오차 5.7도"라는
+            #   주장인데, 좁은 방 앵커 기하에서 실제로는 25도 이상 틀어지는 것을
+            #   여러 번 확인했다(180도 뒤집힌 경우도 있었다). 과신한 공분산은
+            #   ekf_global 에서 AMCL(라이다-맵 매칭)의 정확한 yaw 를 눌러버린다.
+            #   실측에 맞춰 낮춘다 — 여전히 AMCL 이 수렴하기 전이나
+            #   AMCL 이 실패했을 때의 fallback 역할은 한다.
+            #
+            # ★ 2026-08-18 재조정 0.15 -> 1.0 (약 57도).
+            #   0.15 로도 부족했다. AMCL 이 수렴해 공분산 6.5도(=아주 확신)를
+            #   내는데도 EKF 가 29도나 어긋난 채로 heading 필터를 따라갔다.
+            #   원인은 **업데이트 빈도**다 — heading 필터는 10 Hz 로 계속 밀어넣지만
+            #   AMCL 은 로봇이 0.1 m 움직여야 한 번 갱신한다(update_min_d).
+            #   정확도는 AMCL 이 높은데 횟수로 밀린다.
+            #   그래서 heading 필터를 "약한 사전정보"로 낮춘다. 라이다-맵 매칭이
+            #   가능한 상황에서는 그쪽이 언제나 더 정확하다.
+            'yaw_variance': 1.0,
+        }],
     )
 
     ekf_local_node = Node(
@@ -74,17 +116,70 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ★ 배 측량은 매핑 랩과 같은 주행에서 이뤄져야 한다.
-    #   Nav2 순찰을 돌리려면 배 중심이 이미 있어야 하는데, 중심을 구하려고
-    #   도는 것이라 Nav2를 켠 뒤에 측량하면 닭-달걀이 되기 때문.
-    #   mapping.launch.py가 이 launch를 전제로 돌므로 여기 두면 매핑 시 항상 켜진다.
-    #   측량 입력(/event_detection/uvd)을 yolo_depth_publisher가 만들므로 같이 띄운다.
-    yolo_depth_publisher_node = Node(
-        package='ship_ugv_perception',
-        executable='yolo_depth_publisher',
-        name='yolo_depth_publisher',
+    # ★ yolo_depth_publisher 는 **여기서 띄우지 않는다** (2026-08-19 제거).
+    #
+    #   원래는 "측량 입력(/event_detection/uvd)을 yolo_depth_publisher 가 만드니
+    #   같이 띄운다" 는 의도로 여기 있었다. 의도는 맞지만 실제로는 동작하지
+    #   않고 있었다.
+    #
+    #   젯슨에는 systemd 서비스 `yolo-depth-publisher.service` 가 이미 있고,
+    #   카메라(pyorbbecsdk)는 **한 프로세스만 열 수 있다.** 그래서 둘이 경쟁하면
+    #   늦게 뜬 쪽이 죽는데, 늦게 뜨는 쪽이 항상 이 launch 였다:
+    #       [ERROR] [yolo_depth_publisher-11]: process has died [exit code 1]
+    #   런치 로그가 워낙 길어 이 한 줄은 아무도 못 봤고, "YOLO 잘 돌아가네" 하고
+    #   있었지만 실제로 도는 것은 systemd 쪽이었다.
+    #
+    #   반대로 CPU 를 아끼려고 systemd 를 잠깐 끄면 이번엔 이쪽이 살아나면서
+    #   터미널을 로그로 도배했다 (실측 120건/12초).
+    #
+    #   -> **systemd 가 YOLO 를 소유한다.** 부팅 시 자동으로 뜨고, 죽어도
+    #      Restart=always 로 되살아나며, 로그가 journald 로 가서 이 터미널을
+    #      더럽히지 않는다. 매핑 중 배 표면 측량도 그대로 동작한다.
+    #
+    #   대신 아래 기동 배너에서 "YOLO 가 실제로 떠 있는지" 를 확인한다.
+    #   누가 서비스를 꺼놨으면 매핑 마스킹이 **조용히** 실패하기 때문이다.
+
+    # ---- YOLO 배 측량을 켤지 (2026-08-20: 기본 끔) ----
+    #   ros2 launch ship_ugv_localization localization.launch.py survey:=true
+    #
+    #   왜 껐나: 이 노드가 내놓는 배 중심·방향·크기가 못 쓸 정도로 부정확했다.
+    #     실측 0.80 x 0.17 m 인 배를 1.68 x 0.35 m 로 쟀다(2026-08-20).
+    #     방향은 노이즈고, 중심도 같은 배를 두 번 재서 크게 달랐다.
+    #   왜 문제인가: 이 값 하나가 **두 곳의 기준 좌표계**가 된다.
+    #     ① Nav2 keepout 마스크 위치  ② 프론트엔드 화면 전체
+    #        (ShipyardTwinDashboard.jsx 의 mapXYToShipLocalMeters 가 배 pose 를
+    #         기준으로 로봇·이벤트·블록을 전부 변환한다)
+    #     즉 배 pose 가 틀리면 자율주행도 화면도 같이 틀어진다.
+    #   대신: 매핑할 때 사람이 줄자로 한 번 재서 넣는다.
+    #     finalize_map.py <맵이름> --center X Y
+    #     방향은 "캘리브레이션 때 로봇을 배와 나란히" 약속으로 0도 고정.
+    #   ※ 이벤트 좌표(/event_detection/map_point)와 block_level 은 그대로 YOLO 를
+    #     쓴다. 그쪽은 1회 관측이라 오차가 누적되지 않고, 대안도 없다.
+    survey_on = any(a in ('survey:=true', 'survey:=True', 'survey:=1')
+                    for a in sys.argv)
+
+    # ---- 실측 배 중심을 켜질 때마다 서버로 보낸다 (2026-08-20 신설) ----
+    #   매핑한 날에는 publish_ship_pose.py 를 사람이 치지만, 며칠 뒤에 맵만
+    #   불러와 자율주행을 돌리는 날에는 아무도 안 친다. 그러면 프론트엔드
+    #   화면에 배 위치가 안 가고, 그 화면은 배 pose 를 기준 좌표계로 쓰므로
+    #   로봇도 이벤트도 전부 어긋난 자리에 그려진다.
+    #   ※ 이 파일은 install/ 에서도 src 로의 심볼릭 링크라, realpath 로
+    #     소스 트리를 되짚으면 측정값 파일을 확실히 찾을 수 있다.
+    #     (share 경유로 찾으면 colcon build 를 해야만 보인다)
+    measured_file = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.realpath(__file__)),
+        '..', '..', 'ship_ugv_navigation', 'config',
+        'ship_center_measured.json'))
+
+    ship_pose_pub_node = Node(
+        package='ship_ugv_navigation',
+        executable='ship_pose_publisher',
+        name='ship_pose_publisher',
         output='screen',
+        parameters=[{'measured_file': measured_file}],
     )
+    banner_survey = ('켬 — YOLO 로 배를 측량한다 (부정확할 수 있음)' if survey_on
+                     else '끔 — 배 위치는 finalize_map.py --center X Y 로 실측해 넣는다')
 
     ship_survey_node = Node(
         package='ship_ugv_perception',
@@ -165,7 +260,12 @@ def generate_launch_description():
             'serial_port': '/dev/wheel_mcu',
             'track_width_m': 0.22568,
             'wheel_radius_m': 0.0308,
-            'ticks_per_rev': 330,   # 1320 -> 330으로 변경 (JGB37-520 실제 CPR 재검증)
+            # ★ 2026-08-18: 330 -> 1320 으로 되돌림.
+            #   330 이었던 이유는 펌웨어가 A상 상승엣지만 세는 반쪽 디코딩이라
+            #   쿼드러처 4배를 못 셌기 때문이다 (1320 / 4 = 330).
+            #   펌웨어를 정식 x4 쿼드러처로 바꿨으므로 스펙값이 맞다.
+            #   물리 치수(wheel_radius_m, track_width_m)는 그대로다 — 세는 방식만 바뀐 것.
+            'ticks_per_rev': 1320,
             'right_trim': 0.98,   # 왼쪽으로 휘니 오른쪽을 살짝 줄여서 시작
         }],
     )
@@ -198,7 +298,74 @@ def generate_launch_description():
         ],
     )
 
-    return LaunchDescription([
+    # ------------------------------------------------------------------
+    # ★ 기동 배너 — 센서 장치 파일이 있는지 먼저 눈으로 알려준다 (2026-08-17 추가)
+    #
+    # 왜 필요한가: 라이다 USB 커넥터가 헐거워져 /dev/lidar 가 사라진 채로
+    # 이 launch 를 띄웠더니, rplidar_node 만 1초 만에 조용히 죽고 나머지는
+    # 정상 기동했다. 이 launch 는 노드 하나가 죽어도 전체가 안 죽으므로
+    # (required 미설정 — 카메라가 없어도 주행은 되어야 하니 의도된 설계다)
+    # 아무도 눈치채지 못했고, 그 상태로 13분을 매핑했지만 스캔이 없어
+    # 지도가 한 장도 안 만들어졌다. align 을 부르고 나서야 알았다.
+    #
+    # 그래서 "없으면 크게 알린다". 죽이지는 않는다 — 장치 하나가 없어도
+    # 나머지로 할 수 있는 일이 있고, 그 판단은 사람이 한다.
+    DEVICES = [
+        ('/dev/lidar',     'RPLIDAR',      '스캔 없음 -> 매핑·Nav2 불가'),
+        ('/dev/uwb_tag',   'UWB 태그',     '위치추정 불가 (캘리브레이션 실패)'),
+        ('/dev/imu',       'IMU',          'yaw 추정 열화'),
+        ('/dev/wheel_mcu', 'Arduino Mega', '바퀴가 안 돈다 (/cmd_vel 소비자 없음)'),
+    ]
+    missing = [(p, name, impact) for p, name, impact in DEVICES if not os.path.exists(p)]
+
+    banner = [LogInfo(msg='─── 센서 장치 확인 ' + '─' * 41)]
+    for path, name, _ in DEVICES:
+        mark = '✅' if os.path.exists(path) else '❌'
+        banner.append(LogInfo(msg=f'  {mark} {name:<14} {path}'))
+    if missing:
+        banner.append(LogInfo(msg='━' * 60))
+        for path, name, impact in missing:
+            banner.append(LogInfo(msg=f'  ⚠️  {name} 없음 ({path}) — {impact}'))
+        banner.append(LogInfo(
+            msg='  ⚠️  USB 를 다시 꽂고 이 launch 를 재시작할 것. '
+                '이 상태로 진행하면 조용히 실패한다'))
+        banner.append(LogInfo(msg='━' * 60))
+    else:
+        banner.append(LogInfo(msg='  네 장치 모두 정상 — 그래도 매핑 전에 '
+                                  '/scan_filtered 가 실제로 흐르는지 한 번 볼 것'))
+
+    # ★ YOLO 는 이 launch 가 아니라 systemd 가 띄운다(위 주석 참고).
+    #   그래서 "떠 있는지" 를 여기서 확인해 준다. 안 떠 있으면 매핑 중
+    #   배 표면 측량이 **조용히** 실패한다 — 에러도 경고도 안 난다.
+    yolo_up = subprocess.run(
+        ['pgrep', '-f', 'yolo_depth_publisher'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    banner.append(LogInfo(msg=f"  {'✅' if yolo_up else '❌'} {'YOLO(카메라)':<14} "
+                              f"systemd yolo-depth-publisher.service"))
+    banner.append(LogInfo(msg=f"  {'✅' if survey_on else '⏸️'} {'배 측량':<14} "
+                              f"{banner_survey}"))
+    banner.append(LogInfo(
+        msg=f"  {'✅' if os.path.exists(measured_file) else '❌'} "
+            f"{'배 중심 실측값':<11} "
+            + ('있음 — 켜지면 자동으로 서버에 보낸다'
+               if os.path.exists(measured_file)
+               else '없음 — 프론트엔드에 배 위치가 안 간다. '
+                    'scripts/measure_ship_center.py 로 잴 것')))
+    banner.append(LogInfo(
+        msg=f"  {'✅' if calib_file else '⏸️'} {'캘리브 불러오기':<12} "
+            + (os.path.basename(calib_file) if calib_file
+               else '끔 — 새로 잰다 (되살리려면 calib:=<맵이름>)')))
+    if not yolo_up:
+        banner.append(LogInfo(msg='━' * 60))
+        banner.append(LogInfo(
+            msg='  ⚠️  YOLO 가 안 떠 있다 — 카메라 영상 송출과 배 표면 측량이 '
+                '둘 다 조용히 실패한다'))
+        banner.append(LogInfo(
+            msg='  ⚠️  살리는 법:  sudo systemctl start yolo-depth-publisher'))
+        banner.append(LogInfo(msg='━' * 60))
+    banner.append(LogInfo(msg='─' * 60))
+
+    return LaunchDescription(banner + [
         uwb_driver_node,
         uwb_calibration_node,
         imu_static_tf_node,
@@ -209,8 +376,7 @@ def generate_launch_description():
         ekf_local_node,
         ekf_global_node,
         change_point_node,
-        yolo_depth_publisher_node,
-        ship_survey_node,
+        *( [ship_survey_node] if survey_on else [ship_pose_pub_node] ),
         websocket_client_node,
         laser_static_tf_node,
         rplidar_node,
