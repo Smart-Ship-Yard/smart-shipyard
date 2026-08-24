@@ -13,12 +13,13 @@
 이 파일은 ②의 has_left_once 상태기계를 검증한다(①은 노드 배선 문제라
 순수 함수 테스트 대상이 아니다).
 """
+import math
 import os
 import sys
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '..', 'ship_ugv_perception'))
-from change_point import clear_verdict
+from change_point import clear_verdict, in_camera_fov, quat_to_yaw
 
 R, W = 0.6, 3.0   # clear_radius_m, clear_watch_s
 
@@ -92,5 +93,27 @@ if __name__ == '__main__':
                                has_left_once=True)
     check('클리어 전 반경 이탈 -> reset', v, 'reset')
     assert r is None
+
+    # ★ 사고 재현 (주현 진단): camera_yaw_deg=-90 상태에서 순찰 왕복
+    #   구간을 반대 방향으로 지나가면 카메라가 이벤트 반대쪽을 본다.
+    hfov = math.radians(74.0)
+    cam_yaw = math.radians(-90.0)
+    ev_x, ev_y = 0.0, -1.0
+
+    # 로봇이 정면(yaw=0)일 때는 카메라(우측 고정)가 정확히 이벤트를 본다.
+    assert in_camera_fov(math.radians(0), cam_yaw, hfov, 0.0, 0.0, ev_x, ev_y)
+    print('  정면 주행 중 카메라가 이벤트를 봄: True  OK')
+
+    # 왕복 구간에서 로봇이 180도 돌아 반대로 지나가면, 같은 위치에서도
+    # 카메라는 이벤트 반대쪽을 본다 -> FOV 밖.
+    assert not in_camera_fov(math.radians(180), cam_yaw, hfov, 0.0, 0.0, ev_x, ev_y)
+    print('  반대 방향 주행 중 카메라가 등 돌림: False  OK')
+
+    # quat_to_yaw: 흔한 각도 몇 개로 부호·범위 확인.
+    assert abs(quat_to_yaw(0, 0, 0, 1) - 0.0) < 1e-9
+    assert abs(quat_to_yaw(0, 0, 1, 0) - math.pi) < 1e-9
+    s, c = math.sin(math.pi / 4), math.cos(math.pi / 4)
+    assert abs(quat_to_yaw(0, 0, s, c) - math.pi / 2) < 1e-9
+    print('  quat_to_yaw 기본 각도 확인  OK')
 
     print('\n통과')

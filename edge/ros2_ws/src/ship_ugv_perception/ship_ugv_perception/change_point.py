@@ -58,6 +58,30 @@ def clear_verdict(dist_m, range_entered_at_s, last_seen_s, now_s,
     return 'clear', range_entered_at_s, has_left_once
 
 
+def quat_to_yaw(x, y, z, w):
+    """평면(2D) 로봇 가정 — 쿼터니언에서 Z축 회전(요)만 뽑아낸다."""
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def in_camera_fov(robot_yaw, cam_yaw, hfov, robot_x, robot_y, event_x, event_y):
+    """지금 이 위치·헤딩에서 카메라가 이벤트 방향을 실제로 보고 있는지.
+
+    ★ 2026-08-24 (주현 진단, 근본 원인) ★
+    clear 판정이 거리만 보고 카메라가 실제로 그쪽을 보고 있었는지는
+    확인하지 않았다. camera_yaw_deg=-90(로봇 우측 고정)인 상태로 순찰
+    왕복/원형 구간을 반대 방향으로 지나가면 카메라는 이벤트 반대쪽을
+    보고 있는데도, 거리만으로 "지켜봤는데 없었다"고 오판해 지워버리고
+    다음 바퀴에 같은 걸 다시 보면 새 이벤트로 재등록 -> 재정지가
+    반복됐다. 반경/시간(dedup_radius_m, clear_radius_m, clear_watch_s)을
+    아무리 넓혀도 카메라가 구조적으로 못 보는 구간 자체는 없어지지
+    않으므로 근본 해결이 안 됐다(지난 3커밋: 8428374, 057d5f3, 16cbf9d).
+    """
+    camera_facing = robot_yaw + cam_yaw
+    bearing = math.atan2(event_y - robot_y, event_x - robot_x)
+    diff = math.atan2(math.sin(bearing - camera_facing), math.cos(bearing - camera_facing))
+    return abs(diff) <= hfov / 2.0
+
+
 class ChangePointDetector(Node):
 
     def __init__(self):
@@ -90,13 +114,11 @@ class ChangePointDetector(Node):
         #   흔들렸다(이 프로젝트의 헤딩 추정 오차 ±30도가 그대로 위치 오차로
         #   번짐). 그 결과 "같은 불"이 각도 바뀔 때마다 새 이벤트로 잡혀
         #   clear-재생성이 반복됐다. 반경을 실측 흔들림보다 넉넉히 키운다.
-        # ponytail: 2026-08-24 데모 당일 시간 부족으로 dedup/clear 완전
-        #   안정화를 포기하고 0으로 되돌림 — 매 감지가 항상 새 이벤트로
-        #   잡혀 "여러 번 멈춰도 프론트가 확인을 계속 눌러준다"는 예전의
-        #   단순 동작으로 복귀. dist(>=0) < 0.0 은 절대 참이 안 되므로
-        #   100% 확실하게 매칭이 꺼진다. 데모 이후 시간 생기면 위치 잡음
-        #   문제(각도별 최대 ~1m 흔들림 실측) 제대로 잡고 되살릴 것.
-        self.declare_parameter('dedup_radius_m', 0.0)   # 같은 이벤트로 볼 거리 반경
+        # ★ 2026-08-24 2차: 데모 당일 시간 부족으로 잠깐 0(완전 비활성화)
+        #   으로 돌렸었는데, 근본 원인(주현 진단 — clear 판정이 카메라
+        #   방향을 안 봄, in_camera_fov 게이트로 아래서 수정함)을 고쳤으니
+        #   1.0으로 복원한다.
+        self.declare_parameter('dedup_radius_m', 1.0)   # 같은 이벤트로 볼 거리 반경
         self.declare_parameter('event_ttl_s', 600.0)    # 이 시간 이상 재감지 없으면 "새 이벤트"로 취급
 
         # ★ 2026-08-21 신설 — 능동 클리어링.
@@ -220,6 +242,8 @@ class ChangePointDetector(Node):
             return   # 위치추정이 아직 없다 — 다음 주기에 다시 시도
         rx = transform.transform.translation.x
         ry = transform.transform.translation.y
+        q = transform.transform.rotation
+        robot_yaw = quat_to_yaw(q.x, q.y, q.z, q.w)
 
         now = self.get_clock().now()
         now_s = now.nanoseconds / 1e9
@@ -227,6 +251,17 @@ class ChangePointDetector(Node):
         survivors = []
         for ev in self.reported_events:
             dist = math.hypot(rx - ev['x'], ry - ev['y'])
+
+            # ★ 2026-08-24 (주현 진단): 반경 안이어도 카메라가 실제로 이
+            #   방향을 보고 있지 않으면 "지켜봤는데 없었다"로 셀 수 없다.
+            #   이번 틱은 정보 없음으로 보고 state 를 그대로 둔다(진행도
+            #   되돌리기도 안 함) — clear_verdict 자체는 순수함수로 두고
+            #   호출 여부만 게이트한다.
+            if dist <= self.clear_radius and not in_camera_fov(
+                    robot_yaw, self.cam_yaw, self.hfov, rx, ry, ev['x'], ev['y']):
+                survivors.append(ev)
+                continue
+
             range_s = (ev['range_entered_at'].nanoseconds / 1e9
                       if ev['range_entered_at'] is not None else None)
             last_seen_s = ev['last_seen'].nanoseconds / 1e9
