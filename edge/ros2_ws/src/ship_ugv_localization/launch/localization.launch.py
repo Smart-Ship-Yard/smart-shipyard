@@ -153,6 +153,43 @@ def generate_launch_description():
             get_package_share_directory('ship_ugv_navigation'),
             'maps', 'calibration_records', f'calib_{calib_arg}.json')
 
+        # ★ 파일이 없으면 **여기서 멈춘다** (2026-08-27 실측 사고).
+        #   맵 이름 끝에 점 하나가 더 붙었을 뿐인데
+        #       calib:=shipyard_map_hall_v6.
+        #   에러도 경고도 없이 그냥 캘리브레이션 없이 떴다. map<-uwb_frame
+        #   이 항등변환(0,0,0)이 되어 UWB 원시 좌표가 그대로 map 좌표로
+        #   쓰였고, 로봇이 자기를 맵 밖 4m 지점에 있다고 믿어 제자리만
+        #   돌았다(Nav2 recovery 7회). 로봇이 눈에 띄게 이상해서 알아챘지
+        #   조금만 어긋났으면 "오늘따라 부정확하네" 하고 넘어갔을 것이다.
+        #
+        #   조용히 잘못된 상태로 도는 것보다 안 뜨는 게 낫다. 장치 확인은
+        #   경고만 하고 진행하지만(없는 장치로 할 수 있는 일이 남아 있다),
+        #   이건 조치가 명확하고 잘못 진행하면 주행이 통째로 망가진다.
+        if not os.path.exists(calib_file):
+            d = os.path.dirname(calib_file)
+            avail = sorted(f[len('calib_'):-len('.json')]
+                           for f in os.listdir(d)
+                           if f.startswith('calib_') and f.endswith('.json')) \
+                    if os.path.isdir(d) else []
+            print('\n' + '━' * 60)
+            print('  ❌ 캘리브레이션 파일이 없다 — 시작하지 않는다')
+            print(f'     찾은 이름 : calib_{calib_arg}.json')
+            print(f'     찾은 경로 : {d}')
+            near = [a for a in avail if a.strip('. ') == calib_arg.strip('. ')]
+            if near:
+                print(f'\n  💡 이름이 거의 같은 것이 있다 — 오타로 보인다:')
+                print(f'        calib:={calib_arg}   ->   calib:={near[0]}')
+            elif avail:
+                print('\n  쓸 수 있는 이름:')
+                for a in avail:
+                    print(f'        calib:={a}')
+            else:
+                print('\n  저장된 캘리브레이션이 하나도 없다. 먼저 캘리브레이션을 할 것:')
+                print('        ros2 service call /uwb_map_calibration/calibrate '
+                      'std_srvs/srv/Trigger')
+            print('━' * 60 + '\n')
+            sys.exit(1)
+
     uwb_calibration_node = Node(
         package='uwb_map_calibration',
         executable='calibration_node',
