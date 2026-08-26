@@ -36,44 +36,53 @@ def check(name, verdict, expected):
     print(f'  {name}: {verdict}  OK')
 
 
-def cv(dist, yawd=0.0, last_seen=0.0, now=100.0, left=True):
-    return clear_verdict(dist, yawd, last_seen, now, RV, YT, G, left)
+def cv(dist, yawd=0.0, last_seen=0.0, now=100.0, left=True, arrived=None):
+    return clear_verdict(dist, yawd, last_seen, now, RV, YT, G, left, arrived)
 
 
 if __name__ == '__main__':
-    # 그 자리에서 멀리 있음 -> 판정 안 함. 다만 "벗어난 적 있음"으로 표시된다
-    v, left = cv(dist=1.0, left=False)
+    # 그 자리에서 멀리 있음 -> 판정 안 함. 재방문 자격이 생기고 도착 시계는 접힌다
+    v, left, arr = cv(dist=1.0, left=False)
     check('처음 본 자리에서 멀다', v, 'wait')
-    assert left is True, '벗어났는데 left_vantage 가 안 켜졌다'
+    assert left is True and arr is None
 
     # ★ 사고 재현 ①: 막 검출해서 아직 그 자리에 있다 -> 지우면 안 된다
-    #   (예전 "핑이 반짝하고 꺼짐" 사고)
-    v, left = cv(dist=0.1, last_seen=0.0, now=100.0, left=False)
+    v, left, arr = cv(dist=0.1, left=False)
     check('막 검출, 아직 그 자리 -> 판정 안 함', v, 'wait')
-    assert left is False
+    assert left is False and arr is None
 
-    # ★ 사고 재현 ②: 예전 has_left_once 는 clear_radius(2.0m)를 기준으로 삼아
-    #   순찰 기하상 영영 못 벗어나 clear 가 아예 발동 못 했다. 여기서는
-    #   기준이 0.35m 라 한 바퀴만 돌면 반드시 벗어난다.
-    _, left = cv(dist=1.0, left=False)          # 한 바퀴 도는 중
-    v, left = cv(dist=0.1, last_seen=0.0, now=100.0, left=left)   # 그 자리로 복귀
-    check('한 바퀴 뒤 복귀 -> 판정 가능', v, 'clear')
+    # 한 바퀴 돌고 그 자리에 막 도착 -> 시계를 켜기만 하고 판정은 안 한다
+    v, left, arr = cv(dist=0.1, last_seen=0.0, now=100.0, left=True, arrived=None)
+    check('막 도착 -> 시계만 켬', v, 'wait')
+    assert arr == 100.0, f'도착 시계가 안 켜졌다: {arr}'
 
-    # 그 자리로 돌아왔지만 방금 다시 봤다 -> 아직 있다
-    v, _ = cv(dist=0.1, last_seen=99.0, now=100.0, left=True)
-    check('복귀했는데 방금 봄', v, 'wait')
+    # ★★ 사고 재현 ②(2026-08-26, 4회 실측) ★★
+    #   도착 직전까지 배에 가려 28초간 못 봤다. 예전 로직은 "마지막으로 본 지
+    #   28초 > grace 3초" 라서 **도착하자마자** clear 를 내버렸고, 1초 뒤 몇 cm
+    #   옆에 재등록됐다. 도착 시계를 쓰면 아직 덜 지켜봤으므로 wait 여야 한다.
+    v, _, arr = cv(dist=0.1, last_seen=72.0, now=100.0, left=True, arrived=100.0)
+    check('도착 직후(28초간 못 봄) -> 즉시 판정 안 함', v, 'wait')
+    assert arr == 100.0
 
-    # 그 자리로 돌아왔고 grace 만큼 안 보였다 -> 치워짐
-    v, _ = cv(dist=0.1, last_seen=90.0, now=100.0, left=True)
-    check('복귀했는데 안 보임 -> 확정', v, 'clear')
+    # 도착 후 grace 를 채우는 동안 불이 보였다 -> 아직 있다
+    v, _, _ = cv(dist=0.1, last_seen=101.0, now=100.0 + G, left=True, arrived=100.0)
+    check('도착 후 다시 봄 -> 아직 있다', v, 'wait')
 
-    # 위치는 맞지만 딴 데를 보고 있다(복구 회전 등) -> 판정 안 함
-    v, _ = cv(dist=0.1, yawd=math.radians(90), last_seen=0.0, now=100.0, left=True)
-    check('위치는 맞지만 헤딩이 다름', v, 'wait')
+    # 도착 후 grace 를 채웠고 그동안 한 번도 안 보였다 -> 치워짐
+    v, _, _ = cv(dist=0.1, last_seen=72.0, now=100.0 + G, left=True, arrived=100.0)
+    check('도착 후 grace 동안 안 보임 -> 확정', v, 'clear')
 
-    # 경계: grace 정확히 채움
-    v, _ = cv(dist=0.1, last_seen=100.0 - G, now=100.0, left=True)
-    check('경계값(정확히 grace)', v, 'clear')
+    # 헤딩이 어긋나면 판정만 보류하고 도착 시계는 유지한다
+    #   (잠깐 흔들렸다고 시계를 되돌리면 통과 시간이 grace 를 못 채운다)
+    v, _, arr = cv(dist=0.1, yawd=math.radians(90), last_seen=72.0,
+                   now=100.0 + G, left=True, arrived=100.0)
+    check('헤딩 어긋남 -> 판정 보류', v, 'wait')
+    assert arr == 100.0, f'헤딩 때문에 도착 시계가 리셋됐다: {arr}'
+
+    # 그 자리를 벗어나면 도착 시계를 접는다 (다음 방문에 새로 켠다)
+    v, left, arr = cv(dist=1.0, last_seen=72.0, now=200.0, left=True, arrived=100.0)
+    check('자리 이탈 -> 시계 접음', v, 'wait')
+    assert arr is None and left is True
 
     # angle_diff 는 -pi~pi 로 감싼다
     assert abs(angle_diff(math.radians(350), math.radians(10)) - math.radians(20)) < 1e-9
