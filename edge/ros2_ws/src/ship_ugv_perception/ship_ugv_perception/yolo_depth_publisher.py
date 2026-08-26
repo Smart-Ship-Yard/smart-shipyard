@@ -211,6 +211,10 @@ class YoloDepthPublisher(Node):
                 "person_crop_enabled=True 이지만 모델에 helmet/no_helmet 이 없음 - 비활성화")
             self.person_crop_enabled = False
 
+        # 1차 통과 문턱은 '가장 낮은 클래스 임계값'. 클래스별 판정은
+        # _evaluate_box 가 _conf_for() 로 다시 한다.
+        self._min_conf = min([self.conf_threshold] + list(self.class_conf.values()))
+
         self.pub = self.create_publisher(String, topic, 10)
         # 화면 중앙 뎁스 탐침 결과 (measure_ship_center.py 가 쓴다)
         self.probe_pub = self.create_publisher(
@@ -668,7 +672,21 @@ class YoloDepthPublisher(Node):
         #   -> 트래커를 빼면 불안정 요인과 칼만 필터 CPU 가 함께 사라지고,
         #      모든 검출이 아래 fallback 경로(연속 N프레임 확인)를 타므로
         #      노이즈 필터는 오히려 일관돼진다.
-        results = self.model.predict(color_image, verbose=False)[0]
+        #   ★ classes=None / conf 을 **매번 명시**해야 한다 (2026-08-27 실측 사고).
+        #   ultralytics 는 Model 하나가 predictor 하나를 공유하고, predict()
+        #   kwargs 를 그 predictor.args 에 **누적 병합**한다. 그래서 아래
+        #   _run_person_crop 이 self.model(crops, classes=[helmet,no_helmet])
+        #   를 한 번 부르면 그 classes 필터가 메인 추론에 눌러붙어, 그 뒤로는
+        #   fire/level 이 통째로 걸러진다. 재현:
+        #       predict()                 -> ['fire','fire']
+        #       model(x, classes=[2,8])   -> (person crop 경로)
+        #       predict()                 -> []        영구히 0건
+        #   화면에 사람이 한 번만 들어와도 그때부터 불을 영영 못 봤다.
+        #   conf 도 같은 이유로 명시한다 — 안 주면 ultralytics 기본값 0.25 라
+        #   confidence_threshold:=0.1 과 no_helmet/fallen_person 0.15 가
+        #   조용히 무시됐다(파라미터가 먹은 척만 하는 상태).
+        results = self.model.predict(color_image, verbose=False,
+                                     classes=None, conf=self._min_conf)[0]
 
         display_image = color_image.copy()
 
