@@ -62,21 +62,42 @@ def _check_yolo_freshness():
 
     src_mtime = os.path.getmtime(src)
     if src_mtime <= started:
-        return '✅', '소스와 실행본 일치'
+        return '✅', '소스와 실행본 일치 — systemd 구동이라 git pull 만으론 최신화 안 됨'
 
     fmt = '%H:%M:%S'
     old = time.strftime(fmt, time.localtime(started))
     new = time.strftime(fmt, time.localtime(src_mtime))
     print(f'\n⚠️  YOLO 가 옛 코드로 돌고 있다 (실행 {old} < 소스 {new}).')
-    print('   최신 코드로 재시작한다 — 관리자 암호를 입력할 것:')
-    try:
-        rc = subprocess.run(
-            ['sudo', 'systemctl', 'restart', 'yolo-depth-publisher']).returncode
-    except Exception as e:
-        return '❌', f'재시작 실패({e}) — sudo systemctl restart yolo-depth-publisher'
-    if rc != 0:
-        return '❌', '재시작 실패 — sudo systemctl restart yolo-depth-publisher'
-    return '🔄', f'소스가 최신이라 재시작함 ({old} -> 방금)'
+    print('   최신 코드로 재시작한다 — 관리자 암호를 입력할 것.')
+    print('   (중단하려면 Ctrl+C — 그 경우 launch 를 시작하지 않는다)')
+
+    # ★ 성공할 때까지 다시 묻는다. sudo 는 자체적으로 3회까지 받고 실패로
+    #   끝나므로, 그 위를 한 번 더 감싸 무한 재시도로 만든다. 설치할 때
+    #   sudo 를 쓰는 것과 같은 감각으로 쓰라고.
+    #
+    # ★ 실패한 채로는 launch 를 진행하지 않는다.
+    #   옛 코드로 도는 YOLO 는 "돌긴 도는데 최신 개선이 안 걸린" 상태라
+    #   증상이 조용하다. 실제로 그 상태로 7시간을 시험하며 엉뚱한 원인을
+    #   쫓았다. 경고만 띄우고 진행하면 그 사고가 그대로 재현되므로,
+    #   여기서는 아예 시작을 막는다(장치 확인과 달리 조치가 확실하므로).
+    while True:
+        try:
+            rc = subprocess.run(
+                ['sudo', 'systemctl', 'restart', 'yolo-depth-publisher']).returncode
+        except KeyboardInterrupt:
+            print('\n\n중단됨 — YOLO 가 옛 코드인 채로는 시작하지 않는다.')
+            print('   나중에 직접 하려면:  sudo systemctl restart yolo-depth-publisher')
+            sys.exit(1)
+        except Exception as e:
+            print(f'\n재시작을 실행하지 못했다: {e}')
+            sys.exit(1)
+        if rc == 0:
+            break
+        print('\n암호가 틀렸거나 재시작에 실패했다. 다시 시도한다 '
+              '(중단하려면 Ctrl+C).')
+
+    return '🔄', (f'옛 코드 감지 -> 재시작함 ({old} -> 방금) — '
+                  f'systemd 구동이라 git pull 만으론 최신화 안 됨')
 
 
 def generate_launch_description():
