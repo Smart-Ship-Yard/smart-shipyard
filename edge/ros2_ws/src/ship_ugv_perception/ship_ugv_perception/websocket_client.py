@@ -8,11 +8,22 @@ websocket_client.py
 - ① position에 yaw(로봇이 바라보는 방향, 라디안) 추가
   -> /odometry/global의 orientation 쿼터니언에서 yaw 추출.
 - ② 위험 이벤트에 map_xy(객체의 map 절대 좌표) 추가
-  -> depth_xyz(카메라 기준)를 tf2로 map 프레임 변환 (change_point.py와 동일한
-     카메라 장착 오프셋 + REP-103 좌표축 변환 로직 사용).
-  -> TF(map->base_link) 조회 실패 시(EKF 미가동 등) 해당 이벤트 전송 보류.
-- depth_xyz, ekf_global은 디버깅용으로 유지.
+- ekf_global은 디버깅용으로 유지.
 - ③ block_level, ④ ship_pose는 변경 없음.
+
+[2026-08-21 위험 이벤트 경로 변경 — 재정지 사고 수정]
+- 예전에는 이 노드가 /event_detection/uvd(원본 검출)를 직접 받아 카메라
+  좌표(depth_xyz)를 자체적으로 TF 변환해 map_xy 를 만들었다. 위치 기준
+  중복 제거가 전혀 없어서, 같은 대상을 로봇이 다시 지나칠 때마다 서버로
+  또 전송됐다(정지-확인-재개 후 반바퀴도 못 가 재정지하는 사고로 드러남).
+- change_point_detector(change_point.py)가 이미 이 TF 변환 + map 좌표
+  기준 중복 제거를 갖고 있었으나, 그동안 ship_survey_node 용으로만
+  쓰이고 있었다. 이제 위험 이벤트도 그 출력(/event_detection/map_point,
+  이미 중복 제거됨)을 받는다. 그래서 이 노드는 더 이상 TF 를 직접
+  조회하지 않는다(카메라 오프셋 파라미터·TF 코드 삭제).
+- 새 메시지 event_cleared: change_point_detector 가 로봇이 그 자리를
+  다시 지나가며 확인했는데 대상이 없어졌을 때 /event_detection/cleared
+  로 알린다. 여기서 서버로 그대로 넘겨 프론트엔드가 해당 핑을 지운다.
 
 [수신 루프 추가]
 - 기존에는 송신만 하던 노드였으나, 서버 -> 젯슨 메시지를 받는 수신 루프를 추가함.
@@ -38,13 +49,9 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
-from rclpy.time import Time
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 from std_msgs.msg import String, Int32
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import PointStamped
-from tf2_ros import Buffer, TransformListener
-import tf2_geometry_msgs  # noqa: F401  (PointStamped 변환 등록용)
 
 try:
     from websockets.sync.client import connect as ws_connect
@@ -93,15 +100,10 @@ class WebSocketClient(Node):
         self.declare_parameter('block_id', 'B1')
         self.declare_parameter('block_level_stability_s', 3.0)
 
-        self.declare_parameter('map_frame_id', 'map')
-        self.declare_parameter('base_frame_id', 'base_link')
-        # ★ 실측: base_link 기준 카메라 RGB 렌즈 위치 (2026-08-13 재실측).
-        # change_point.py와 반드시 동일한 값 유지 - 다르면 위험 이벤트 map_xy가
-        # change_point.py의 /event_detection/map_point와 어긋난 위치로 발행됨.
-        self.declare_parameter('camera_offset_x', 0.135)
-        self.declare_parameter('camera_offset_y', -0.089)
-        self.declare_parameter('camera_yaw_deg', -90.0)
-        self.declare_parameter('tf_timeout_s', 0.3)
+        # ★ 2026-08-21: 카메라 오프셋·TF 파라미터를 지웠다. map_xy 변환은
+        #   change_point_detector 가 전담하고, 이 노드는 그 결과만 받는다.
+        self.declare_parameter('map_point_topic', '/event_detection/map_point')
+        self.declare_parameter('cleared_topic', '/event_detection/cleared')
 
         # ★ 수신 루프 관련
         self.declare_parameter('inbound_topic', '/server/inbound')
@@ -128,13 +130,6 @@ class WebSocketClient(Node):
         self.block_level_stability = Duration(
             seconds=self.get_parameter('block_level_stability_s').value)
 
-        self.map_frame = self.get_parameter('map_frame_id').value
-        self.base_frame = self.get_parameter('base_frame_id').value
-        self.cam_offset_x = self.get_parameter('camera_offset_x').value
-        self.cam_offset_y = self.get_parameter('camera_offset_y').value
-        self.cam_yaw = math.radians(self.get_parameter('camera_yaw_deg').value)
-        self.tf_timeout = Duration(seconds=self.get_parameter('tf_timeout_s').value)
-
         inbound_topic = self.get_parameter('inbound_topic').value
         self.recv_timeout = self.get_parameter('recv_timeout_s').value
 
@@ -153,10 +148,13 @@ class WebSocketClient(Node):
         self._level_confirmed = None
         self._level_lock = threading.Lock()
 
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
         self.send_queue = queue.Queue()
+        # ★ 마지막 배 위치. 재연결할 때 다시 보내려고 들고 있는다(2026-08-20).
+        #   ship_pose 는 측량이 끝나는 그 순간 1회만 발행된다. 그래서 그 뒤에
+        #   백엔드가 재시작하고 DB가 비어 있으면 배 위치를 영영 못 받는다.
+        #   block_level 은 이미 재연결마다 다시 보내고 있었다. 같이 맞춘다.
+        #   (참조 대입 하나라 CPython 에서는 락 없이도 원자적이다)
+        self._last_ship_pose = None
 
         # ★ 서버 -> 젯슨 수신 메시지를 그대로 중계할 퍼블리셔 (해석하지 않음)
         self.inbound_pub = self.create_publisher(String, inbound_topic, 10)
@@ -172,6 +170,12 @@ class WebSocketClient(Node):
             Int32, self.get_parameter('block_level_topic').value, level_qos)
 
         self.create_subscription(String, uvd_topic, self._uvd_cb, 10)
+        self.create_subscription(
+            String, self.get_parameter('map_point_topic').value,
+            self._map_point_cb, 10)
+        self.create_subscription(
+            String, self.get_parameter('cleared_topic').value,
+            self._cleared_cb, 10)
         self.create_subscription(Odometry, ekf_topic, self._ekf_cb, 10)
         # ★ ship_pose는 ship_survey_node가 측량 끝날 때 딱 1번만 발행하고, 그 시점은
         #   매핑 랩 도중이라 이 노드보다 먼저 끝나 있을 수 있다. 기본 QoS(VOLATILE)로
@@ -226,42 +230,13 @@ class WebSocketClient(Node):
         if self._ping_count % 10 == 0:
             self.get_logger().info(f"[위치핑] ekf_global={ekf_global} yaw={yaw:.3f}")
 
-    def _camera_xyz_to_map_xy(self, depth_xyz):
-        x_cam, y_cam, z_cam = depth_xyz
-
-        # change_point.py와 동일한 카메라 장착 회전(cam_yaw) 보정.
-        # 카메라 기준 "전방"은 z_cam, "좌측"은 -x_cam (OpenCV: x=우측이므로 좌측=-x_cam)
-        cam_local_x = z_cam
-        cam_local_y = -x_cam
-        cos_yaw = math.cos(self.cam_yaw)
-        sin_yaw = math.sin(self.cam_yaw)
-        rotated_x = cam_local_x * cos_yaw - cam_local_y * sin_yaw
-        rotated_y = cam_local_x * sin_yaw + cam_local_y * cos_yaw
-
-        local_x = rotated_x + self.cam_offset_x
-        local_y = rotated_y + self.cam_offset_y
-
-        point_in_base = PointStamped()
-        point_in_base.header.frame_id = self.base_frame
-        point_in_base.header.stamp = self.get_clock().now().to_msg()
-        point_in_base.point.x = local_x
-        point_in_base.point.y = local_y
-        point_in_base.point.z = 0.0
-
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                self.map_frame, self.base_frame,
-                Time(),
-                timeout=self.tf_timeout)
-        except Exception as e:
-            self.get_logger().warn(
-                f"TF 조회 실패 ({self.map_frame}<-{self.base_frame}): {e}")
-            return None
-
-        point_in_map = tf2_geometry_msgs.do_transform_point(point_in_base, transform)
-        return [point_in_map.point.x, point_in_map.point.y]
-
     def _uvd_cb(self, msg: String):
+        """원본 검출 스트림 — 이제 block_level(조립 단계) 판정에만 쓴다.
+
+        위험 이벤트(fire 등)는 위치 기준 중복 제거를 거친
+        /event_detection/map_point 로 옮겼다(_map_point_cb 참고). 이 콜백이
+        원본을 그대로 위험 이벤트로 넘기면 중복 제거가 무의미해진다.
+        """
         try:
             det = json.loads(msg.data)
         except json.JSONDecodeError as e:
@@ -269,51 +244,87 @@ class WebSocketClient(Node):
             return
 
         class_id = str(det.get('class_id', ''))
-
-        event_type = DANGER_CLASS_MAP.get(class_id)
-        if event_type is not None:
-            self._handle_danger_event(event_type, det)
-            return
+        if class_id in DANGER_CLASS_MAP:
+            return   # map_point 경로가 처리한다
 
         level = extract_level(class_id)
         if level is not None:
             self._handle_block_level(class_id, level)
+
+    def _map_point_cb(self, msg: String):
+        """change_point_detector 가 위치 기준 중복 제거를 마친 위험 이벤트.
+
+        같은 자리의 같은 클래스는 change_point_detector 가 이미 걸러서
+        여기까지 오지 않는다. 그래서 여기서는 신뢰도만 다시 확인하고
+        그대로 서버에 큐잉하면 된다 — TF 변환도 여기서 다시 안 한다
+        (change_point_detector 가 map_x/map_y 를 이미 계산해 줬다).
+        """
+        try:
+            det = json.loads(msg.data)
+        except json.JSONDecodeError as e:
+            self.get_logger().warn(f"/map_point 파싱 실패: {e}")
             return
 
+        class_id = str(det.get('class_id', ''))
+        event_type = DANGER_CLASS_MAP.get(class_id)
+        if event_type is None:
+            return   # ship_defect 등 여기서 다루지 않는 클래스
+
+        self._handle_danger_event(event_type, det)
+
     def _handle_danger_event(self, event_type, det):
-        confidence = float(det.get('confidence', 0.0))
+        confidence = float(det.get('confidence') or 0.0)
         if confidence < self.min_confidence:
             return
 
-        depth_xyz = det.get('depth_xyz')
-        if depth_xyz is None:
+        try:
+            map_xy = [float(det['map_x']), float(det['map_y'])]
+        except (KeyError, TypeError, ValueError):
             self.get_logger().warn(
-                f"[{event_type}] depth_xyz 없음 - yolo_depth_publisher 최신 버전인지 확인")
+                f"[{event_type}] map_x/map_y 없음 - change_point_detector "
+                "최신 버전인지 확인")
             return
 
         ekf_global, _yaw = self._get_ekf_state()
-        if ekf_global is None:
-            self.get_logger().warn(
-                f"[{event_type}] ekf_global 없음(EKF 미가동) - 이벤트 전송 보류")
-            return
 
-        map_xy = self._camera_xyz_to_map_xy(depth_xyz)
-        if map_xy is None:
-            self.get_logger().warn(
-                f"[{event_type}] map_xy 변환 실패(TF 미가용) - 이벤트 전송 보류")
-            return
-
+        # ★ event_id: change_point_detector 가 이 위치에 매긴 안정된 식별자.
+        #   프론트엔드가 event_cleared 로 어느 핑을 지울지 이 값으로 맞춘다.
         payload = {
             'event_type': event_type,
             'confidence': confidence,
             'map_xy': map_xy,
-            'depth_xyz': depth_xyz,
+            'event_id': det.get('event_id'),
             'ekf_global': ekf_global,
         }
         self._enqueue(payload)
         self.get_logger().info(
             f"[위험이벤트 큐] {event_type} conf={confidence:.2f} "
-            f"map_xy=({map_xy[0]:.2f},{map_xy[1]:.2f})")
+            f"map_xy=({map_xy[0]:.2f},{map_xy[1]:.2f}) "
+            f"event_id={det.get('event_id')}")
+
+    def _cleared_cb(self, msg: String):
+        """change_point_detector 가 "치워짐"을 확인했을 때. 서버로 그대로 넘겨
+        프론트엔드가 해당 위치의 빨간 핑을 지우게 한다.
+
+        프론트엔드와 합의한 봉투 형식 그대로 보낸다:
+        {"event_type": "event_cleared", "block_id", "cls", "map_xy", "event_id"}
+        """
+        try:
+            det = json.loads(msg.data)
+            payload = {
+                'event_type': 'event_cleared',
+                'block_id': self.block_id,
+                'cls': str(det['class_id']),
+                'map_xy': [float(det['map_x']), float(det['map_y'])],
+                'event_id': det.get('event_id'),
+            }
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            self.get_logger().warn(f"/cleared 파싱 실패: {e}")
+            return
+
+        self._enqueue(payload)
+        self.get_logger().info(
+            f"[치워짐 큐] {payload['cls']} event_id={payload['event_id']}")
 
     def _handle_block_level(self, class_id, level):
         now = self.get_clock().now()
@@ -364,6 +375,7 @@ class WebSocketClient(Node):
             'map_xy': [float(map_xy[0]), float(map_xy[1])],
             'yaw': yaw,
         }
+        self._last_ship_pose = payload
         self._enqueue(payload)
         self.get_logger().info(f"[배위치] block_id={block_id} map_xy={map_xy} yaw={yaw:.3f}")
 
@@ -419,6 +431,12 @@ class WebSocketClient(Node):
                         'level': current_level,
                     })
                     self.get_logger().info(f"[조립단계 재통보] level={current_level} 재전송")
+
+                last_pose = self._last_ship_pose
+                if last_pose is not None:
+                    self._enqueue(dict(last_pose))
+                    self.get_logger().info(
+                        f"[배위치 재통보] map_xy={last_pose['map_xy']} 재전송")
 
                 while not self._stop_event.is_set():
                     try:

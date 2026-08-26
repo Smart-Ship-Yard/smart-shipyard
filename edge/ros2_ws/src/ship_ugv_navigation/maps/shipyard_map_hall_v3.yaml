@@ -1,0 +1,8 @@
+image: shipyard_map_hall_v3.pgm
+mode: trinary
+resolution: 0.05
+origin: [-4.3796, -2.7308, 0.0000]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+# baked: map<-slam_map applied tx=0.1176 ty=0.1033 yaw=-0.1460 (yaw 는 그림에 구움 — 코스트맵이 origin yaw 를 못 읽는다)

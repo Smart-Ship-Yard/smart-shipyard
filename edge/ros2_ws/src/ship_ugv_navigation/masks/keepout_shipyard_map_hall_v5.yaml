@@ -1,0 +1,16 @@
+# keepout 마스크 — shipyard_map_hall_v5
+#
+# ⚠️ 자동 생성 파일. 손으로 고치지 말 것.
+#    맵을 다시 만들면 finalize_map.py 가 이 파일도 다시 쓴다.
+#
+# 검은 사각형 = 로봇이 들어가면 안 되는 영역(순찰 대상이 놓인 자리).
+# 라이다에 안 잡히는 낮은 대상을 코스트맵에 알려주기 위한 것이다.
+# 해상도·원점은 맵과 반드시 같아야 한다.
+#
+image: keepout_shipyard_map_hall_v5.pgm
+mode: trinary
+resolution: 0.05
+origin: [-4.482, -2.724, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

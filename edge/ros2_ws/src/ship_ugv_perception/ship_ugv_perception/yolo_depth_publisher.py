@@ -220,8 +220,6 @@ class YoloDepthPublisher(Node):
         self.annotated_image_pub = self.create_publisher(
             CompressedImage, annotated_image_topic, LOW_LATENCY_QOS)
 
-        self.reported_tids = set()
-        self.reported_fallbacks = []
         self.fallback_candidates = []
 
         # ★ 캡처 스레드와 공유할 최신 프레임 상태
@@ -483,21 +481,21 @@ class YoloDepthPublisher(Node):
             key_info = "level(항상발행)"
 
         elif track_id is not None:
-            if track_id in self.reported_tids:
-                _maybe_draw()
-                return
-            if self._match_nearby(self.reported_fallbacks, class_name, u, v):
-                self.reported_tids.add(track_id)
-                _maybe_draw()
-                return
-            self.reported_tids.add(track_id)
+            # ★ 위치(맵 좌표) 기준 "이미 보고했나" 판단은 change_point_detector 가
+            #   한다. 여기서 화면좌표(u,v)로 한 번 더 걸러 영구히 기억해두면
+            #   (예전의 reported_tids/reported_fallbacks) 불을 옮기거나 다른
+            #   자리에 새로 놓아도 화면상 비슷한 위치라는 이유로 아예
+            #   발행조차 안 되는 사고가 난다(2026-08-24 실측: 불을 옮겨도
+            #   팝업/정지 둘 다 안 뜸). 트랙별로 매 프레임 그냥 발행하고,
+            #   실제 중복 제거는 map 좌표 기반인 change_point_detector 에
+            #   전부 맡긴다.
             publish_ok = True
             key_info = f"tid={track_id}"
 
         else:
-            if self._match_nearby(self.reported_fallbacks, class_name, u, v):
-                _maybe_draw()
-                return
+            # ★ 트랙 ID가 없는 검출: 노이즈 필터링 목적으로만 연속
+            #   fallback_confirm_frames 프레임 동안 비슷한 화면 위치에
+            #   잡혀야 발행한다. (위치 중복 제거는 change_point_detector 몫)
             cand = self._match_nearby(self.fallback_candidates, class_name, u, v)
             if cand is None:
                 self.fallback_candidates.append({'class': class_name, 'u': u, 'v': v, 'count': 1})
@@ -509,7 +507,6 @@ class YoloDepthPublisher(Node):
                 _maybe_draw()
                 return
             self.fallback_candidates.remove(cand)
-            self.reported_fallbacks.append({'class': class_name, 'u': u, 'v': v})
             publish_ok = True
             key_info = f"fallback({u},{v})"
 
