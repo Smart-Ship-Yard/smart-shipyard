@@ -239,35 +239,18 @@ class YoloDepthPublisher(Node):
         depth_profile = profile_list.get_default_video_stream_profile()
         config.enable_stream(depth_profile)
 
-        # ★ 뎁스-컬러 정렬은 하드웨어에 맡긴다 (2026-08-27).
-        #   SW_MODE 는 **카메라 fps 그대로(30 Hz) 매 프레임** 640x480 뎁스를
-        #   컬러 좌표로 CPU 재투영한다. 그런데 우리가 뎁스를 실제로 쓰는
-        #   것은 추론할 때뿐이고 그건 4 Hz 다 — 필요량의 7.5배를 계산하고
-        #   있었다. 실측: YOLO 프로세스가 1.4코어를 쓰는데 추론(GPU)은
-        #   0.11코어(4Hz x 33ms)뿐이고 나머지가 캡처 스레드였다.
-        #   CPU 가 포화되면 Nav2 가 밀린다 — 실제로 BehaviorTree tick rate
-        #   초과 경고가 뜨고 로봇이 멈췄다.
-        #
-        #   HW_MODE 는 카메라 칩이 정렬을 처리하므로 CPU 가 통째로 빠지고
-        #   결과(정렬된 뎁스)는 동일하다. 다만 모든 기기가 지원하지는
-        #   않으므로, start() 가 실패하면 SW_MODE 로 되돌린다.
-        #   정렬을 아예 끄면(DISABLE) (u,v) 로 뎁스를 찾을 수 없어 검출
-        #   좌표 변환이 통째로 깨지므로 그건 선택지가 아니다.
-        align_mode = OBAlignMode.HW_MODE
-        try:
-            config.set_align_mode(align_mode)
-            self.pipeline.start(config)
-        except Exception as e:
-            self.get_logger().warn(
-                f'하드웨어 뎁스 정렬(HW_MODE) 실패 — 소프트웨어 정렬로 되돌린다. '
-                f'CPU 사용량이 늘어난다: {e}')
-            align_mode = OBAlignMode.SW_MODE
-            config.set_align_mode(align_mode)
-            self.pipeline.start(config)
-        self.get_logger().info(
-            f'뎁스-컬러 정렬 모드: {align_mode.name}'
-            + ('' if align_mode == OBAlignMode.HW_MODE
-               else '  (CPU 부하 큼 — Nav2 와 동시 구동 시 주의)'))
+        # ★ 뎁스-컬러 정렬은 소프트웨어 모드로 둔다.
+        #   HW_MODE(카메라 칩이 정렬)로 바꿔 CPU 를 아낄 수 있는지 실측해
+        #   봤으나 차이가 없었다(2026-08-27: 1.77코어 -> 1.77코어). 이 카메라
+        #   에서는 HW_MODE 를 켜도 결국 같은 경로를 타는 것으로 보인다.
+        #   검증된 이득이 없는 변경은 되돌린다 — 정렬 방식이 바뀌면 뎁스
+        #   품질도 미묘하게 달라질 수 있어 굳이 위험을 질 이유가 없다.
+        #   (실제 CPU 범인은 영상 발행의 rclpy 원소 검사였다. _encode_and_publish
+        #    주석 참고)
+        #   DISABLE 은 선택지가 아니다 — (u,v) 로 뎁스를 못 찾아 좌표 변환이
+        #   통째로 깨진다.
+        config.set_align_mode(OBAlignMode.SW_MODE)
+        self.pipeline.start(config)
 
         camera_param = self.pipeline.get_camera_param()
         intrinsics = camera_param.rgb_intrinsic
