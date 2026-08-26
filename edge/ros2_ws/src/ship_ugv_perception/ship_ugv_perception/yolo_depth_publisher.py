@@ -17,6 +17,30 @@ Astra+ 카메라로 Color+Depth를 받아 YOLO로 객체를 검출하고,
 - ROS2 타이머(메인 스레드): 공유 변수에서 최신 프레임을 꺼내 YOLO 추론 +
   주석 영상 발행 + 이벤트 발행을 수행. 이 처리가 느려도 캡처/원본발행 속도에
   전혀 영향 주지 않음.
+
+[2026-08-21 추가 1] 클래스별 confidence 임계값
+  전역 confidence_threshold 하나로 모든 클래스를 걸렀는데, 클래스마다
+  적정 임계값이 다르다. 예를 들어 no_helmet 은 놓치면 안 되니 낮게, 배경
+  오탐이 잦은 fire/helmet 은 높게 두고 싶다. class_confidence_overrides
+  파라미터("클래스명:값" 문자열 배열)로 클래스별로 덮어쓸 수 있게 함.
+  지정하지 않은 클래스는 기존처럼 confidence_threshold 를 쓴다.
+
+[2026-08-21 추가 2] person crop 2단계 helmet/no_helmet 재검출
+  화면 전체 기준으로는 안전모가 너무 작아 YOLO 내부 특징맵에서 정보가
+  손실된다(작은 객체 탐지의 고질적 취약점). person 이 검출되면 그 영역만
+  잘라 비율을 유지한 채 확대한 뒤 helmet/no_helmet 만 재검출한다.
+  cv2.resize 는 단순 보간이라 원본에 없는 디테일을 만들어내지 않는다
+  (슈퍼레졸루션과 다름). 화질을 올리는 게 아니라 "특징맵 상의 공간 여유"를
+  늘려주는 것이다.
+  개별 박스 처리(1차 필터 + depth 계산 + 발행)를 _evaluate_box() 로 공통화해
+  메인 검출(track_id 있음)과 crop 검출(track_id 없음 -> fallback 경로)이 같은
+  로직을 쓰게 했다. crop 좌표는 원본 프레임 좌표로 환산해서 넘긴다.
+
+  ⚠️ CPU 주의: person 한 명당 추론이 한 번씩 더 돈다. 2026-08-18 에 CPU 포화로
+     Nav2 lifecycle 전환이 타임아웃되어 브링업이 통째로 실패한 적이 있으므로,
+     Nav2 와 동시에 돌릴 때는 반드시 부하를 실측할 것. 문제가 되면
+     person_crop_enabled 를 끄거나(런타임에 ros2 param set 으로 즉시 가능)
+     person_crop_max_count / person_crop_target_size 를 줄인다.
 """
 
 import json
@@ -49,6 +73,19 @@ def is_level_class(class_name: str) -> bool:
     return re.search(r'(\d+)', str(class_name)) is not None
 
 
+# ★ 클래스별 confidence 임계값 — 여기 값만 고치면 바로 적용됩니다.
+#   여기 없는 클래스는 아래 declare_parameter('confidence_threshold', ...) 의
+#   전역값(기본 0.2)을 그대로 씁니다.
+#   예: no_helmet/fallen_person 은 놓치면 안 되니 낮게, fire/helmet 처럼
+#   배경 오탐이 잦은 클래스는 높게 두는 식으로 조정하세요.
+CLASS_CONFIDENCE = {
+    'no_helmet': 0.15,
+    'fallen_person': 0.15,
+    'fire': 0.45,
+    'helmet': 0.35,
+}
+
+
 LOW_LATENCY_QOS = QoSProfile(
     reliability=QoSReliabilityPolicy.BEST_EFFORT,
     history=QoSHistoryPolicy.KEEP_LAST,
@@ -68,6 +105,16 @@ class YoloDepthPublisher(Node):
         self.declare_parameter('weights_path', default_weights)
         self.declare_parameter('detection_topic', '/event_detection/uvd')
         self.declare_parameter('confidence_threshold', 0.2)
+        # ★ 클래스별 confidence 임계값
+        #   기본값은 파일 위쪽의 CLASS_CONFIDENCE 딕셔너리를 그대로 씀 —
+        #   값을 바꾸고 싶으면 재빌드 없이도 이 파라미터로 임시 조정 가능:
+        #     ros2 run ... --ros-args \
+        #       -p "class_confidence_overrides:=['no_helmet:0.15','fire:0.45']"
+        #   실행 중에도 ros2 param set 으로 즉시 반영됨. 여기서 지정 안 한
+        #   클래스는 CLASS_CONFIDENCE -> 없으면 confidence_threshold 순으로 적용.
+        #   평소엔 이 파라미터를 건드릴 필요 없이, 그냥 CLASS_CONFIDENCE
+        #   딕셔너리 값만 고쳐서 재빌드하면 됨.
+        self.declare_parameter('class_confidence_overrides', [''])
         self.declare_parameter('debug_log', True)
         self.declare_parameter('fallback_confirm_frames', 3)
         self.declare_parameter('fallback_match_dist_px', 60.0)
@@ -105,10 +152,20 @@ class YoloDepthPublisher(Node):
         self.declare_parameter('center_probe_w', 80)   # 중앙 ROI 가로(px)
         self.declare_parameter('center_probe_h', 60)   # 중앙 ROI 세로(px)
         self.declare_parameter('center_probe_hz', 5.0)
+        # ★ person crop 2단계 재검출 (2026-08-21 신설). 위 docstring 의 CPU 주의 참고.
+        self.declare_parameter('person_crop_enabled', True)
+        self.declare_parameter('person_crop_target_size', 640)   # 확대 후 긴 변 크기
+        self.declare_parameter('person_crop_min_size_px', 20)    # 이보다 작은 person 은 건너뜀
+        self.declare_parameter('person_crop_max_count', 2)       # 한 프레임에 처리할 최대 인원
 
         weights_path = self.get_parameter('weights_path').value
         topic = self.get_parameter('detection_topic').value
         self.conf_threshold = self.get_parameter('confidence_threshold').value
+        # ★ CLASS_CONFIDENCE(코드 상단 딕셔너리)를 기본값으로 삼고, 파라미터로
+        #   지정한 게 있으면 그 클래스만 덮어씀 (재빌드 없는 임시 실험용).
+        self.class_conf = dict(CLASS_CONFIDENCE)
+        self.class_conf.update(self._parse_class_conf(
+            self.get_parameter('class_confidence_overrides').value))
         self.debug_log = self.get_parameter('debug_log').value
         self.fallback_confirm_frames = self.get_parameter('fallback_confirm_frames').value
         self.fallback_match_dist = self.get_parameter('fallback_match_dist_px').value
@@ -123,6 +180,10 @@ class YoloDepthPublisher(Node):
         self.probe_h = int(self.get_parameter('center_probe_h').value)
         self.probe_period = 1.0 / max(0.1, self.get_parameter('center_probe_hz').value)
         self._probe_last = 0.0
+        self.person_crop_enabled = self.get_parameter('person_crop_enabled').value
+        self.person_crop_target_size = int(self.get_parameter('person_crop_target_size').value)
+        self.person_crop_min_size = int(self.get_parameter('person_crop_min_size_px').value)
+        self.person_crop_max_count = int(self.get_parameter('person_crop_max_count').value)
 
         # ★ debug_log 를 실행 중에 바꿀 수 있게 한다 (2026-08-19).
         #   지금까지는 위에서 값을 한 번 읽어 self.debug_log 에 넣어두고 다시
@@ -136,6 +197,20 @@ class YoloDepthPublisher(Node):
 
         self.model = YOLO(weights_path)
         self.get_logger().info(f"모델 클래스 목록: {self.model.names}")
+        if self.class_conf:
+            self.get_logger().info(f"클래스별 confidence 임계값: {self.class_conf} "
+                                   f"(그 외 전역값 {self.conf_threshold})")
+
+        # person crop 재검출을 helmet/no_helmet 으로만 제한한다(속도).
+        self._helmet_class_ids = [
+            idx for idx, name in self.model.names.items()
+            if name in ('helmet', 'no_helmet')
+        ]
+        if self.person_crop_enabled and not self._helmet_class_ids:
+            self.get_logger().warn(
+                "person_crop_enabled=True 이지만 모델에 helmet/no_helmet 이 없음 - 비활성화")
+            self.person_crop_enabled = False
+
         self.pub = self.create_publisher(String, topic, 10)
         # 화면 중앙 뎁스 탐침 결과 (measure_ship_center.py 가 쓴다)
         self.probe_pub = self.create_publisher(
@@ -174,7 +249,8 @@ class YoloDepthPublisher(Node):
         self.get_logger().info(
             f"YOLO+Depth publisher 시작, weights={weights_path}, "
             f"raw_topic={raw_image_topic}(캡처 스레드, 항상 빠름), "
-            f"annotated_topic={annotated_image_topic}(YOLO 처리 주기 종속)"
+            f"annotated_topic={annotated_image_topic}(YOLO 처리 주기 종속), "
+            f"person_crop={self.person_crop_enabled}"
         )
 
         # ★ 캡처 전담 스레드 시작 (카메라 최대 속도로 계속 실행)
@@ -187,6 +263,31 @@ class YoloDepthPublisher(Node):
 
         # ★ YOLO 처리는 이 타이머로만, 캡처 속도와 무관
         self.timer = self.create_timer(inference_interval, self._process_frame)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_class_conf(raw_list):
+        """['no_helmet:0.15', 'fire:0.45'] -> {'no_helmet': 0.15, 'fire': 0.45}
+
+        빈 문자열/형식 오류 항목은 조용히 건너뛴다(파라미터 하나 잘못 적었다고
+        노드가 죽으면 안 되므로).
+        """
+        out = {}
+        for item in (raw_list or []):
+            s = str(item).strip()
+            if not s or ':' not in s:
+                continue
+            name, _, value = s.partition(':')
+            name = name.strip()
+            try:
+                out[name] = float(value)
+            except ValueError:
+                continue
+        return out
+
+    def _conf_for(self, class_name):
+        """이 클래스에 적용할 confidence 임계값. 지정 없으면 전역값."""
+        return self.class_conf.get(class_name, self.conf_threshold)
 
     def _match_nearby(self, records, class_name, u, v):
         for r in records:
@@ -207,6 +308,15 @@ class YoloDepthPublisher(Node):
                 self.conf_threshold = float(p.value)
                 self.get_logger().info(
                     f'confidence_threshold -> {self.conf_threshold} (즉시 반영됨)')
+            elif p.name == 'class_confidence_overrides':
+                self.class_conf = dict(CLASS_CONFIDENCE)
+                self.class_conf.update(self._parse_class_conf(p.value))
+                self.get_logger().info(
+                    f'class_confidence_overrides -> {self.class_conf} (즉시 반영됨)')
+            elif p.name == 'person_crop_enabled':
+                self.person_crop_enabled = bool(p.value) and bool(self._helmet_class_ids)
+                self.get_logger().info(
+                    f'person_crop_enabled -> {self.person_crop_enabled} (즉시 반영됨)')
         return SetParametersResult(successful=True)
 
     def _encode_and_publish(self, publisher, image, quality=None):
@@ -329,6 +439,7 @@ class YoloDepthPublisher(Node):
                     self._latest_stamp = self.get_clock().now().to_msg()
             except Exception as e:
                 self.get_logger().error(f"캡처 스레드 예외 (계속 재시도): {e}")
+
     def _get_latest_frame(self):
         with self._frame_lock:
             if self._latest_depth is None:
@@ -345,6 +456,179 @@ class YoloDepthPublisher(Node):
             if color is None:
                 return None, None
         return color, depth
+
+    # ------------------------------------------------------------------
+    # ★ 박스 하나를 처리하는 공통 로직 (1차 필터 -> depth 계산 -> 발행).
+    #   메인 검출(track_id 있음)과 person crop 재검출(track_id None)이 함께 쓴다.
+    #   track_id 가 None 이면 자동으로 fallback(위치 기반) 경로를 타므로,
+    #   메인 검출과 위치가 겹치면 기존 dedup 이 알아서 중복을 걸러준다.
+    def _evaluate_box(self, class_name, conf, x1, y1, x2, y2, track_id,
+                      depth_image, display_image, draw_box=True):
+        if conf < self._conf_for(class_name):
+            return
+
+        u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
+
+        def _maybe_draw(z_m=None):
+            if draw_box:
+                self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, z_m)
+
+        publish_ok = False
+        key_info = ""
+
+        if is_level_class(class_name):
+            publish_ok = True
+            key_info = "level(항상발행)"
+
+        elif track_id is not None:
+            # ★ 위치(맵 좌표) 기준 "이미 보고했나" 판단은 change_point_detector 가
+            #   한다. 여기서 화면좌표(u,v)로 한 번 더 걸러 영구히 기억해두면
+            #   (예전의 reported_tids/reported_fallbacks) 불을 옮기거나 다른
+            #   자리에 새로 놓아도 화면상 비슷한 위치라는 이유로 아예
+            #   발행조차 안 되는 사고가 난다(2026-08-24 실측: 불을 옮겨도
+            #   팝업/정지 둘 다 안 뜸). 트랙별로 매 프레임 그냥 발행하고,
+            #   실제 중복 제거는 map 좌표 기반인 change_point_detector 에
+            #   전부 맡긴다.
+            publish_ok = True
+            key_info = f"tid={track_id}"
+
+        else:
+            # ★ 트랙 ID가 없는 검출: 노이즈 필터링 목적으로만 연속
+            #   fallback_confirm_frames 프레임 동안 비슷한 화면 위치에
+            #   잡혀야 발행한다. (위치 중복 제거는 change_point_detector 몫)
+            cand = self._match_nearby(self.fallback_candidates, class_name, u, v)
+            if cand is None:
+                self.fallback_candidates.append({'class': class_name, 'u': u, 'v': v, 'count': 1})
+                _maybe_draw()
+                return
+            cand['count'] += 1
+            cand['u'], cand['v'] = u, v
+            if cand['count'] < self.fallback_confirm_frames:
+                _maybe_draw()
+                return
+            self.fallback_candidates.remove(cand)
+            publish_ok = True
+            key_info = f"fallback({u},{v})"
+
+        if not publish_ok:
+            return
+
+        box_w, box_h = int(x2 - x1), int(y2 - y1)
+        y_min = max(0, v - box_h // 4)
+        y_max = min(depth_image.shape[0], v + box_h // 4)
+        x_min = max(0, u - box_w // 4)
+        x_max = min(depth_image.shape[1], u + box_w // 4)
+        depth_roi = depth_image[y_min:y_max, x_min:x_max]
+        valid_depths = depth_roi[depth_roi > 0]
+        valid_ratio = len(valid_depths) / depth_roi.size if depth_roi.size > 0 else 0.0
+
+        if valid_ratio < self.min_valid_ratio:
+            if self.debug_log:
+                self.get_logger().debug(
+                    f"[{class_name}] 유효 depth 비율 {valid_ratio:.2f} < "
+                    f"{self.min_valid_ratio} - 검출 폐기"
+                )
+            _maybe_draw()
+            return
+
+        z_m = float(np.median(valid_depths)) / 1000.0
+        X = (u - self.cx) * z_m / self.fx
+        Y = (v - self.cy) * z_m / self.fy
+
+        _maybe_draw(z_m)
+
+        if self.debug_log:
+            self.get_logger().info(
+                f"[발행] class={class_name} {key_info} conf={conf:.2f} xyz=({X:.3f},{Y:.3f},{z_m:.3f})m"
+            )
+
+        msg = String()
+        # ★ stamp = 이 검출이 나온 **사진을 찍은 시각** (발행 시각이 아니다).
+        #   소비자는 이 시각의 TF 를 조회해야 로봇 위치가 맞다.
+        st = getattr(self, '_frame_stamp', None)
+        payload = {
+            'u': u, 'v': v, 'depth': z_m,
+            'depth_xyz': [X, Y, z_m],
+            'class_id': class_name, 'confidence': conf,
+        }
+        if st is not None:
+            payload['stamp_sec'] = int(st.sec)
+            payload['stamp_nanosec'] = int(st.nanosec)
+        msg.data = json.dumps(payload)
+        self.pub.publish(msg)
+
+    # ------------------------------------------------------------------
+    # ★ person 영역들을 잘라 확대한 뒤 helmet/no_helmet 만 배치로 재검출.
+    #   호출당 추론 1회(배치)로 처리해 인원수만큼 호출이 늘지 않게 한다.
+    #
+    #   위치(u,v)와 거리(depth)는 helmet 자신의 작은 bbox 가 아니라 **그
+    #   helmet 을 찾아낸 person 의 bbox**를 그대로 쓴다. 위험 이벤트의 관심사는
+    #   "안전모 픽셀이 정확히 어디 있는가"가 아니라 "안전모가 없는 그 사람이
+    #   어디 있는가"이고, person bbox 는 훨씬 커서 depth 유효 픽셀 비율이
+    #   안정적으로 min_valid_ratio 를 넘는다(반대로 작은 helmet bbox 는 depth
+    #   가 자주 무효 처리되어 검출이 통째로 폐기되곤 했다). 화면에 그려지는
+    #   박스만 실제 helmet 위치(정확한 시각화용)를 쓰고, 발행되는 이벤트의
+    #   좌표는 person 기준이다.
+    def _detect_helmet_in_person_crops(self, color_image, person_boxes,
+                                       depth_image, display_image):
+        crops = []
+        metas = []   # (px1, py1, px2, py2, scale) — 원본 person bbox 그대로 들고 다님
+
+        for (px1, py1, px2, py2) in person_boxes[:self.person_crop_max_count]:
+            px1 = max(0, int(px1))
+            py1 = max(0, int(py1))
+            px2 = min(color_image.shape[1], int(px2))
+            py2 = min(color_image.shape[0], int(py2))
+            cw, ch = px2 - px1, py2 - py1
+            if cw < self.person_crop_min_size or ch < self.person_crop_min_size:
+                continue
+            crop = color_image[py1:py2, px1:px2]
+            if crop.size == 0:
+                continue
+            # 비율 유지 확대 (정사각형으로 늘리면 사람이 찌그러져 특징이 왜곡됨)
+            scale = self.person_crop_target_size / max(cw, ch)
+            nw, nh = max(1, int(cw * scale)), max(1, int(ch * scale))
+            crops.append(cv2.resize(crop, (nw, nh)))
+            metas.append((px1, py1, px2, py2, scale))
+
+        if not crops:
+            return
+
+        try:
+            results_list = self.model(
+                crops, verbose=False, classes=self._helmet_class_ids)
+        except Exception as e:
+            self.get_logger().warn(f"person crop 재검출 실패(무시하고 계속): {e}")
+            return
+
+        for res, (px1, py1, px2, py2, scale) in zip(results_list, metas):
+            if res.boxes is None:
+                continue
+            for hbox in res.boxes:
+                hx1, hy1, hx2, hy2 = hbox.xyxy[0].cpu().numpy()
+                hconf = float(hbox.conf[0])
+                hname = self.model.names[int(hbox.cls[0])]
+
+                # 시각화용: helmet 실제 위치를 원본 좌표로 환산해서 화면에는
+                # 정확한 자리에 박스를 그린다 (사람 전체 박스를 그리면 어디에
+                # helmet/no_helmet 이 있는지 눈으로 확인하기 어려워지므로).
+                ox1 = px1 + hx1 / scale
+                oy1 = py1 + hy1 / scale
+                ox2 = px1 + hx2 / scale
+                oy2 = py1 + hy2 / scale
+                self._draw_box(display_image, ox1, oy1, ox2, oy2, hname, hconf, None)
+
+                if self.debug_log:
+                    self.get_logger().info(
+                        f"[person crop] {hname} conf={hconf:.2f} "
+                        f"-> person bbox 기준 좌표/거리로 발행",
+                        throttle_duration_sec=5.0)
+
+                # 발행 좌표/거리는 person bbox 기준 (위 docstring 참고).
+                # draw_box=False: 정확한 helmet 위치 박스는 위에서 이미 그렸으므로,
+                # 여기서 person 크기 박스를 또 그리면 화면에 두 개가 겹쳐 지저분해짐.
+                self._evaluate_box(hname, hconf, px1, py1, px2, py2,
+                                   None, depth_image, display_image, draw_box=False)
 
     # ------------------------------------------------------------------
     # YOLO 처리 (캡처 스레드가 채워둔 최신 프레임을 가져다 씀, 카메라 속도와 무관)
@@ -378,101 +662,27 @@ class YoloDepthPublisher(Node):
             self._encode_and_publish(self.annotated_image_pub, display_image)
             return
 
+        # ---- 1단계: 프레임 전체 검출 ----
+        person_boxes = []
         for box in results.boxes:
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
             cls = int(box.cls[0])
             conf = float(box.conf[0])
             class_name = self.model.names[cls]
+            track_id = int(box.id[0]) if box.id is not None else None
 
-            if conf < self.conf_threshold:
-                continue
+            self._evaluate_box(class_name, conf, x1, y1, x2, y2, track_id,
+                               depth_image, display_image)
 
-            u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
+            # person 은 confidence 미달이면 crop 대상에서도 제외
+            if (self.person_crop_enabled and class_name == 'person'
+                    and conf >= self._conf_for(class_name)):
+                person_boxes.append((x1, y1, x2, y2))
 
-            publish_ok = False
-            key_info = ""
-
-            if is_level_class(class_name):
-                publish_ok = True
-                key_info = "level(항상발행)"
-
-            elif box.id is not None:
-                # ★ 위치(맵 좌표) 기준 "이미 보고했나" 판단은 change_point_detector 가
-                #   한다. 여기서 화면좌표(u,v)로 한 번 더 걸러 영구히 기억해두면
-                #   (예전의 reported_tids/reported_fallbacks) 불을 옮기거나 다른
-                #   자리에 새로 놓아도 화면상 비슷한 위치라는 이유로 아예
-                #   발행조차 안 되는 사고가 난다(2026-08-24 실측: 불을 옮겨도
-                #   팝업/정지 둘 다 안 뜸). 트랙별로 매 프레임 그냥 발행하고,
-                #   실제 중복 제거는 map 좌표 기반인 change_point_detector 에
-                #   전부 맡긴다.
-                track_id = int(box.id[0])
-                publish_ok = True
-                key_info = f"tid={track_id}"
-
-            else:
-                # ★ 트랙 ID가 없는 검출: 노이즈 필터링 목적으로만 연속
-                #   fallback_confirm_frames 프레임 동안 비슷한 화면 위치에
-                #   잡혀야 발행한다. (위치 중복 제거는 change_point_detector 몫)
-                cand = self._match_nearby(self.fallback_candidates, class_name, u, v)
-                if cand is None:
-                    self.fallback_candidates.append({'class': class_name, 'u': u, 'v': v, 'count': 1})
-                    self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
-                    continue
-                cand['count'] += 1
-                cand['u'], cand['v'] = u, v
-                if cand['count'] < self.fallback_confirm_frames:
-                    self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
-                    continue
-                self.fallback_candidates.remove(cand)
-                publish_ok = True
-                key_info = f"fallback({u},{v})"
-
-            if not publish_ok:
-                continue
-
-            box_w, box_h = int(x2 - x1), int(y2 - y1)
-            y_min = max(0, v - box_h // 4)
-            y_max = min(depth_image.shape[0], v + box_h // 4)
-            x_min = max(0, u - box_w // 4)
-            x_max = min(depth_image.shape[1], u + box_w // 4)
-            depth_roi = depth_image[y_min:y_max, x_min:x_max]
-            valid_depths = depth_roi[depth_roi > 0]
-            valid_ratio = len(valid_depths) / depth_roi.size if depth_roi.size > 0 else 0.0
-
-            if valid_ratio < self.min_valid_ratio:
-                if self.debug_log:
-                    self.get_logger().debug(
-                        f"[{class_name}] 유효 depth 비율 {valid_ratio:.2f} < "
-                        f"{self.min_valid_ratio} - 검출 폐기"
-                    )
-                self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, None)
-                continue
-
-            z_m = float(np.median(valid_depths)) / 1000.0
-            X = (u - self.cx) * z_m / self.fx
-            Y = (v - self.cy) * z_m / self.fy
-
-            self._draw_box(display_image, x1, y1, x2, y2, class_name, conf, z_m)
-
-            if self.debug_log:
-                self.get_logger().info(
-                    f"[발행] class={class_name} {key_info} conf={conf:.2f} xyz=({X:.3f},{Y:.3f},{z_m:.3f})m"
-                )
-
-            msg = String()
-            # ★ stamp = 이 검출이 나온 **사진을 찍은 시각** (발행 시각이 아니다).
-            #   소비자는 이 시각의 TF 를 조회해야 로봇 위치가 맞다.
-            st = getattr(self, '_frame_stamp', None)
-            payload = {
-                'u': u, 'v': v, 'depth': z_m,
-                'depth_xyz': [X, Y, z_m],
-                'class_id': class_name, 'confidence': conf,
-            }
-            if st is not None:
-                payload['stamp_sec'] = int(st.sec)
-                payload['stamp_nanosec'] = int(st.nanosec)
-            msg.data = json.dumps(payload)
-            self.pub.publish(msg)
+        # ---- 2단계: person 영역 확대 후 helmet/no_helmet 재검출 ----
+        if person_boxes:
+            self._detect_helmet_in_person_crops(
+                color_image, person_boxes, depth_image, display_image)
 
         self._encode_and_publish(self.annotated_image_pub, display_image)
 
