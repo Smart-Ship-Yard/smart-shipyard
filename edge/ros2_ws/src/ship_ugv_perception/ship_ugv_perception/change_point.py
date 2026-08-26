@@ -181,6 +181,17 @@ class ChangePointDetector(Node):
         self.declare_parameter('revisit_radius_m', 0.35)    # 이만큼 가까우면 "그 자리로 돌아왔다"
         self.declare_parameter('revisit_yaw_tol_deg', 45.0) # 헤딩도 비슷해야 카메라가 같은 곳을 본다
         self.declare_parameter('revisit_grace_s', 3.0)      # 그 자리에서 이만큼 안 보이면 확정
+        # ★ 2026-08-24: confidence 필터. 실측 0.468짜리 한 프레임 오탐이
+        #   그대로 새 이벤트(정지 유발)로 등록된 사고가 있었다.
+        #   websocket_client 가 이미 쓰는 기준(0.5)과 맞춘다.
+        self.declare_parameter('min_confidence', 0.5)
+        # ★ 2026-08-24: depth 상한. 이게 없으면 쓰레기 depth 가 그대로 map
+        #   좌표로 투영돼 맵 밖(x=5.13, 경계는 4.95)까지 유령 이벤트가 찍혔다.
+        #   진짜 불은 배 위에 있어 로봇~불 거리 상한이
+        #       순찰 반지름(1.0) + 불이 배 중심에서 떨어진 거리
+        #   이고, 불을 배 중심에서 1.0m 까지 옮겨도 2.0m 다.
+        #   순찰 반지름을 키우거나 불을 배에서 더 멀리 두려면 같이 올릴 것.
+        self.declare_parameter('max_depth_m', 2.0)
         self.declare_parameter('clear_check_hz', 2.0)
 
         self.map_frame = self.get_parameter('map_frame_id').value
