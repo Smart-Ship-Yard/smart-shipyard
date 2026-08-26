@@ -446,9 +446,18 @@ class YoloDepthPublisher(Node):
 
                 # ★ YOLO 처리 스레드(타이머)가 쓸 수 있게 최신 프레임 저장
                 with self._frame_lock:
-                    self._latest_raw = raw if is_jpeg else None
+                    # ★ .copy() 필수 (2026-08-27).
+                    #   raw 는 np.frombuffer 로 만든 **SDK 프레임 버퍼의 뷰**이고
+                    #   복사본이 아니다. 캡처 스레드가 다음 프레임으로 넘어가면
+                    #   SDK 가 그 버퍼를 재사용하므로, 추론 스레드가 250ms 뒤에
+                    #   읽을 때는 이미 다른 내용일 수 있다.
+                    #   영상 발행의 rclpy 원소 검사를 없애(2400배) 캡처 루프가
+                    #   빨라지자 이 경합이 바로 드러났다 — 카메라 화면은 멀쩡한데
+                    #   (발행 경로는 tobytes() 로 복사본을 쓴다) 추론만 검출 0건이
+                    #   되어 불을 봐도 로봇이 안 멈췄다.
+                    self._latest_raw = raw.copy() if is_jpeg else None
                     self._latest_color = color_image
-                    self._latest_depth = depth_image
+                    self._latest_depth = depth_image.copy()   # 위와 같은 이유(뷰 -> 복사)
                     # ★ 이 프레임을 언제 찍었는지 남긴다 (2026-08-19).
                     #   아래 _process_frame 이 YOLO 추론을 마친 뒤 검출을
                     #   발행하는데, 그 사이 55~305 ms 가 걸린다. 소비자

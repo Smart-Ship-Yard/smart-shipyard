@@ -38,52 +38,54 @@ def clear_verdict(dist_to_vantage_m, yaw_diff_rad, last_seen_s, now_s,
     """치워짐 판정의 순수 핵심부. ROS 없이 검증하려고 뽑아냈다.
 
     반환: (verdict, 다음 left_vantage, 다음 arrived_at_s)
-      'wait'  — 아직 판정할 자리가 아니거나, 덜 지켜봤거나, 아직 보인다.
-      'clear' — 확정. 처음 봤던 그 자리로 돌아와 지켜봤는데 안 보였다.
 
-    ★ 판정 기준이 "로봇 자신의 위치"인 이유 ★
-    그 불을 처음 검출한 순간의 로봇 위치에서는 불이 **분명히 보였다**
-    (그래서 검출됐다). 그러니 그 자리로 다시 왔는데 안 보이면 가려진 게
-    아니라 진짜 없는 것이다. 순찰 원 중심에 배가 있어 반대편에서는 배가
-    불을 가리는데(실측 약 30초), in_camera_fov 는 각도만 볼 뿐 가림을
-    모른다. 시간만 보는 방식은 그 가림을 오판하지 않으려 60초를 기다려야
-    했고 최악 2.2바퀴가 걸렸다. 위치를 쓰면 그 추측이 통째로 없어진다.
+    ★ 기준이 "로봇 자신의 위치"인 이유 ★
+    그 불을 처음 검출한 순간의 로봇 위치에서는 불이 분명히 보였다(그래서
+    검출됐다). 순찰 원 중심에 배가 있어 반대편에서는 배가 불을 가리는데
+    (실측 약 30초), 시간만 보는 방식은 그 가림을 오판하지 않으려 60초를
+    기다려야 했고 최악 2.2바퀴가 걸렸다. 위치를 쓰면 그 추측이 없어진다.
 
-    ★ arrived_at_s 가 왜 필요한가 (2026-08-26 실측 사고) ★
-    처음에는 마지막 조건이 "(now - last_seen) >= grace" 였다. 그런데 그러면
-    **그 자리에 도착하는 순간 즉시 판정해버린다.** 로봇은 직전까지 배 뒤를
-    지나오며 28~30초간 불을 못 봤으므로, 도착 시점에 last_seen 은 이미
-    한참 전이고 grace(3초)를 그냥 통과한다:
+    ★ 판정을 "구역을 빠져나가는 순간"에 하는 이유 (2026-08-27 실측 사고) ★
+    처음에는 "도착 후 revisit_grace_s 동안 못 보면 확정" 이었다. 그런데
+    seen_from 은 **불이 막 보이기 시작한 경계**다 — 그 직전까지는 배에
+    가려 안 보이던 자리다. 돌아와서 반경 0.35m 안에 들어와도 그 0.35m 가
+    아직 안 보이는 쪽일 수 있고, 거기서 3초를 세면 당연히 못 본다:
 
-        21:13:30  cleared  fire@-0.14,-0.84
-        21:13:31  등록     fire@-0.10,-0.86   <- 1초 뒤, 4cm 옆
+        01:09:23  fire@0.44,-0.87 등록 (정지)
+        01:11:31  마지막 검출
+        01:11:54  치워짐 판정      <- 불은 그대로 있었다
+        그 구간 confidence 0.88~0.94 (임계값 0.45 와 무관, 안 보였을 뿐)
 
-    clear 1초 만에 사실상 같은 자리에 재등록됐다(3회 실측). 불은 계속
-    거기 있었고, 로봇이 "도착하자마자, 아직 보기도 전에" 판정한 것이다.
+    그래서 머무는 동안에는 판정하지 않고, **구역을 벗어나는 순간** 이번
+    방문 전체를 돌아보고 판정한다. 로봇은 반경을 통과하는 전 구간
+    (0.35m 반경이면 약 0.7m, 0.126 m/s 로 약 5.5초) 동안 불을 볼 기회를
+    얻고, 그동안 한 번도 못 봤을 때만 치워진 것으로 본다.
 
-    그래서 기준을 **"그 자리에 도착한 뒤로"** 로 바꾼다. 도착 시각을 따로
-    들고 있다가, 도착 후 grace 만큼 지켜봤는데 그동안 한 번도 안 보였을
-    때만 확정한다. 가림 구간은 애초에 그 자리가 아니므로 판정 대상이
-    아니고, grace 를 키우지 않아도 되므로 "한 바퀴 안 판정"이 유지된다.
+    revisit_grace_s 는 이제 "이번 방문이 유효한 통과였는지" 를 재는
+    최소 체류 시간이다. 모퉁이만 스치고 지나간 것을 한 번의 방문으로
+    치지 않기 위한 것.
 
-    헤딩(yaw_diff)은 판정만 보류시키고 도착 시계는 리셋하지 않는다.
-    잠깐 흔들렸다고 시계를 되돌리면 통과 시간(반경 0.35m 를 0.126 m/s 로
-    지나가면 약 5초)이 grace 를 못 채워 영영 판정이 안 될 수 있다.
+    left_vantage: 그 자리를 한 번은 벗어나야 "재방문" 으로 친다. 안 그러면
+    막 검출해 아직 그 자리에 서 있는 동안(정지-확인 대기 중) 지워버린다.
     """
     if dist_to_vantage_m > revisit_radius_m:
-        # 그 자리를 벗어났다 -> 재방문 자격이 생기고, 도착 시계는 접는다
+        # 구역 밖 — 이번 방문이 끝난 시점이다. 여기서만 판정한다.
+        if (left_vantage
+                and arrived_at_s is not None
+                and (now_s - arrived_at_s) >= revisit_grace_s   # 제대로 통과했고
+                and last_seen_s < arrived_at_s):                # 그동안 한 번도 못 봤다
+            return 'clear', True, None
         return 'wait', True, None
+
     if not left_vantage:
         return 'wait', left_vantage, None   # 아직 처음 그 자리에 머무는 중
     if arrived_at_s is None:
-        return 'wait', left_vantage, now_s  # 방금 도착 — 지금부터 지켜본다
-    if yaw_diff_rad > revisit_yaw_tol_rad:
-        return 'wait', left_vantage, arrived_at_s   # 다른 쪽을 봄: 판정만 보류
-    if (now_s - arrived_at_s) < revisit_grace_s:
-        return 'wait', left_vantage, arrived_at_s   # 아직 덜 지켜봤다
-    if last_seen_s >= arrived_at_s:
-        return 'wait', left_vantage, arrived_at_s   # 도착 후에 봤다 = 아직 있다
-    return 'clear', left_vantage, arrived_at_s
+        # 방금 도착. 헤딩이 맞을 때만 "유효한 방문" 으로 보고 시계를 켠다
+        # (Nav2 복구 회전 중 우연히 스친 것을 방문으로 치지 않는다).
+        if yaw_diff_rad > revisit_yaw_tol_rad:
+            return 'wait', left_vantage, None
+        return 'wait', left_vantage, now_s
+    return 'wait', left_vantage, arrived_at_s   # 머무는 동안은 판정하지 않는다
 
 
 def quat_to_yaw(x, y, z, w):
