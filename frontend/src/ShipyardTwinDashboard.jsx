@@ -102,11 +102,39 @@ function sectionCenterZ(blockId) {
   return (t - 0.5) * SHIP_LEN;             // 월드 z (선미 뒤 ~ 선수 앞)
 }
 
+/* 0~1 스무스스텝 — 양 끝에서 기울기가 0이 되어 이어붙일 때 꺾임이 없다.
+ * SceneManager._smoothstep도 이 함수를 그대로 쓴다(하나로 통일해서 핑 위치와
+ * 실제로 그려지는 선체 모양이 항상 같은 공식을 쓰게 함). */
+function smoothstep01(x) {
+  const c = Math.max(0, Math.min(1, x));
+  return c * c * (3 - 2 * c);
+}
+
+/* 배 단면 폭 계수: 선미(t=0)~선수(t=1). 뱃머리 쪽은 배가 뾰족해지면서 실제 폭이
+ * 크게 줄어든다 — SceneManager._beamFactor(실제 선체 렌더링에 쓰는 것)와 반드시
+ * 같은 공식을 써야 한다. 이게 안 맞으면 핑 x좌표가 SHIP_BEAM 기준 "직사각형 배"로
+ * 계산되는데, 실제 뱃머리/선미는 그보다 훨씬 좁아서 핑이 선체 바깥 빈 공간(허공)에
+ * 찍힌 것처럼 보이는 버그가 생긴다. */
+function hullBeamFactor(t) {
+  if (t < 0.15) {
+    const u = t / 0.15;
+    return 0.55 + 0.45 * smoothstep01(u);
+  }
+  if (t < 0.78) return 1.0;
+  const u = (t - 0.78) / 0.22;
+  const eased = Math.pow(smoothstep01(u), 1.15);
+  return 1.0 - eased * 0.97;
+}
+
 function serverToWorld(blockId, local = { x: 0.5, y: 1, z: 0.5 }) {
   const r = SECTION_RANGE[blockId] || [0.4, 0.6];
   const t = r[0] + (r[1] - r[0]) * (local.z ?? 0.5); // 구획 내 z 위치
   const z = (t - 0.5) * SHIP_LEN;
-  const x = (local.x - 0.5) * SHIP_BEAM * 0.8;       // 폭 방향
+  // 그 z 위치에서 실제 선체가 얼마나 넓은지(hullBeamFactor)를 반영해서 x를 계산한다.
+  // 이걸 안 하면 뱃머리(S1)처럼 배가 뾰족해지는 구간에서 핑이 실제 선체보다 훨씬
+  // 바깥쪽 — 즉 화재/사고가 없는 빈 물 위 — 에 찍힌 것처럼 보인다.
+  const localWidth = SHIP_BEAM * hullBeamFactor(t);
+  const x = (local.x - 0.5) * localWidth * 0.8;      // 폭 방향(해당 지점 실제 선폭 기준)
   const y = DECK_Y + (local.y ?? 1) * 0.9;           // 갑판 위
   return new THREE.Vector3(x, y, z);
 }
@@ -220,6 +248,57 @@ function mapXYToUgvWorld(mapXY, ugvYaw, shipPose) {
     : null;
 
   return { x: worldX, z: worldZ, yaw: relativeYaw };
+}
+
+/* 위험(화재/사고) 위치를 "배 위(구획 안)"인지 "배 밖(주변 작업장)"인지 먼저 판단해서
+ * 서로 다른 좌표계로 변환한다.
+ *
+ * mapXYToBlockLocal은 원래 "위험은 항상 배 위에서 감지된다"는 가정으로 만들어져서,
+ * 배 밖에서 감지된 화재도 0~1 범위로 억지로 눌러(clamp) 가장 가까운 구획 가장자리에
+ * 붙여버린다 — 그래서 "화재가 배에서 멀리 떨어져 있는데 핑은 배 위에 찍힌다"는
+ * 문제가 생겼다. 이제 배 실측 크기(약간의 여유 포함) 안쪽인지 먼저 확인해서,
+ * 배 밖이면 UGV 위치 변환(mapXYToUgvWorld)과 똑같은 방식 — 야드 공간에 실제
+ * 상대 위치 그대로 — 으로 배치한다. */
+function mapXYToPingWorld(mapXY, shipPose) {
+  const rel = mapXYToShipLocalMeters(mapXY, shipPose);
+  if (!rel) return null;
+
+  // 배 실측 길이/폭보다 살짝 여유를 둬서(15%) — 뱃전에 거의 붙어있는 정도는
+  // "배 위"로 보고, 그보다 확실히 떨어진 경우만 "배 밖"으로 판단한다.
+  const ON_SHIP_MARGIN = 1.15;
+  const onShip =
+    Math.abs(rel.forward) <= (SHIP_REAL_LENGTH_M / 2) * ON_SHIP_MARGIN &&
+    Math.abs(rel.beam) <= (SHIP_REAL_BEAM_M / 2) * ON_SHIP_MARGIN;
+
+  if (onShip) {
+    const blockLocal = mapXYToBlockLocal(mapXY, shipPose);
+    return blockLocal ? { onShip: true, blockId: blockLocal.blockId, local: blockLocal.local } : null;
+  }
+
+  // 배 밖(작업장) — UGV와 같은 축척/클램프 범위를 그대로 쓴다. blockId는 화면 표시
+  // 위치엔 안 쓰지만, 이벤트 로그/구획 강조 등 기존 UI가 여전히 blockId를 필요로
+  // 해서 "제일 가까운 구획"으로 하나 붙여준다.
+  const MAX_FORWARD_M = 3;
+  const MAX_BEAM_M = 2;
+  const clampedForward = Math.max(-MAX_FORWARD_M, Math.min(MAX_FORWARD_M, rel.forward));
+  const clampedBeam = Math.max(-MAX_BEAM_M, Math.min(MAX_BEAM_M, rel.beam));
+  const lengthScale = SHIP_LEN / SHIP_REAL_LENGTH_M;
+  const beamScale = SHIP_BEAM / SHIP_REAL_BEAM_M;
+
+  let t = rel.forward / SHIP_REAL_LENGTH_M + 0.5;
+  t = Math.max(0, Math.min(1, t));
+  let nearestBlockId = BLOCKS[0].id;
+  for (const b of BLOCKS) {
+    const [r0, r1] = SECTION_RANGE[b.id];
+    if (t >= r0 && t <= r1) { nearestBlockId = b.id; break; }
+  }
+
+  return {
+    onShip: false,
+    blockId: nearestBlockId,
+    worldX: clampedBeam * beamScale,
+    worldZ: clampedForward * lengthScale,
+  };
 }
 
 /* ---------------------------------------------------------------------------
@@ -404,23 +483,15 @@ class SceneManager {
     this.scene.add(rim);
   }
 
-  /* 0~1 스무스스텝 — 양 끝에서 기울기가 0이 되어 이어붙일 때 꺾임이 없다 */
+  /* 0~1 스무스스텝 / 선체 폭 계수 — 파일 위쪽의 smoothstep01/hullBeamFactor와
+   * 같은 공식을 써야 한다(핑 위치 계산에도 그 함수들을 그대로 쓰기 때문).
+   * 그래서 여기서 다시 구현하지 않고 그 함수들을 그대로 호출한다. */
   _smoothstep(x) {
-    const c = Math.max(0, Math.min(1, x));
-    return c * c * (3 - 2 * c);
+    return smoothstep01(x);
   }
 
-  /* 배 단면 폭 계수: 선미(t=0)~선수(t=1). 중앙은 평행한 최대폭 구간(패럴렐 미드바디),
-   * 선미는 완만하게, 선수는 뾰족하게 — 스무스스텝으로 이어 붙여 꺾임 없이 매끄럽다. */
   _beamFactor(t) {
-    if (t < 0.15) {
-      const u = t / 0.15;
-      return 0.55 + 0.45 * this._smoothstep(u); // 선미: 0.55 → 1.0
-    }
-    if (t < 0.78) return 1.0; // 평행 중앙부(최대폭 유지)
-    const u = (t - 0.78) / 0.22;
-    const eased = Math.pow(this._smoothstep(u), 1.15); // 선수: 1.0 → 거의 0 (뾰족)
-    return 1.0 - eased * 0.97;
+    return hullBeamFactor(t);
   }
 
   /* 갑판의 세로 곡선(시어, sheer) — 선수 쪽으로 갈수록 갑판이 살짝 치솟는다 */
@@ -656,30 +727,32 @@ class SceneManager {
   }
 
   _buildUGV() {
-    // RC카(UGV) 표식 — 배 크기 대비 실제 축척에 맞게 작게 만든다 (RC카는 배보다 훨씬 작음).
-    // ⚠️ 로봇을 실제 축척 그대로 그리면(0.4m는 0.77m 배의 절반이나 됨) 배보다도
-    // 큰 판때기로 보여서, 시각적 크기는 원래 쓰던 고정 아이콘 크기를 그대로 쓰고
-    // base_link(회전 중심) 위치만 로봇 실측 "비율"(전체 길이 대비 회전축 위치)을
-    // 반영해서 자연스럽게 제자리 회전하도록 만든다.
+    // RC카(UGV) 표식 — 실제 축척 그대로 그리면(0.4m는 0.77m 배의 절반이나 됨) 배보다도
+    // 큰 판때기로 보이니, 실제 축척은 안 쓰고 고정된 "아이콘" 크기를 쓴다.
+    // 로봇 순찰 범위까지 다 보려고 카메라를 멀리 뺄 수 있게 해놔서(줌아웃 최대 110),
+    // 그 상태에서도 눈에 잘 띄도록 원래 아이콘 크기(0.5m)의 6배로 키웠다(3배 → 한 번 더 2배).
+    // base_link(회전 중심) 위치는 로봇 실측 "비율"(전체 길이 대비 회전축 위치)을
+    // 그대로 반영해서 자연스럽게 제자리 회전하도록 만든다.
     const g = new THREE.Group();
-    const VISUAL_LEN = 0.5;
-    const VISUAL_WIDTH = 0.34;
+    const VISUAL_LEN = 3.0;
+    const VISUAL_WIDTH = 2.0;
+    const BODY_H = 0.64;
     // base_link가 로봇 중심에서 앞으로 얼마나 떨어져 있는지를 "비율"로 계산해서
     // (뒤에서 0.069m / 전체 0.401m 기준), 고정 아이콘 크기에 그 비율만 적용한다.
     const baseLinkRatioFromCenter = (UGV_REAL_LENGTH_M / 2 - UGV_BASE_LINK_FROM_BACK_M) / (UGV_REAL_LENGTH_M / 2);
     const centerOffsetFromBaseLink = baseLinkRatioFromCenter * (VISUAL_LEN / 2);
     const body = new THREE.Mesh(
-      new THREE.BoxGeometry(VISUAL_WIDTH, 0.14, VISUAL_LEN),
-      new THREE.MeshStandardMaterial({ color: "#38bdf8", metalness: 0.4, roughness: 0.4, emissive: "#0c4a6e", emissiveIntensity: 0.4 })
+      new THREE.BoxGeometry(VISUAL_WIDTH, BODY_H, VISUAL_LEN),
+      new THREE.MeshStandardMaterial({ color: "#38bdf8", metalness: 0.4, roughness: 0.4, emissive: "#0c4a6e", emissiveIntensity: 0.5 })
     );
-    body.position.set(0, 0.14, centerOffsetFromBaseLink); body.castShadow = true;
+    body.position.set(0, BODY_H, centerOffsetFromBaseLink); body.castShadow = true;
     g.add(body);
     const cam = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.05, 0.05, 0.08, 12),
+      new THREE.CylinderGeometry(0.3, 0.3, 0.48, 12),
       new THREE.MeshStandardMaterial({ color: "#0ea5e9" })
     );
     cam.rotation.x = Math.PI / 2;
-    cam.position.set(0, 0.22, centerOffsetFromBaseLink + VISUAL_LEN / 2 - 0.05);
+    cam.position.set(0, BODY_H + 0.48, centerOffsetFromBaseLink + VISUAL_LEN / 2 - 0.3);
     g.add(cam);
     this.ugv = g;
     this.ugvAngle = 0;
@@ -716,11 +789,33 @@ class SceneManager {
     const meta = CLASS_META[payload.cls];
     if (!meta) return;
     const color = new THREE.Color(SEV_COLOR[meta.severity]);
-    const pos = serverToWorld(payload.blockId, payload.local);
+    // payload.onShip === false면 배 밖(작업장) 실좌표를 직접 받은 것 — 배 위 구획
+    // 좌표계(serverToWorld)로 계산하면 안 되고, UGV처럼 야드 바닥 높이에 그대로 찍는다.
+    // (onShip이 없는 옛날 방식 payload/모의 이벤트는 그냥 true로 취급해서 기존과 동일하게 동작)
+    const isOnShip = payload.onShip !== false;
+    const YARD_PING_Y = 0.5; // 야드 바닥에서 핑이 뜨는 높이(UGV 몸체 높이와 비슷한 정도)
+    const pos = isOnShip
+      ? serverToWorld(payload.blockId, payload.local)
+      : new THREE.Vector3(payload.worldX ?? 0, YARD_PING_Y, payload.worldZ ?? 0);
+    const isDanger = meta.severity === SEVERITY.DANGER;
+
+    // 디버깅용 — 핑이 "실제로 만들어지는지" / "어디 좌표에 찍히는지"를 콘솔에서 바로 확인할 수 있게.
+    // 화면에 아무것도 안 보이는데 이 로그도 안 뜨면 spawnPing 자체가 호출이 안 된 것이고,
+    // 로그는 뜨는데 화면엔 안 보이면 좌표나 카메라 쪽 문제다.
+    console.log(`[Ping] spawnPing 호출됨 — cls=${payload.cls} blockId=${payload.blockId} onShip=${isOnShip}`, {
+      local: payload.local, worldXZ: { x: payload.worldX, z: payload.worldZ },
+      worldPos: { x: pos.x, y: pos.y, z: pos.z }, cameraRadius: this.radius,
+    });
+
+    // DANGER(화재/사고)는 카메라를 멀리 뺐을 때도(순찰 반경까지 보려고 줌아웃 범위를 넓혀둬서)
+    // 놓치지 않도록 WARN보다 눈에 띄게 크게 그린다.
+    const coreR = isDanger ? 0.55 : 0.22;
+    const ringR = isDanger ? [0.62, 0.92] : [0.25, 0.34];
+    const poleH = isDanger ? 3.6 : 2.2;
 
     // 코어 스피어
     const core = new THREE.Mesh(
-      new THREE.SphereGeometry(0.22, 16, 16),
+      new THREE.SphereGeometry(coreR, 16, 16),
       new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.95 })
     );
     core.position.copy(pos);
@@ -728,7 +823,7 @@ class SceneManager {
 
     // 확산 링
     const ring = new THREE.Mesh(
-      new THREE.RingGeometry(0.25, 0.34, 32),
+      new THREE.RingGeometry(ringR[0], ringR[1], 32),
       new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, side: THREE.DoubleSide })
     );
     ring.position.copy(pos);
@@ -738,15 +833,15 @@ class SceneManager {
     // 위험 라벨 폴(수직선)
     const poleMat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.6 });
     const poleGeo = new THREE.BufferGeometry().setFromPoints([
-      pos.clone(), pos.clone().setY(pos.y + 2.2),
+      pos.clone(), pos.clone().setY(pos.y + poleH),
     ]);
     const pole = new THREE.Line(poleGeo, poleMat);
     this.scene.add(pole);
 
-    // DANGER(화재/사고)는 시간이 지나도 자동으로 안 사라진다 — 핑 수명은 이제 프론트가
-    // 타이머로 정하지 않고 젯슨이 관리한다: 로봇이 그 자리를 다시 지나가서 "이제 없다"고
-    // 확인해줄 때(event_cleared) 지운다. 관제사가 확인 버튼/ESC를 누르면 그때도 즉시 지운다
-    // (사람이 직접 처리했다고 판단한 경우를 위한 보조 수단, clearBlockPing).
+    // DANGER(화재/사고)는 시간이 지나도 자동으로 안 사라진다 — 핑 수명은 프론트가 타이머로
+    // 정하지 않고 젯슨이 관리한다: 로봇이 그 자리를 다시 지나가서 "이제 없다"고 확인해줄
+    // 때(event_cleared)만 지운다. 관제사가 확인 버튼/ESC를 눌러도(event_ack) 핑은 안 지워짐 —
+    // 확인은 "봤다/순찰 재개해라"일 뿐, 위험물이 실제로 없어졌다는 뜻은 아니라서.
     // WARN(안전모 미착용/선박 결함)은 기존처럼 잠깐 떴다가 자동으로 사라진다.
     const persistent = meta.severity === SEVERITY.DANGER;
     const ttl = persistent ? Infinity : 5500;
@@ -779,8 +874,9 @@ class SceneManager {
     }
   }
 
-  // 관제사가 "확인"(버튼 또는 ESC)을 눌렀을 때 호출 — 해당 구획에 남아있던
-  // DANGER 핑(들)을 화면에서 지우고, 블록의 빨간 강조도 원래대로 되돌린다.
+  // 관제사가 팝업의 "핑 직접 지우기"를 눌렀을 때 호출 — 서버에 아무것도 보내지 않고
+  // 화면에서만 그 구획의 지속 핑을 지운다(사람이 눈으로 보고 이미 처리됐다고 판단한 경우용).
+  // 백엔드가 나중에 event_cleared를 보내도 이미 지워진 핑이라 그냥 "못 찾음" 경고만 뜨고 끝난다.
   clearBlockPing(blockId) {
     this.pings = this.pings.filter((p) => {
       if (p.blockId !== blockId || !p.persistent) return true;
@@ -1190,7 +1286,7 @@ function LivePanel({ ugvBlock, warnEvent, onExpand }) {
 
 /* 확대 팝업 — 위험(빨강) 자동 송출 + 클릭 시 표시 공용.
  * ESC 키로도 닫을 수 있게 한다 (X 버튼 클릭 없이 키보드로 종료). */
-function CctvPopup({ block, event, auto, onClose, onAck }) {
+function CctvPopup({ block, event, auto, onClose, onAck, onClearPing }) {
   const cvRef = useRef(null);
   const isDirect = USE_REAL_VIDEO && VIDEO_MODE === "direct";
   useCctvCanvas(cvRef, !!block && !isDirect, event, block ? block.name : "");
@@ -1210,6 +1306,9 @@ function CctvPopup({ block, event, auto, onClose, onAck }) {
 
   if (!block) return null;
   const meta = event ? CLASS_META[event.cls] : null;
+  // 화면에 계속 남아있는 핑(DANGER)이 있는 팝업일 때만 "핑 지우기" 버튼을 보여준다 —
+  // WARN처럼 알아서 사라지는 핑이거나 애초에 활성 이벤트가 없으면 지울 게 없으니 표시 안 함.
+  const canClearPing = !!(onClearPing && meta && meta.severity === SEVERITY.DANGER);
   return (
     <div className="popup-backdrop" onClick={onClose}>
       <div className={`popup ${auto ? "popup-auto" : ""}`} onClick={(e) => e.stopPropagation()}>
@@ -1241,11 +1340,18 @@ function CctvPopup({ block, event, auto, onClose, onAck }) {
             <div><span className="k">상태</span><span className="v">정상 — 활성 경보 없음</span></div>
           )}
         </div>
-        {onAck && (
+        {(onAck || canClearPing) && (
           <div className="popup-actions">
-            <button type="button" className="popup-ack-btn" onClick={onAck}>
-              확인 — 위험 확인, 순찰 재개
-            </button>
+            {onAck && (
+              <button type="button" className="popup-ack-btn" onClick={onAck}>
+                확인 — 위험 확인, 순찰 재개
+              </button>
+            )}
+            {canClearPing && (
+              <button type="button" className="popup-clear-btn" onClick={onClearPing}>
+                🗑 핑 직접 지우기 (화면에서만 제거)
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -1481,16 +1587,22 @@ export default function ShipyardTwinDashboard() {
         const meta = CLASS_META[type];
         if (!meta) return; // stream_boost 등 프론트가 보내는 종류가 되돌아오면 무시
 
-        const conv = mapXYToBlockLocal(data.map_xy ?? null, shipPoseRef.current);
+        // 배 위(구획 안)인지 배 밖(작업장)인지 먼저 판단 — 배 밖인 화재를 억지로
+        // 구획에 눌러 붙이면 "화재가 배에서 떨어져 있는데 배 위에 핑이 찍힌다"가 된다.
+        const conv = mapXYToPingWorld(data.map_xy ?? null, shipPoseRef.current);
         const blockId = conv?.blockId ?? shipPoseRef.current?.block_id ?? BLOCKS[0].id;
-        const local = conv?.local ?? { x: 0.5, y: 0.6, z: 0.5 };
 
         handleDetectionEvent({
           id: `evt_${Date.now()}_${Math.floor(Math.random() * 1e4)}`,
           ts: Date.now(),
           cls: type,
           blockId,
-          local,
+          // 배 위면 구획 기준 로컬 좌표, 배 밖이면 야드 월드 좌표를 직접 넘긴다 —
+          // spawnPing이 onShip 값을 보고 둘 중 알맞은 쪽으로 위치를 계산한다.
+          onShip: conv?.onShip ?? true,
+          local: conv?.onShip ? conv.local : { x: 0.5, y: 0.6, z: 0.5 },
+          worldX: conv && conv.onShip === false ? conv.worldX : null,
+          worldZ: conv && conv.onShip === false ? conv.worldZ : null,
           conf: data.confidence ?? 0,
           eventId: data.event_id ?? null, // 젯슨이 만든 고유 id — 나중에 event_cleared로 이 핑만 콕 집어 지울 때 씀
         });
@@ -1530,17 +1642,24 @@ export default function ShipyardTwinDashboard() {
   // {"event_type":"event_ack"} 한 줄만 보내고 팝업을 닫는다. 새 연결/새 API 없음.
   // 응답은 안 기다림 — 서버가 젯슨으로 전달, 젯슨이 Nav2에 순찰 재개 신호를 보냄(백엔드 완료).
   // 위험물이 안 치워졌으면 다음 바퀴(~40초 후)에 팝업이 다시 뜨는 게 의도된 동작.
+  // "확인"은 오직 event_ack만 보내고 팝업만 닫는다 — 화면의 핑/구획 강조/
+  // "확인 대기중" 기록은 여기서 건드리지 않는다. 그 위험이 실제로 없어졌는지는
+  // 로봇이 다시 가서 눈으로 확인해야 아는 거라서, 핑을 지우는 건 오직 젯슨이
+  // 보내는 event_cleared뿐이다(관제사가 확인 버튼을 눌렀다고 위험이 사라진 건 아니니까).
   const handleAck = () => {
     wsControlRef.current?.send?.({ event_type: "event_ack" });
     console.log("[이벤트 채널] event_ack 전송");
-    // 확인했으니 이 구획의 "확인 대기중" 위험 이벤트 기록도 지운다 —
-    // 안 지우면 나중에 이 블록을 다시 클릭했을 때 이미 처리된 옛날 이벤트로
-    // 확인 버튼이 또 뜨게 된다.
+    closePopup();
+  };
+
+  // 팝업의 "핑 직접 지우기" 버튼 — event_ack과 달리 서버에 아무것도 안 보낸다.
+  // 관제사가 화면(영상)으로 봤을 때 이미 처리된 게 확실하다고 판단해서 직접 지우는
+  // 용도. 젯슨의 event_cleared를 기다리지 않고 화면에서만 즉시 없앤다.
+  const handleClearPing = () => {
     if (activeBlock) {
       const next = { ...dangerByBlockRef.current };
       delete next[activeBlock.id];
       dangerByBlockRef.current = next;
-      // 화면에 계속 남아있던 위험 핑(화재/사고 표시)도 확인한 지금 지운다.
       if (sceneRef.current) sceneRef.current.clearBlockPing(activeBlock.id);
     }
     closePopup();
@@ -1655,6 +1774,7 @@ export default function ShipyardTwinDashboard() {
         auto={autoPopup}
         onClose={closePopup}
         onAck={handleAck}
+        onClearPing={handleClearPing}
       />
     </div>
   );
@@ -1805,13 +1925,19 @@ const CSS = `
 .popup-meta > div { display:flex; justify-content:space-between; font-size:12px; border-bottom:1px solid #161f2e; padding-bottom:7px; }
 .popup-meta .k { color:#7d8aa3; }
 .popup-meta .v { color:#e6edf6; font-weight:600; }
-.popup-actions { padding:0 16px 16px; }
+.popup-actions { padding:0 16px 16px; display:flex; flex-direction:column; gap:8px; }
 .popup-ack-btn {
   width:100%; padding:12px; border-radius:9px; border:1px solid #2dd4bf;
   background:rgba(45,212,191,.12); color:#2dd4bf; font-size:13px; font-weight:700;
   letter-spacing:.3px; cursor:pointer; transition:background .15s ease;
 }
 .popup-ack-btn:hover { background:rgba(45,212,191,.22); }
+.popup-clear-btn {
+  width:100%; padding:10px; border-radius:9px; border:1px solid #4b5768;
+  background:rgba(75,87,104,.15); color:#9aa7bc; font-size:12px; font-weight:600;
+  letter-spacing:.2px; cursor:pointer; transition:background .15s ease, color .15s ease;
+}
+.popup-clear-btn:hover { background:rgba(75,87,104,.3); color:#e6edf6; }
 
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.25} }
 @keyframes fade { from{opacity:0} to{opacity:1} }
