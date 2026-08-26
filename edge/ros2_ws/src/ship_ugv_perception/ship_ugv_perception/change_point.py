@@ -27,35 +27,43 @@ from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs  # noqa: F401  (PointStamped 변환을 위해 필요한 등록)
 
 
-def clear_verdict(dist_m, range_entered_at_s, last_seen_s, now_s,
-                  clear_radius_m, clear_watch_s, has_left_once):
-    """이벤트 클리어 상태기계의 순수 핵심부. ROS 없이 검증하려고 뽑아냈다.
+def clear_verdict(dist_m, last_seen_s, now_s,
+                  clear_radius_m, clear_watch_s, first_seen_s, min_age_s):
+    """치워짐 판정의 순수 핵심부. ROS 없이 검증하려고 뽑아냈다.
 
-    반환: (verdict, 다음 range_entered_at_s, 다음 has_left_once)
-      'reset' — 반경 밖. 다음 방문을 위해 range_entered_at 을 지운다.
-      'wait'  — 아직 판정 시간이 안 됐거나, 이번 방문 중 다시 보였거나,
-                애초에 판정을 시작할 자격이 안 된다.
-      'clear' — 확정. 자리를 한 번 떠났다가 다시 들어와 지켜봤는데 없었다.
+    반환: 'clear' 또는 'wait'.
 
-    ★ has_left_once 가 왜 필요한가 (2026-08-22 실측 사고로 발견) ★
-    불을 처음 발견해서 **정지한 그 순간부터 이미 반경 안**이다. 로봇이
-    자리를 뜬 적이 한 번도 없는데 판정 시계가 그냥 시작해버리면, 정지-확인
-    사이에 흐른 몇 초만으로 "재방문했는데 없다"고 오판해 방금 막 보고한
-    이벤트를 곧장 지워버린다(프론트 핑이 반짝하고 꺼지는 것으로 관측됨).
-    그래서 **반경을 한 번이라도 벗어난 적이 있어야만** 그다음 재진입을
-    "재방문"으로 인정하고 시계를 켠다.
+    판정은 딱 세 가지만 본다:
+      · 로봇이 판정할 만큼 가까운가        (dist_m <= clear_radius_m)
+      · 이벤트가 판정할 만큼 늙었는가      (now - first_seen >= min_age_s)
+      · 마지막으로 본 지 충분히 지났는가   (now - last_seen >= clear_watch_s)
+
+    ★ 왜 이렇게 단순해졌나 (2026-08-24) ★
+    예전에는 range_entered_at("이번 관찰을 언제 시작했나")을 따로 들고
+    다니며 last_seen 과 비교했다. 그런데 그 값은 **한 번 켜지면 다시
+    켜지지 않아서**, 그 뒤로 검출이 한 번이라도 있으면
+    last_seen >= range_entered_at 이 영원히 참이 되어 clear 가 절대
+    발동하지 못했다(실측: 불을 치워도 cleared 가 안 나감). 유일한 재무장
+    경로가 "FOV 이탈 시 리셋"이었는데 그건 헤딩 오차에 따라 불규칙해서
+    clear_watch_s 를 채우지 못했다.
+
+    "마지막으로 본 지 얼마나 됐나"만 보면 재무장이 필요 없다. 불이
+    그대로 있으면 검출될 때마다 last_seen 이 갱신돼 판정이 계속 밀리고,
+    치우면 갱신이 멈춰 자연히 시간이 쌓인다. 배에 가려 안 보이는
+    구간(실측 약 30초)은 clear_watch_s(60초)보다 짧아 그대로 넘어간다.
+
+    그 이전에 쓰던 has_left_once("반경을 한 번은 벗어나야 판정 시작")도
+    같은 이유로 걷어냈다. 그 조건은 순찰 기하에 의존해서, 반지름 1.00 에
+    불이 중심 0.30m 면 로봇~불 거리가 0.70~1.30m 라 clear_radius 2.0 을
+    영영 못 벗어나 clear 가 아예 발동 못 했다.
     """
     if dist_m > clear_radius_m:
-        return 'reset', None, True   # 벗어났다 -> 이제부터는 재방문 자격 있음
-    if not has_left_once:
-        return 'wait', range_entered_at_s, has_left_once   # 아직 첫 방문 중
-    if range_entered_at_s is None:
-        return 'wait', now_s, has_left_once
-    if (now_s - range_entered_at_s) < clear_watch_s:
-        return 'wait', range_entered_at_s, has_left_once
-    if last_seen_s >= range_entered_at_s:
-        return 'wait', range_entered_at_s, has_left_once
-    return 'clear', range_entered_at_s, has_left_once
+        return 'wait'
+    if (now_s - first_seen_s) < min_age_s:
+        return 'wait'
+    if (now_s - last_seen_s) < clear_watch_s:
+        return 'wait'
+    return 'clear'
 
 
 def quat_to_yaw(x, y, z, w):
@@ -160,11 +168,51 @@ class ChangePointDetector(Node):
         #   반경 안에서 몇 초는 재검출 없이 지나갈 수 있다), 데모 시간
         #   내에는 거의 안 걸릴 정도로 늘린다.
         self.declare_parameter('clear_radius_m', 2.0)    # 이 반경 안이면 "지나간다"로 본다
-        self.declare_parameter('clear_watch_s', 15.0)    # 그 안에서 이만큼 재감지가 없으면 지운다
+        #   ★ 2026-08-24 4차 (실측으로 결론). 5초로 줄였더니 한 바퀴마다
+        #   오판이 났다. 원인은 **배가 불을 가리는 시간**이다:
+        #       20:53:40 검출 끊김(배 뒤로 들어감) -> 20:54:10 재개
+        #       = 가림 구간 약 30초, 한 바퀴 약 50초
+        #   in_camera_fov 는 각도만 보므로 가림을 모른다. 가림과 진짜
+        #   없어짐은 **더 긴 시간으로만** 구분된다 — 가려진 것은 다음
+        #   바퀴에 반드시 다시 보이고, 치운 것은 영영 안 보인다.
+        #   그래서 실측 가림 시간(30초)의 2배인 60초로 잡는다.
+        #   대가: 불을 진짜 치웠을 때 핑이 사라지기까지 최대 1분쯤 걸린다.
+        #   그 대신 "가려졌다고 핑이 깜빡 사라지는" 일이 없어진다.
+        self.declare_parameter('clear_watch_s', 60.0)    # 그 안에서 이만큼 재감지가 없으면 지운다
         # ★ 2026-08-24: confidence 필터가 아예 없어서 저신뢰도(실측 0.468)
         #   한 프레임짜리 오탐도 그대로 새 이벤트로 등록 -> 불필요한 정지를
         #   유발했다. websocket_client 가 이미 쓰는 기준(0.5)과 맞춘다.
         self.declare_parameter('min_confidence', 0.5)
+        # ★ 2026-08-24: depth 상한이 아예 없어서 쓰레기 depth 가 그대로
+        #   map 좌표로 투영되고 있었다. 실측(21:42):
+        #       로봇(-0.78,-0.42) -> 불 추정(+5.13,-2.52), 계산상 6.27m
+        #       맵 경계가 x:-4.60~4.95 인데 x=5.13 은 맵 밖이다.
+        #   같은 시간대 로봇 위치(ekf_global)는 18개 샘플 전부 순찰중심에서
+        #   0.93~1.14m 로 궤도에 정확히 붙어 있었다 — 즉 로컬라이제이션은
+        #   멀쩡하고, YOLO 가 멀리 있는 무언가를 fire 로 잡아(conf 0.64~0.93)
+        #   ROI 중앙값 depth 가 5~6m 로 나온 것이 원인이다.
+        #   event_gate_node 는 max_trigger_depth_m=2.5 가 있어 정지는 안
+        #   했지만, 프론트·DB 로는 다 나가 맵 전체에 유령 핑이 찍혔다.
+        #   순찰 반지름 1.0 + 불이 배 위(중심에서 ~0.4m)면 로봇~불 거리는
+        #   0.6~1.4m 다. 2.5m 면 넉넉하고, event_gate_node 와 같은 값이라
+        #   "정지는 안 하는데 핑만 찍히는" 불일치도 사라진다.
+        #   ★ 2026-08-24 2차: 2.5m 도 헐거웠다. 실측:
+        #       22:07:32  로봇(-0.31,-1.87) -> 불 추정(+0.56,+0.52)  2.55m
+        #       22:08:18  로봇(+0.33,-1.96) -> 불 추정(-0.35,+0.54)  2.59m
+        #     로봇이 방 아래쪽에서 위쪽을 보며 2.5m 거리의 무언가를 fire 로
+        #     오검출해 2.5m 상한을 아슬아슬하게 통과했다.
+        #   진짜 불은 배 위에 있다. 로봇~불 거리의 상한은
+        #       순찰 반지름(1.0) + 불이 배 중심에서 떨어진 거리
+        #   이고, 불을 배 중심에서 1.0m 까지 옮긴다 해도 2.0m 다.
+        #   그래서 2.0 으로 조인다. 순찰 반지름을 키우거나 불을 배에서 더
+        #   멀리 두고 시험하려면 이 값도 같이 올려야 한다.
+        self.declare_parameter('max_depth_m', 2.0)
+        # ★ 2026-08-24: 이벤트가 생긴 지 이만큼은 지나야 클리어 판정 대상이
+        #   된다. 예전의 has_left_once(순찰 기하에 의존해 영영 발동 못 하던
+        #   조건)를 대체한다 — clear_verdict 주석 참고.
+        #   30초는 clear_watch_s 와 합쳐 체감 30~45초가 되어 너무 길었다.
+        #   10초면 정지-확인 순간을 덮으면서 체감 지연은 최대 15초다.
+        self.declare_parameter('min_event_age_s', 10.0)
         self.declare_parameter('clear_check_hz', 2.0)
 
         self.map_frame = self.get_parameter('map_frame_id').value
@@ -185,6 +233,8 @@ class ChangePointDetector(Node):
         self.clear_radius = self.get_parameter('clear_radius_m').value
         self.clear_watch = Duration(seconds=self.get_parameter('clear_watch_s').value)
         self.min_confidence = self.get_parameter('min_confidence').value
+        self.min_event_age = self.get_parameter('min_event_age_s').value
+        self.max_depth = self.get_parameter('max_depth_m').value
 
         # ★ 2차 필터: 이미 보고한 이벤트 기록
         # 각 항목: {'class_id': str, 'x': float, 'y': float, 'last_seen': rclpy.time.Time}
@@ -230,17 +280,19 @@ class ChangePointDetector(Node):
 
     # ------------------------------------------------------------------
     def _check_clear(self):
-        """이미 보고한 이벤트 자리를 로봇이 **다시 지나가며** 지켜본다.
+        """이미 보고한 이벤트 자리를 지켜보다가, 안 보인 지 clear_watch_s
+        이상 지나면 "치워졌다"고 알린다.
 
-        clear_radius 를 한 번이라도 벗어난 적이 있는 이벤트에 한해서만,
-        재진입 후 clear_watch 이상 지켜봤는데 재검출이 없으면 "치워졌다"고
-        알린다. 벗어난 적이 아직 없으면(막 보고돼서 로봇이 그 옆에 서 있는
-        중이면) 판정을 시작하지 않는다 — 그렇지 않으면 정지-확인 사이 몇
-        초만으로 방금 보고한 이벤트를 "재방문했는데 없다"고 오판해 곧장
-        지워버린다(2026-08-22 실측: 프론트 핑이 반짝하고 꺼짐).
+        판정 조건은 clear_verdict 참고. 여기서는 그 앞에 두 가지 게이트를
+        더 둔다:
+          · 카메라가 실제로 그 방향을 보고 있을 때만 판정한다
+            (in_camera_fov — 등 돌린 채 "안 보이네"라고 하면 안 된다)
+          · 판정이 나면 목록에서 지운다. 같은 자리에 나중에 새로 불을
+            놓으면 완전히 새 이벤트로 다시 보고돼야 하기 때문이다.
 
-        치워진 이벤트는 목록에서 지운다. 같은 자리에 나중에 새로 불이 나면
-        (모형을 다시 놓으면) 완전히 새 이벤트로 다시 보고돼야 하기 때문이다.
+        ★ in_camera_fov 는 각도만 본다 — 배에 가려 안 보이는 것(occlusion)은
+        모른다. 그래서 가림 구간(실측 약 30초)을 clear_watch_s(60초)로
+        덮는다. 자세한 근거는 docs/이벤트_중복제거_튜닝.md 참고.
         """
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -259,34 +311,20 @@ class ChangePointDetector(Node):
         for ev in self.reported_events:
             dist = math.hypot(rx - ev['x'], ry - ev['y'])
 
-            # ★ 2026-08-24 (주현 진단): 반경 안이어도 카메라가 실제로 이
-            #   방향을 보고 있지 않으면 "지켜봤는데 없었다"로 셀 수 없다.
-            #   이번 틱은 정보 없음으로 보고 state 를 그대로 둔다(진행도
-            #   되돌리기도 안 함) — clear_verdict 자체는 순수함수로 두고
-            #   호출 여부만 게이트한다.
-            if dist <= self.clear_radius and not in_camera_fov(
-                    robot_yaw, self.cam_yaw, self.hfov, rx, ry, ev['x'], ev['y']):
+            if not in_camera_fov(robot_yaw, self.cam_yaw, self.hfov,
+                                 rx, ry, ev['x'], ev['y']):
                 survivors.append(ev)
                 continue
 
-            range_s = (ev['range_entered_at'].nanoseconds / 1e9
-                      if ev['range_entered_at'] is not None else None)
-            last_seen_s = ev['last_seen'].nanoseconds / 1e9
-
-            verdict, next_range_s, next_left = clear_verdict(
-                dist, range_s, last_seen_s, now_s,
-                self.clear_radius, clear_watch_s, ev['has_left_once'])
-
-            ev['range_entered_at'] = (
-                None if next_range_s is None
-                else (now if next_range_s == now_s else ev['range_entered_at']))
-            ev['has_left_once'] = next_left
+            verdict = clear_verdict(
+                dist, ev['last_seen'].nanoseconds / 1e9, now_s,
+                self.clear_radius, clear_watch_s,
+                ev['first_seen'].nanoseconds / 1e9, self.min_event_age)
 
             if verdict != 'clear':
                 survivors.append(ev)
                 continue
 
-            # ★ 확정: 이번 방문 동안 한 번도 안 잡혔다 — 치워졌다.
             out = {
                 'class_id': ev['class_id'],
                 'event_id': ev['event_id'],
@@ -297,7 +335,7 @@ class ChangePointDetector(Node):
             self.clear_pub.publish(msg)
             self.get_logger().info(
                 f"[{ev['class_id']}] 치워짐 확인 — event_id={ev['event_id']} "
-                f"({now_s - range_s:.1f}초 지켜봄, 재검출 없음)")
+                f"(안 보인 지 {now_s - ev['last_seen'].nanoseconds/1e9:.0f}초)")
             # survivors 에 안 넣는다 -> 목록에서 제거됨
 
         self.reported_events = survivors
@@ -317,6 +355,12 @@ class ChangePointDetector(Node):
 
         if depth <= 0.0:
             self.get_logger().debug("depth<=0, 무효 감지 스킵")
+            return
+
+        if depth > self.max_depth:
+            self.get_logger().debug(
+                f"[{class_id}] depth {depth:.2f}m > {self.max_depth}m — "
+                f"쓰레기 depth 로 보고 버린다")
             return
 
         # ★ 2026-08-24: confidence 필터. 실측 0.468짜리 한 프레임 오탐이
@@ -404,8 +448,7 @@ class ChangePointDetector(Node):
             'x': map_x,
             'y': map_y,
             'last_seen': now,
-            'range_entered_at': None,   # _check_clear 가 쓴다
-            'has_left_once': False,     # 처음엔 아직 반경을 벗어난 적이 없다
+            'first_seen': now,          # min_event_age_s 판정용
         })
 
         position_uncertainty_m = self._estimate_position_uncertainty()
