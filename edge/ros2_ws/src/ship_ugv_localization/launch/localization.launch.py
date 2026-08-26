@@ -41,11 +41,27 @@ def _check_yolo_freshness():
 
     반환: (mark, text) — 배너 한 줄로 쓸 표시와 설명.
     """
-    src = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-        'ship_ugv_perception', 'ship_ugv_perception', 'yolo_depth_publisher.py')
-    if not os.path.exists(src):
-        return '❔', '소스를 못 찾음 — 확인 생략'
+    # ★ realpath 로 심볼릭 링크를 먼저 푼다.
+    #   ros2 launch 로 실행하면 __file__ 은 install/ 쪽 경로다:
+    #       install/ship_ugv_localization/share/ship_ugv_localization/launch/...
+    #   colcon --symlink-install 이라 그 파일은 src/ 를 가리키는 심볼릭 링크인데,
+    #   abspath 는 링크를 풀지 않아 install/ 밑에서 소스를 찾다가 실패했다.
+    #   (src/ 에서 직접 돌린 테스트만 해서 못 잡았다 — 2026-08-26)
+    here = os.path.realpath(__file__)
+    rel = os.path.join('ship_ugv_perception', 'ship_ugv_perception',
+                       'yolo_depth_publisher.py')
+    src = None
+    d = os.path.dirname(here)
+    for _ in range(6):          # launch -> 패키지 -> src -> ... 위로 훑는다
+        for cand in (os.path.join(d, rel), os.path.join(d, 'src', rel)):
+            if os.path.exists(cand):
+                src = cand
+                break
+        if src:
+            break
+        d = os.path.dirname(d)
+    if src is None:
+        return '❔', '소스를 못 찾음 — 확인 생략 (경로 구조가 바뀌었는지 볼 것)'
 
     # 래퍼(ros2 run)가 아니라 실제 노드 프로세스를 찾는다.
     r = subprocess.run(['pgrep', '-f', 'lib/ship_ugv_perception/yolo_depth_publisher'],
