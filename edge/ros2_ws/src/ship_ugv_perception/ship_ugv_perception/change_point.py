@@ -34,58 +34,39 @@ def angle_diff(a, b):
 
 def clear_verdict(dist_to_vantage_m, yaw_diff_rad, last_seen_s, now_s,
                   revisit_radius_m, revisit_yaw_tol_rad, revisit_grace_s,
-                  left_vantage, arrived_at_s):
-    """치워짐 판정의 순수 핵심부. ROS 없이 검증하려고 뽑아냈다.
+                  left_vantage, arrived_at_s, event_in_fov, fov_seen_s, dt_s):
+    """치워졌는지 판정. 반환 (verdict, left_vantage, arrived_at_s, fov_seen_s).
 
-    반환: (verdict, 다음 left_vantage, 다음 arrived_at_s)
+    ★ 2026-08-27 실측 사고: "구역 안에 머문 시간" 으로 세면 안 된다.
+      로봇은 불을 **지나친 뒤에** 멈춘다(정지까지 1초쯤 걸린다). 그 자리에서
+      카메라(우측 고정)는 불을 안 보는 쪽을 향하고 있는데, 사용자가 팝업
+      확인을 누를 때까지 10초쯤 서 있는다. 그러면 grace 3초가 그냥 채워져
+      "지켜봤는데 안 보임" 이 성립하고, 불이 멀쩡히 있는데 핑이 지워졌다.
+      지워지면 목록에서도 빠지므로 다음 검출이 **새 이벤트로 재등록되어
+      로봇이 또 멈춘다** — 실측: 등록 02:32:50 -> 치워짐 02:33:03(13초)
+      -> 5cm 옆에 재등록 02:33:04 + 재정지. 사용자는 손도 안 댔다.
 
-    ★ 기준이 "로봇 자신의 위치"인 이유 ★
-    그 불을 처음 검출한 순간의 로봇 위치에서는 불이 분명히 보였다(그래서
-    검출됐다). 순찰 원 중심에 배가 있어 반대편에서는 배가 불을 가리는데
-    (실측 약 30초), 시간만 보는 방식은 그 가림을 오판하지 않으려 60초를
-    기다려야 했고 최악 2.2바퀴가 걸렸다. 위치를 쓰면 그 추측이 없어진다.
-
-    ★ 판정을 "구역을 빠져나가는 순간"에 하는 이유 (2026-08-27 실측 사고) ★
-    처음에는 "도착 후 revisit_grace_s 동안 못 보면 확정" 이었다. 그런데
-    seen_from 은 **불이 막 보이기 시작한 경계**다 — 그 직전까지는 배에
-    가려 안 보이던 자리다. 돌아와서 반경 0.35m 안에 들어와도 그 0.35m 가
-    아직 안 보이는 쪽일 수 있고, 거기서 3초를 세면 당연히 못 본다:
-
-        01:09:23  fire@0.44,-0.87 등록 (정지)
-        01:11:31  마지막 검출
-        01:11:54  치워짐 판정      <- 불은 그대로 있었다
-        그 구간 confidence 0.88~0.94 (임계값 0.45 와 무관, 안 보였을 뿐)
-
-    그래서 머무는 동안에는 판정하지 않고, **구역을 벗어나는 순간** 이번
-    방문 전체를 돌아보고 판정한다. 로봇은 반경을 통과하는 전 구간
-    (0.35m 반경이면 약 0.7m, 0.126 m/s 로 약 5.5초) 동안 불을 볼 기회를
-    얻고, 그동안 한 번도 못 봤을 때만 치워진 것으로 본다.
-
-    revisit_grace_s 는 이제 "이번 방문이 유효한 통과였는지" 를 재는
-    최소 체류 시간이다. 모퉁이만 스치고 지나간 것을 한 번의 방문으로
-    치지 않기 위한 것.
-
-    left_vantage: 그 자리를 한 번은 벗어나야 "재방문" 으로 친다. 안 그러면
-    막 검출해 아직 그 자리에 서 있는 동안(정지-확인 대기 중) 지워버린다.
+      그래서 **카메라가 실제로 그 이벤트 방향을 향한 시간(fov_seen_s)** 만
+      센다. 등 돌리고 서 있는 시간은 0초로 친다. in_camera_fov() 는 예전에
+      이 목적으로 만들어 놓고도 **아무 데서도 부르지 않는 죽은 코드**였다.
     """
+    tick = dt_s if event_in_fov else 0.0
+
     if dist_to_vantage_m > revisit_radius_m:
         # 구역 밖 — 이번 방문이 끝난 시점이다. 여기서만 판정한다.
         if (left_vantage
                 and arrived_at_s is not None
-                and (now_s - arrived_at_s) >= revisit_grace_s   # 제대로 통과했고
-                and last_seen_s < arrived_at_s):                # 그동안 한 번도 못 봤다
-            return 'clear', True, None
-        return 'wait', True, None
-
+                and fov_seen_s >= revisit_grace_s
+                and last_seen_s < arrived_at_s):
+            return 'clear', True, None, 0.0
+        return 'wait', True, None, 0.0
     if not left_vantage:
-        return 'wait', left_vantage, None   # 아직 처음 그 자리에 머무는 중
+        return 'wait', left_vantage, None, 0.0
     if arrived_at_s is None:
-        # 방금 도착. 헤딩이 맞을 때만 "유효한 방문" 으로 보고 시계를 켠다
-        # (Nav2 복구 회전 중 우연히 스친 것을 방문으로 치지 않는다).
         if yaw_diff_rad > revisit_yaw_tol_rad:
-            return 'wait', left_vantage, None
-        return 'wait', left_vantage, now_s
-    return 'wait', left_vantage, arrived_at_s   # 머무는 동안은 판정하지 않는다
+            return 'wait', left_vantage, None, 0.0
+        return 'wait', left_vantage, now_s, tick
+    return 'wait', left_vantage, arrived_at_s, fov_seen_s + tick
 
 
 def quat_to_yaw(x, y, z, w):
@@ -249,7 +230,8 @@ class ChangePointDetector(Node):
         self.clear_pub = self.create_publisher(
             String, self.get_parameter('clear_topic').value, 10)
         clear_hz = max(0.1, self.get_parameter('clear_check_hz').value)
-        self.create_timer(1.0 / clear_hz, self._check_clear)
+        self._clear_dt = 1.0 / clear_hz
+        self.create_timer(self._clear_dt, self._check_clear)
 
         self.get_logger().info(
             "change_point_detector 시작: map->base_link TF 조회 기반 + "
@@ -307,12 +289,15 @@ class ChangePointDetector(Node):
             #     - cleared 가 안 나가 프론트 핑이 영영 안 지워진다.
             #   증상이 인지 문제처럼 보여서 원인을 두 번 놓쳤다.
             watched_since = ev['arrived_at']
-            verdict, ev['left_vantage'], ev['arrived_at'] = clear_verdict(
+            in_fov = in_camera_fov(robot_yaw, self.cam_yaw, self.hfov,
+                                   rx, ry, ev['x'], ev['y'])
+            verdict, ev['left_vantage'], ev['arrived_at'], ev['fov_seen'] = clear_verdict(
                 math.hypot(rx - ev['seen_from'][0], ry - ev['seen_from'][1]),
                 angle_diff(robot_yaw, ev['seen_yaw']),
                 ev['last_seen'].nanoseconds / 1e9, now_s,
                 self.revisit_radius, self.revisit_yaw_tol, self.revisit_grace,
-                ev['left_vantage'], ev['arrived_at'])
+                ev['left_vantage'], ev['arrived_at'],
+                in_fov, ev['fov_seen'], self._clear_dt)
 
             if verdict != 'clear':
                 survivors.append(ev)
@@ -328,6 +313,11 @@ class ChangePointDetector(Node):
             self.clear_pub.publish(msg)
             watched = ('%.1f초' % (now_s - watched_since)
                        if watched_since is not None else '(체류시간 불명)')
+            # 왜 지웠는지 숫자로 남긴다 — 오판이 나면 이 줄만 보면 된다
+            self.get_logger().info(
+                f"  근거: 카메라가 그쪽을 본 시간 {ev.get('fov_seen', 0.0):.1f}초"
+                f"(>={self.revisit_grace}초 필요), 구역 체류 {watched}, "
+                f"마지막 검출은 도착보다 {now_s - ev['last_seen'].nanoseconds/1e9:.1f}초 전")
             self.get_logger().info(
                 f"[{ev['class_id']}] 치워짐 확인 — event_id={ev['event_id']} "
                 f"(처음 본 자리로 돌아와 {watched} 지켜봤는데 안 보임)")
@@ -455,6 +445,7 @@ class ChangePointDetector(Node):
             'seen_yaw': robot_yaw,             # 그때 로봇이 보던 방향
             'left_vantage': False,             # 그 자리를 한 번 벗어났는지
             'arrived_at': None,                # 이번에 그 자리에 도착한 시각
+            'fov_seen': 0.0,                   # 이번 방문에서 카메라가 실제로 그쪽을 본 시간
         })
 
         position_uncertainty_m = self._estimate_position_uncertainty()

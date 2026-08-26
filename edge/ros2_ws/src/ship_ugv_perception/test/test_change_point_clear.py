@@ -41,8 +41,15 @@ def check(name, verdict, expected):
     print(f'  {name}: {verdict}  OK')
 
 
-def cv(dist, yawd=0.0, last_seen=0.0, now=100.0, left=True, arrived=None):
-    return clear_verdict(dist, yawd, last_seen, now, RV, YT, G, left, arrived)
+DT = 0.5   # clear_check_hz 2.0
+
+
+def cv(dist, yawd=0.0, last_seen=0.0, now=100.0, left=True, arrived=None,
+       in_fov=True, fov=99.0):
+    """기본은 '카메라가 계속 보고 있었다'(fov 충분). 그래야 예전 케이스가
+    그대로 성립하고, FOV 관련 케이스만 따로 값을 준다."""
+    return clear_verdict(dist, yawd, last_seen, now, RV, YT, G, left, arrived,
+                         in_fov, fov, DT)
 
 
 IN, OUT = 0.1, 1.0        # 구역 안 / 밖 거리
@@ -50,42 +57,44 @@ IN, OUT = 0.1, 1.0        # 구역 안 / 밖 거리
 
 if __name__ == '__main__':
     # 구역 밖 -> 판정 조건 안 맞으면 대기. 재방문 자격은 켜지고 시계는 접힌다
-    v, left, arr = cv(dist=OUT, left=False)
+    v, left, arr, _f = cv(dist=OUT, left=False)
     check('구역 밖 (첫 이탈)', v, 'wait')
     assert left is True and arr is None
 
     # ★ 사고 재현 ①: 막 검출해 아직 그 자리에 있다(정지-확인 대기) -> 지우면 안 됨
-    v, left, arr = cv(dist=IN, left=False)
+    v, left, arr, _f = cv(dist=IN, left=False)
     check('막 검출, 아직 그 자리', v, 'wait')
     assert left is False and arr is None
 
     # 한 바퀴 뒤 도착 -> 시계만 켜고 판정 안 함
-    v, left, arr = cv(dist=IN, now=100.0, left=True, arrived=None)
+    v, left, arr, _f = cv(dist=IN, now=100.0, left=True, arrived=None)
     check('도착 -> 시계만 켬', v, 'wait')
     assert arr == 100.0
 
     # ★ 사고 재현 ②(2026-08-27 실측): 도착 직후 3초가 지나도 **머무는 동안엔
     #   판정하지 않는다**. seen_from 은 "막 보이기 시작한 경계"라 도착 지점이
     #   아직 안 보이는 쪽일 수 있다 — 통과를 다 해봐야 안다.
-    v, _, arr = cv(dist=IN, last_seen=50.0, now=100.0 + G + 5, left=True, arrived=100.0)
+    v, _, arr, _f = cv(dist=IN, last_seen=50.0, now=100.0 + G + 5, left=True, arrived=100.0)
     check('머무는 중에는 판정 안 함', v, 'wait')
     assert arr == 100.0
 
     # 통과를 마치고 구역을 벗어나는 순간, 그동안 한 번도 못 봤으면 확정
-    v, left, arr = cv(dist=OUT, last_seen=50.0, now=100.0 + G + 1, left=True, arrived=100.0)
+    v, left, arr, _f = cv(dist=OUT, last_seen=50.0, now=100.0 + G + 1, left=True, arrived=100.0)
     check('통과 완료 + 한 번도 못 봄 -> 확정', v, 'clear')
     assert left is True and arr is None
 
     # 통과 중에 한 번이라도 봤으면 아직 있다
-    v, _, _ = cv(dist=OUT, last_seen=100.0 + 2, now=100.0 + G + 1, left=True, arrived=100.0)
+    v, _, _, _f = cv(dist=OUT, last_seen=100.0 + 2, now=100.0 + G + 1, left=True, arrived=100.0)
     check('통과 중 봤음 -> 아직 있다', v, 'wait')
 
-    # 모퉁이만 스치고 지나감(체류 < grace) -> 유효한 방문으로 안 침
-    v, _, _ = cv(dist=OUT, last_seen=50.0, now=100.0 + G - 1, left=True, arrived=100.0)
+    # 모퉁이만 스치고 지나감 -> 카메라가 그쪽을 본 시간이 grace 에 못 미친다.
+    # (체류 시간이 아니라 FOV 시간으로 가른다 — 사고 ⑦ 참고)
+    v, _, _, _f = cv(dist=OUT, last_seen=50.0, now=100.0 + G - 1, left=True,
+                     arrived=100.0, fov=G - 1)
     check('스치고 지나감 -> 판정 안 함', v, 'wait')
 
     # 도착했지만 헤딩이 어긋남 -> 유효한 방문으로 시작하지 않음
-    v, _, arr = cv(dist=IN, yawd=math.radians(90), now=100.0, left=True, arrived=None)
+    v, _, arr, _f = cv(dist=IN, yawd=math.radians(90), now=100.0, left=True, arrived=None)
     check('헤딩 어긋난 채 도착 -> 시계 안 켬', v, 'wait')
     assert arr is None
 
@@ -98,9 +107,9 @@ if __name__ == '__main__':
     #   여기서는 호출부가 하는 일을 그대로 흉내 내 회귀를 막는다.
     ev = {'left_vantage': True, 'arrived_at': 100.0}
     watched_since = ev['arrived_at']          # ★ 덮어쓰기 전에 붙잡아 둔다
-    verdict, ev['left_vantage'], ev['arrived_at'] = clear_verdict(
+    verdict, ev['left_vantage'], ev['arrived_at'], _ = clear_verdict(
         OUT, 0.0, 50.0, 100.0 + G + 1, RV, YT, G,
-        ev['left_vantage'], ev['arrived_at'])
+        ev['left_vantage'], ev['arrived_at'], True, 99.0, DT)
     assert verdict == 'clear'
     assert ev['arrived_at'] is None, 'clear 뒤엔 arrived_at 이 None 이어야 한다'
     # 예전 코드가 하던 계산 — 이게 죽음의 원인이었다
@@ -112,6 +121,27 @@ if __name__ == '__main__':
     # 고친 코드 — 붙잡아 둔 값을 쓰므로 안전
     assert abs((104.0 - watched_since) - 4.0) < 1e-9
     print('  clear 확정 시 arrived_at=None, 호출부는 붙잡아 둔 값을 씀  OK')
+
+    # ★ 사고 재현 ⑦(2026-08-27 실측): 로봇은 불을 **지나친 뒤에** 멈춘다.
+    #   그 자리에서 카메라(우측 고정)는 불을 안 보는 쪽을 향하는데, 사용자가
+    #   팝업 확인을 누를 때까지 10초쯤 서 있는다. 예전 코드는 "구역에 머문
+    #   시간" 으로 grace 를 세서, 등 돌린 채 서 있기만 해도 3초가 채워졌다.
+    #   실측: 등록 02:32:50 -> 치워짐 02:33:03(13초) -> 5cm 옆 재등록 +
+    #   재정지. 사용자는 불에 손도 안 댔다.
+    #   -> 카메라가 실제로 그쪽을 본 시간만 센다.
+    v, _, _, fov = cv(dist=IN, left=True, arrived=100.0, now=110.0,
+                      in_fov=False, fov=0.0)
+    check('등 돌린 채 서 있음 -> FOV 시간 안 쌓임', v, 'wait')
+    assert fov == 0.0, f'등 돌렸는데 {fov}초가 쌓였다'
+
+    v, _, _, _f = cv(dist=OUT, last_seen=50.0, now=100.0 + G + 5,
+                     left=True, arrived=100.0, fov=0.0)
+    check('등 돌린 채 통과 -> 치워짐 판정 안 함', v, 'wait')
+
+    # 카메라가 그쪽을 향하면 정상적으로 쌓인다
+    _v, _, _, fov = cv(dist=IN, left=True, arrived=100.0, in_fov=True, fov=1.0)
+    assert abs(fov - 1.5) < 1e-9, f'FOV 시간이 안 쌓인다: {fov}'
+    print('  카메라가 향한 동안만 FOV 시간이 쌓임  OK')
 
     # angle_diff 는 -pi~pi 로 감싼다
     assert abs(angle_diff(math.radians(350), math.radians(10)) - math.radians(20)) < 1e-9
