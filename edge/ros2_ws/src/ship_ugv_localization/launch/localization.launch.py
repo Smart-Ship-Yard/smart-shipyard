@@ -16,9 +16,67 @@ import sys
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 import subprocess
+import time
 
 from launch.actions import LogInfo
 from launch_ros.actions import Node
+
+
+def _check_yolo_freshness():
+    """YOLO(systemd)가 현재 소스보다 오래된 코드로 돌고 있으면 재시작한다.
+
+    ★ 왜 필요한가 (2026-08-26 실측 사고) ★
+    YOLO 는 이 launch 가 아니라 systemd 가 띄운다(아래 주석 참고). 그런데
+    파이썬은 프로세스를 시작할 때 코드를 한 번 읽고 끝이라, git pull +
+    colcon build 를 해도 **이미 돌고 있는 YOLO 는 옛 코드 그대로**다.
+    실제로 7시간 동안 팀원이 머지한 개선(클래스별 confidence, person crop)이
+    하나도 안 걸린 채 시험하고 있었고, 아무도 몰랐다. 파라미터가 없어서
+    ros2 param set 이 실패하고 나서야 발견했다.
+
+    그래서 여기서 "소스 수정 시각 > 프로세스 시작 시각" 이면 재시작한다.
+    - **최신이면 아무것도 안 한다** (매번 sudo 암호를 물으면 금방 안 쓰게 된다)
+    - 재시작이 필요할 때만 sudo 가 암호를 묻는다
+    - 실패해도 launch 를 죽이지 않는다. 크게 알리고 판단은 사람이 한다
+      (장치 확인 배너와 같은 철학)
+
+    반환: (mark, text) — 배너 한 줄로 쓸 표시와 설명.
+    """
+    src = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        'ship_ugv_perception', 'ship_ugv_perception', 'yolo_depth_publisher.py')
+    if not os.path.exists(src):
+        return '❔', '소스를 못 찾음 — 확인 생략'
+
+    # 래퍼(ros2 run)가 아니라 실제 노드 프로세스를 찾는다.
+    r = subprocess.run(['pgrep', '-f', 'lib/ship_ugv_perception/yolo_depth_publisher'],
+                       capture_output=True, text=True)
+    pids = [x for x in r.stdout.split() if x.isdigit()]
+    if not pids:
+        return '❌', 'YOLO 가 안 떠 있음 — sudo systemctl start yolo-depth-publisher'
+
+    try:
+        # /proc/<pid> 디렉터리의 mtime 이 곧 프로세스 시작 시각이다.
+        started = os.path.getmtime('/proc/' + pids[0])
+    except OSError:
+        return '❔', '프로세스 시작 시각을 못 읽음 — 확인 생략'
+
+    src_mtime = os.path.getmtime(src)
+    if src_mtime <= started:
+        return '✅', '소스와 실행본 일치'
+
+    fmt = '%H:%M:%S'
+    old = time.strftime(fmt, time.localtime(started))
+    new = time.strftime(fmt, time.localtime(src_mtime))
+    print(f'\n⚠️  YOLO 가 옛 코드로 돌고 있다 (실행 {old} < 소스 {new}).')
+    print('   최신 코드로 재시작한다 — 관리자 암호를 입력할 것:')
+    try:
+        rc = subprocess.run(
+            ['sudo', 'systemctl', 'restart', 'yolo-depth-publisher']).returncode
+    except Exception as e:
+        return '❌', f'재시작 실패({e}) — sudo systemctl restart yolo-depth-publisher'
+    if rc != 0:
+        return '❌', '재시작 실패 — sudo systemctl restart yolo-depth-publisher'
+    return '🔄', f'소스가 최신이라 재시작함 ({old} -> 방금)'
 
 
 def generate_launch_description():
@@ -318,7 +376,11 @@ def generate_launch_description():
     ]
     missing = [(p, name, impact) for p, name, impact in DEVICES if not os.path.exists(p)]
 
+    # ★ 장치보다 먼저 — YOLO 가 최신 코드로 돌고 있는지 (필요하면 재시작)
+    yolo_mark, yolo_text = _check_yolo_freshness()
+
     banner = [LogInfo(msg='─── 센서 장치 확인 ' + '─' * 41)]
+    banner.append(LogInfo(msg=f"  {yolo_mark} {'YOLO 코드':<14} {yolo_text}"))
     for path, name, _ in DEVICES:
         mark = '✅' if os.path.exists(path) else '❌'
         banner.append(LogInfo(msg=f'  {mark} {name:<14} {path}'))
