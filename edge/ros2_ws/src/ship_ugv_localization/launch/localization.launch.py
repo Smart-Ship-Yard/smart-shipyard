@@ -18,7 +18,8 @@ from launch import LaunchDescription
 import subprocess
 import time
 
-from launch.actions import LogInfo
+from launch.actions import ExecuteProcess, LogInfo, RegisterEventHandler
+from launch.event_handlers import OnProcessExit
 from launch_ros.actions import Node
 
 
@@ -241,12 +242,67 @@ def generate_launch_description():
         remappings=[('odometry/filtered', '/odometry/global')],
     )
 
+    # ★ change_point_detector 는 **조용히 죽으면 안 되는 노드다** (2026-08-27).
+    #   이게 죽으면 /event_detection/map_point 와 /cleared 가 통째로 끊긴다.
+    #   그런데 위험 이벤트 팝업과 핑은 websocket_client 가 원본 /uvd 로도
+    #   받으므로 **화면상으론 멀쩡해 보인다.** 실제로 겪은 증상:
+    #       - 프론트 팝업 뜨고 핑도 찍힘        (정상처럼 보임)
+    #       - 로봇은 불을 봐도 안 멈춤          (map_point 가 안 나감)
+    #       - 불을 치워도 핑이 영영 안 지워짐   (cleared 가 안 나감)
+    #   원인을 인지(YOLO) 쪽으로 두 번 오진했다. 그래서 죽으면 자동 복구하고,
+    #   동시에 **놓칠 수 없게 크게 찍는다.**
     change_point_node = Node(
         package='ship_ugv_perception',
         executable='change_point',
         name='change_point_detector',
         output='screen',
+        respawn=True,
+        respawn_delay=2.0,
     )
+
+    # ★ change_point 감시견 (2026-08-27). 배너 한 번은 스크롤에 묻힌다.
+    #   죽어 있는 동안 5초마다 계속 찍고, 재시작(PID 변화)도 놓치지 않는다.
+    #   pgrep 패턴의 [c] 는 감시견 자기 자신을 세지 않기 위한 것이다
+    #   (자기 cmdline 에도 같은 글자가 들어 있어 그냥 쓰면 항상 살아있다고 나온다).
+    change_point_watchdog = ExecuteProcess(
+        cmd=['bash', '-c', r"""
+        prev=""; crashes=0; last=0
+        while true; do
+          pid=$(pgrep -f '[c]hange_point --ros-args' | head -1)
+          if [ -n "$pid" ] && [ -n "$prev" ] && [ "$pid" != "$prev" ]; then
+            crashes=$((crashes+1))
+            echo "🔁 change_point_detector 재시작됨 (누적 $crashes 회) - 위로 스크롤해 Traceback 확인"
+          fi
+          [ -n "$pid" ] && prev="$pid"
+          if [ -z "$pid" ]; then
+            now=$(date +%s)
+            if [ $((now-last)) -ge 5 ]; then
+              last=$now
+              echo "🚨 change_point_detector 죽어있음 - 로봇이 불을 봐도 안 멈추고, 핑도 안 지워진다 (팝업/핑은 계속 떠서 속기 쉬움)"
+            fi
+          fi
+          sleep 1
+        done
+        """],
+        output='screen',
+    )
+
+    change_point_died_banner = RegisterEventHandler(OnProcessExit(
+        target_action=change_point_node,
+        on_exit=[
+            LogInfo(msg='\n' + '=' * 68),
+            LogInfo(msg='🚨🚨🚨  change_point_detector 가 죽었다  🚨🚨🚨'),
+            LogInfo(msg=''),
+            LogInfo(msg='   지금부터 이렇게 된다 — 겉보기엔 멀쩡해서 속기 쉽다:'),
+            LogInfo(msg='     · 프론트 팝업/핑은 계속 뜬다 (websocket_client 가 원본을 봄)'),
+            LogInfo(msg='     · 로봇은 불을 봐도 안 멈춘다  (map_point 끊김)'),
+            LogInfo(msg='     · 불을 치워도 핑이 안 지워진다 (cleared 끊김)'),
+            LogInfo(msg=''),
+            LogInfo(msg='   2초 뒤 자동 재시작한다. 위로 스크롤해 Traceback 을 볼 것.'),
+            LogInfo(msg='   계속 반복되면 시나리오를 멈추고 원인부터 고칠 것.'),
+            LogInfo(msg='=' * 68 + '\n'),
+        ],
+    ))
 
     # ★ yolo_depth_publisher 는 **여기서 띄우지 않는다** (2026-08-19 제거).
     #
@@ -512,6 +568,8 @@ def generate_launch_description():
         ekf_local_node,
         ekf_global_node,
         change_point_node,
+        change_point_died_banner,
+        change_point_watchdog,
         *( [ship_survey_node] if survey_on else [ship_pose_pub_node] ),
         websocket_client_node,
         laser_static_tf_node,

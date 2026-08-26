@@ -298,6 +298,15 @@ class ChangePointDetector(Node):
         now_s = self.get_clock().now().nanoseconds / 1e9
         survivors = []
         for ev in self.reported_events:
+            # ★ 판정 전에 따로 붙잡아 둔다 (2026-08-27 실측 사고).
+            #   clear_verdict 는 '치워짐' 을 확정하면서 arrived_at 을 None 으로
+            #   되돌린다(다음 방문을 위해). 그런데 아래 로그가 그 값을 그대로
+            #   빼서 TypeError 로 **노드가 통째로 죽었다.** 치워짐이 처음
+            #   성공하는 순간 죽으므로, 그 뒤로는
+            #     - map_point 가 안 나가 로봇이 불을 봐도 안 멈추고
+            #     - cleared 가 안 나가 프론트 핑이 영영 안 지워진다.
+            #   증상이 인지 문제처럼 보여서 원인을 두 번 놓쳤다.
+            watched_since = ev['arrived_at']
             verdict, ev['left_vantage'], ev['arrived_at'] = clear_verdict(
                 math.hypot(rx - ev['seen_from'][0], ry - ev['seen_from'][1]),
                 angle_diff(robot_yaw, ev['seen_yaw']),
@@ -317,10 +326,11 @@ class ChangePointDetector(Node):
             }
             msg = String(); msg.data = json.dumps(out)
             self.clear_pub.publish(msg)
+            watched = ('%.1f초' % (now_s - watched_since)
+                       if watched_since is not None else '(체류시간 불명)')
             self.get_logger().info(
                 f"[{ev['class_id']}] 치워짐 확인 — event_id={ev['event_id']} "
-                f"(처음 본 자리로 돌아와 "
-                f"{now_s - ev['arrived_at']:.1f}초 지켜봤는데 안 보임)")
+                f"(처음 본 자리로 돌아와 {watched} 지켜봤는데 안 보임)")
             # survivors 에 안 넣는다 -> 목록에서 제거됨
 
         self.reported_events = survivors

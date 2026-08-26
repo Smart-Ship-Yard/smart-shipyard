@@ -89,6 +89,30 @@ if __name__ == '__main__':
     check('헤딩 어긋난 채 도착 -> 시계 안 켬', v, 'wait')
     assert arr is None
 
+    # ★ 사고 재현 ⑥(2026-08-27 실측, 노드 사망): clear 를 확정하면 세 번째
+    #   반환값(arrived_at)이 None 으로 되돌아온다. 호출부가 그 값을 그대로
+    #   ev['arrived_at'] 에 덮어쓴 뒤 로그에서 now_s - ev['arrived_at'] 를
+    #   계산해 TypeError 로 **노드가 통째로 죽었다.**
+    #   증상이 인지 문제처럼 보였다 — 팝업·핑은 websocket_client 가 원본
+    #   /uvd 로도 받아 계속 떴고, 로봇만 안 멈추고 핑만 안 지워졌다.
+    #   여기서는 호출부가 하는 일을 그대로 흉내 내 회귀를 막는다.
+    ev = {'left_vantage': True, 'arrived_at': 100.0}
+    watched_since = ev['arrived_at']          # ★ 덮어쓰기 전에 붙잡아 둔다
+    verdict, ev['left_vantage'], ev['arrived_at'] = clear_verdict(
+        OUT, 0.0, 50.0, 100.0 + G + 1, RV, YT, G,
+        ev['left_vantage'], ev['arrived_at'])
+    assert verdict == 'clear'
+    assert ev['arrived_at'] is None, 'clear 뒤엔 arrived_at 이 None 이어야 한다'
+    # 예전 코드가 하던 계산 — 이게 죽음의 원인이었다
+    try:
+        _ = 104.0 - ev['arrived_at']
+        raise AssertionError('None 뺄셈이 통과했다 - 테스트가 잘못됐다')
+    except TypeError:
+        pass
+    # 고친 코드 — 붙잡아 둔 값을 쓰므로 안전
+    assert abs((104.0 - watched_since) - 4.0) < 1e-9
+    print('  clear 확정 시 arrived_at=None, 호출부는 붙잡아 둔 값을 씀  OK')
+
     # angle_diff 는 -pi~pi 로 감싼다
     assert abs(angle_diff(math.radians(350), math.radians(10)) - math.radians(20)) < 1e-9
     print('  angle_diff 350도 vs 10도 = 20도  OK')
