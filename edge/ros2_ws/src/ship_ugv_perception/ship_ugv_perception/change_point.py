@@ -178,6 +178,10 @@ class ChangePointDetector(Node):
         self.declare_parameter('revisit_radius_m', 0.35)    # 이만큼 가까우면 "그 자리로 돌아왔다"
         self.declare_parameter('revisit_yaw_tol_deg', 45.0) # 헤딩도 비슷해야 카메라가 같은 곳을 본다
         self.declare_parameter('revisit_grace_s', 3.0)      # 그 자리에서 이만큼 안 보이면 확정
+        # ★ 새 이벤트는 이만큼 연속으로 같은 자리에서 봐야 등록한다 (2026-08-27).
+        #   단발 오측정 하나가 곧바로 로봇을 세우는 것을 막는다.
+        self.declare_parameter('new_event_confirm_frames', 2)
+        self.declare_parameter('new_event_confirm_window_s', 2.0)
         # ★ 2026-08-24: confidence 필터. 실측 0.468짜리 한 프레임 오탐이
         #   그대로 새 이벤트(정지 유발)로 등록된 사고가 있었다.
         #   websocket_client 가 이미 쓰는 기준(0.5)과 맞춘다.
@@ -210,6 +214,9 @@ class ChangePointDetector(Node):
         self.revisit_yaw_tol = math.radians(
             self.get_parameter('revisit_yaw_tol_deg').value)
         self.revisit_grace = self.get_parameter('revisit_grace_s').value
+        self.new_confirm = int(self.get_parameter('new_event_confirm_frames').value)
+        self.new_window = float(self.get_parameter('new_event_confirm_window_s').value)
+        self._pending = []   # 아직 확정 안 된 새 이벤트 후보
         self.min_confidence = self.get_parameter('min_confidence').value
         self.max_depth = self.get_parameter('max_depth_m').value
 
@@ -427,6 +434,41 @@ class ChangePointDetector(Node):
                 f"{math.hypot(map_x - existing['x'], map_y - existing['y']):.2f}m 이내) - 재발행 안 함"
             )
             return
+
+        # --- ★ 3차 필터: 새 이벤트는 연속 확인 후에만 등록 (2026-08-27) ---
+        #   같은 불을 110초간 12번 재보니 흩어짐은 중앙값 0.04m / 최대 0.10m 로
+        #   아주 안정적이었다(순찰 원 정반대편에서 봐도 4cm). 그런데 가끔
+        #   depth 가 튀어 0.5~1.3m 벗어난 단발 오측정이 나오고, 그 하나가
+        #   곧바로 새 이벤트로 등록되어 **로봇을 세웠다**. 실측 오측정:
+        #       정상 (-0.21,-1.16) -> 오측정 (-0.71,-0.97) / (-0.51,-2.24)
+        #   yolo 쪽 연속 3프레임 확인은 **화면 좌표** 기준이라 depth 튐을
+        #   못 거른다. 그래서 map 좌표로 한 번 더 확인한다.
+        #   dedup_radius 를 키우는 건 답이 아니다 — 정상 측정이 4cm 밖에
+        #   안 흩어지므로, 키우면 진짜 이동만 놓치게 된다.
+        now_f = now.nanoseconds / 1e9
+        self._pending = [q for q in self._pending
+                         if now_f - q['first'] <= self.new_window]
+        cand = next((q for q in self._pending
+                     if q['class_id'] == class_id
+                     and math.hypot(map_x - q['x'], map_y - q['y']) < self.dedup_radius),
+                    None)
+        if cand is None:
+            self._pending.append({'class_id': class_id, 'x': map_x, 'y': map_y,
+                                  'first': now_f, 'count': 1})
+            cand = self._pending[-1]
+        else:
+            cand['count'] += 1
+            # 평균으로 다듬어 등록 좌표를 안정시킨다
+            k = cand['count']
+            cand['x'] += (map_x - cand['x']) / k
+            cand['y'] += (map_y - cand['y']) / k
+        if cand['count'] < self.new_confirm:
+            self.get_logger().info(
+                f"[{class_id}] 새 이벤트 후보 {cand['count']}/{self.new_confirm} "
+                f"map=({map_x:.2f}, {map_y:.2f}) - 한 번 더 봐야 등록한다")
+            return
+        map_x, map_y = cand['x'], cand['y']
+        self._pending.remove(cand)
 
         # ★ event_id 는 이 위치에 처음 보고된 좌표로 고정한다(반올림 좌표).
         #   재검출마다 map_x/map_y 가 몇 cm씩 흔들려도 프론트가 같은 핑으로
