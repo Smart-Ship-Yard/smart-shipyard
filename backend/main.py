@@ -358,6 +358,18 @@ class ConnectionManager:
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
 
+    def status_line(self) -> str:
+        """현재 접속 상태를 한 줄로. 로그 끝에 항상 붙인다.
+
+        왜 필요한가 — 연결/해제 로그만 찍으면 마지막 줄이 "끊어짐"일 때
+        정말 아무도 없는 건지, 다른 창이 아직 붙어 있는 건지 알 수 없다.
+        브라우저를 새로고침하면 새 연결이 먼저 붙고 옛 연결이 나중에 끊기는
+        순서라(겹침), "연결됨 → 연결됨 → 끊어짐" 으로 보여 접속이 끊긴 것처럼
+        읽힌다. 실제로는 1개가 살아 있다. 그래서 대수를 함께 찍는다.
+        """
+        n = len(self.active_connections)
+        return f"현재 접속 {n}대" if n else "현재 접속 없음"
+
     async def broadcast(self, message: dict):
         """
         젯슨이 보낸 데이터를 현재 접속 중인 '모든' 프론트엔드로 전송한다.
@@ -502,7 +514,7 @@ async def websocket_frontend(websocket: WebSocket):
 
     # ConnectionManager에 등록 (accept + 목록 추가가 여기서 함께 처리됨).
     await manager.connect(websocket)
-    print("🖥️ [프론트엔드] 대시보드 웹소켓 연결됨!")
+    print(f"🖥️ [프론트엔드] 대시보드 연결됨 — {manager.status_line()}")
 
     try:
         # 연결이 살아있는 동안 무한 대기하며 메시지를 수신.
@@ -546,7 +558,13 @@ async def websocket_frontend(websocket: WebSocket):
     except WebSocketDisconnect:
         # 브라우저 창을 닫는 등으로 연결이 끊기면 이 예외가 발생.
         manager.disconnect(websocket)
-        print("🖥️ [프론트엔드] 연결 끊어짐.")
+        # 새로고침이면 여기서 0 이 아니다 (새 연결이 먼저 붙어 있으므로).
+        # 대수를 함께 찍어야 "끊겼는데 왜 아직 되지?" 로 헷갈리지 않는다.
+        if manager.active_connections:
+            print(f"🖥️ [프론트엔드] 창 하나 닫힘 (새로고침일 수 있음) — "
+                  f"{manager.status_line()}")
+        else:
+            print(f"🖥️ [프론트엔드] 연결 끊어짐 — {manager.status_line()}")
 
 
 @app.websocket("/ws/jetson")
@@ -561,7 +579,7 @@ async def websocket_jetson(websocket: WebSocket):
     # 서버→젯슨 방향(stream_boost 전달)에 쓸 수 있도록 연결을 기억해 둠.
     # 재접속 등으로 새 연결이 오면 마지막 연결이 이전 것을 덮어씀.
     jetson_connection = websocket
-    print("🚗 [젯슨 RC카] 웹소켓 연결됨!")
+    print("🚗 [젯슨 RC카] 연결됨 — 현재 접속 중")
 
     try:
         while True:
@@ -600,9 +618,14 @@ async def websocket_jetson(websocket: WebSocket):
         # 젯슨 전원이 꺼지거나 통신이 끊기면 발생.
         # 이 연결이 현재 기억된 연결일 때만 해제 (재접속 직후 옛 연결이
         # 끊기면서 새 연결 참조를 지워버리는 것을 방지).
+        # 프론트와 같은 이유로 대수 대신 "지금 붙어 있나"를 함께 찍는다.
+        # 재접속이면 새 연결이 이미 jetson_connection 을 차지한 뒤라
+        # 옛 연결이 끊기는 이 시점에도 접속은 살아 있다.
         if jetson_connection is websocket:
             jetson_connection = None
-        print("🚗 [젯슨 RC카] 연결 끊어짐.")
+            print("🚗 [젯슨 RC카] 연결 끊어짐 — 현재 접속 없음")
+        else:
+            print("🚗 [젯슨 RC카] 옛 연결 정리됨 (재접속) — 현재 접속 중")
 
 
 # =========================================================
