@@ -33,8 +33,7 @@ Astra+ 카메라로 Color+Depth를 받아 YOLO로 객체를 검출하고,
   (슈퍼레졸루션과 다름). 화질을 올리는 게 아니라 "특징맵 상의 공간 여유"를
   늘려주는 것이다.
   개별 박스 처리(1차 필터 + depth 계산 + 발행)를 _evaluate_box() 로 공통화해
-  메인 검출(track_id 있음)과 crop 검출(track_id 없음 -> fallback 경로)이 같은
-  로직을 쓰게 했다. crop 좌표는 원본 프레임 좌표로 환산해서 넘긴다.
+  메인 검출과 crop 검출이 같은 로직을 쓰게 했다. crop 좌표는 원본 프레임 좌표로 환산해서 넘긴다.
 
   ⚠️ CPU 주의: person 한 명당 추론이 한 번씩 더 돈다. 2026-08-18 에 CPU 포화로
      Nav2 lifecycle 전환이 타임아웃되어 브링업이 통째로 실패한 적이 있으므로,
@@ -488,9 +487,9 @@ class YoloDepthPublisher(Node):
 
     # ------------------------------------------------------------------
     # ★ 박스 하나를 처리하는 공통 로직 (1차 필터 -> depth 계산 -> 발행).
-    #   메인 검출(track_id 있음)과 person crop 재검출(track_id None)이 함께 쓴다.
-    #   track_id 가 None 이면 자동으로 fallback(위치 기반) 경로를 타므로,
-    #   메인 검출과 위치가 겹치면 기존 dedup 이 알아서 중복을 걸러준다.
+    #   메인 검출과 person crop 재검출이 함께 쓴다. track_id 인자는 예전
+    #   트래커 시절의 잔재로 지금은 항상 None 이 들어온다(위 predict 주석
+    #   참고) — 즉 모든 검출이 연속 N프레임 확인 경로를 탄다.
     def _evaluate_box(self, class_name, conf, x1, y1, x2, y2, track_id,
                       depth_image, display_image, draw_box=True):
         if conf < self._conf_for(class_name):
@@ -508,18 +507,6 @@ class YoloDepthPublisher(Node):
         if is_level_class(class_name):
             publish_ok = True
             key_info = "level(항상발행)"
-
-        elif track_id is not None:
-            # ★ 위치(맵 좌표) 기준 "이미 보고했나" 판단은 change_point_detector 가
-            #   한다. 여기서 화면좌표(u,v)로 한 번 더 걸러 영구히 기억해두면
-            #   (예전의 reported_tids/reported_fallbacks) 불을 옮기거나 다른
-            #   자리에 새로 놓아도 화면상 비슷한 위치라는 이유로 아예
-            #   발행조차 안 되는 사고가 난다(2026-08-24 실측: 불을 옮겨도
-            #   팝업/정지 둘 다 안 뜸). 트랙별로 매 프레임 그냥 발행하고,
-            #   실제 중복 제거는 map 좌표 기반인 change_point_detector 에
-            #   전부 맡긴다.
-            publish_ok = True
-            key_info = f"tid={track_id}"
 
         else:
             # ★ 트랙 ID가 없는 검출: 노이즈 필터링 목적으로만 연속
@@ -666,12 +653,22 @@ class YoloDepthPublisher(Node):
         if color_image is None:
             return
 
-        results = self.model.track(
-            color_image,
-            persist=True,
-            verbose=False,
-            tracker=self.tracker_config
-        )[0]
+        # ★ track() 이 아니라 predict() 를 쓴다 (2026-08-27 실측 사고).
+        #   track(persist=True) 는 트래커 상태를 계속 누적하는데, 그 상태가
+        #   망가지면 **검출이 통째로 사라진다.** 실측: 같은 프레임에 대해
+        #       predict()  -> level3=0.79, fire=0.89
+        #       실행 중 노드 -> 검출 개수 0 (주석 영상에 박스가 하나도 없음)
+        #   YOLO 를 재시작하면 잠깐 정상으로 돌아왔다가 몇 분 뒤 다시 0이
+        #   되는 것도 "누적된 상태" 라는 설명과 맞는다.
+        #
+        #   그리고 우리는 이제 track_id 가 필요 없다. 예전에는 reported_tids
+        #   로 "이 트랙은 이미 보고했다" 를 기억했지만, 그 화면좌표 기반
+        #   중복 제거는 걷어냈다(커밋 057d5f3). 지금 위치 기반 중복 제거는
+        #   change_point_detector 가 map 좌표로 한다.
+        #   -> 트래커를 빼면 불안정 요인과 칼만 필터 CPU 가 함께 사라지고,
+        #      모든 검출이 아래 fallback 경로(연속 N프레임 확인)를 타므로
+        #      노이즈 필터는 오히려 일관돼진다.
+        results = self.model.predict(color_image, verbose=False)[0]
 
         display_image = color_image.copy()
 
@@ -698,9 +695,9 @@ class YoloDepthPublisher(Node):
             cls = int(box.cls[0])
             conf = float(box.conf[0])
             class_name = self.model.names[cls]
-            track_id = int(box.id[0]) if box.id is not None else None
-
-            self._evaluate_box(class_name, conf, x1, y1, x2, y2, track_id,
+            # track_id 는 더 이상 쓰지 않는다(위 predict 주석 참고).
+            # None 을 넘겨 모든 검출이 연속 프레임 확인 경로를 타게 한다.
+            self._evaluate_box(class_name, conf, x1, y1, x2, y2, None,
                                depth_image, display_image)
 
             # person 은 confidence 미달이면 crop 대상에서도 제외
