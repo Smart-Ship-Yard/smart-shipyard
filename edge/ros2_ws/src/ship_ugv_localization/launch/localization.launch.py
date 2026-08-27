@@ -18,8 +18,9 @@ from launch import LaunchDescription
 import subprocess
 import time
 
-from launch.actions import ExecuteProcess, LogInfo, RegisterEventHandler
-from launch.event_handlers import OnProcessExit
+from launch.actions import (ExecuteProcess, LogInfo, OpaqueFunction,
+                            RegisterEventHandler)
+from launch.event_handlers import OnProcessExit, OnShutdown
 from launch_ros.actions import Node
 
 
@@ -274,7 +275,10 @@ def generate_launch_description():
             echo "🔁 change_point_detector 재시작됨 (누적 $crashes 회) - 위로 스크롤해 Traceback 확인"
           fi
           [ -n "$pid" ] && prev="$pid"
-          if [ -z "$pid" ]; then
+          # 런치를 통째로 내릴 때도 change_point 는 당연히 사라진다. 그때까지
+          # 경고하면 늑대소년이 되므로, **다른 노드가 살아있을 때만** 경고한다.
+          # ekf_node 를 기준으로 삼는다 (이 런치가 항상 띄우는 노드).
+          if [ -z "$pid" ] && pgrep -f '[e]kf_node' >/dev/null; then
             now=$(date +%s)
             if [ $((now-last)) -ge 5 ]; then
               last=$now
@@ -287,9 +291,20 @@ def generate_launch_description():
         output='screen',
     )
 
-    change_point_died_banner = RegisterEventHandler(OnProcessExit(
-        target_action=change_point_node,
-        on_exit=[
+    # ★ Ctrl+C 로 끌 때는 배너를 띄우지 않는다 (2026-08-27).
+    #   런치를 내리면 change_point 도 당연히 종료되는데(파이썬 노드는 SIGINT
+    #   에도 exit 1 이라 크래시와 종료 코드가 같다), 그때마다 🚨 를 띄우면
+    #   **진짜 죽었을 때도 무시하게 된다.** 늑대소년이 제일 나쁜 실패다.
+    _shutdown = {'started': False}
+
+    def _mark_shutdown(context, *a, **kw):
+        _shutdown['started'] = True
+        return []
+
+    def _banner_if_crashed(context, *a, **kw):
+        if _shutdown['started']:
+            return []       # 정상 종료 — 조용히 넘어간다
+        return [
             LogInfo(msg='\n' + '=' * 68),
             LogInfo(msg='🚨🚨🚨  change_point_detector 가 죽었다  🚨🚨🚨'),
             LogInfo(msg=''),
@@ -301,8 +316,16 @@ def generate_launch_description():
             LogInfo(msg='   2초 뒤 자동 재시작한다. 위로 스크롤해 Traceback 을 볼 것.'),
             LogInfo(msg='   계속 반복되면 시나리오를 멈추고 원인부터 고칠 것.'),
             LogInfo(msg='=' * 68 + '\n'),
-        ],
+        ]
+
+    shutdown_marker = RegisterEventHandler(OnShutdown(
+        on_shutdown=[OpaqueFunction(function=_mark_shutdown)]))
+
+    change_point_died_banner = RegisterEventHandler(OnProcessExit(
+        target_action=change_point_node,
+        on_exit=[OpaqueFunction(function=_banner_if_crashed)],
     ))
+
 
     # ★ yolo_depth_publisher 는 **여기서 띄우지 않는다** (2026-08-19 제거).
     #
@@ -568,6 +591,7 @@ def generate_launch_description():
         ekf_local_node,
         ekf_global_node,
         change_point_node,
+        shutdown_marker,
         change_point_died_banner,
         change_point_watchdog,
         *( [ship_survey_node] if survey_on else [ship_pose_pub_node] ),
