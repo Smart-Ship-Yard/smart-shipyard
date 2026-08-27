@@ -104,6 +104,7 @@ class WebSocketClient(Node):
         #   change_point_detector 가 전담하고, 이 노드는 그 결과만 받는다.
         self.declare_parameter('map_point_topic', '/event_detection/map_point')
         self.declare_parameter('cleared_topic', '/event_detection/cleared')
+        self.declare_parameter('snapshot_topic', '/event_detection/snapshot')
 
         # ★ 수신 루프 관련
         self.declare_parameter('inbound_topic', '/server/inbound')
@@ -176,6 +177,12 @@ class WebSocketClient(Node):
         self.create_subscription(
             String, self.get_parameter('cleared_topic').value,
             self._cleared_cb, 10)
+        # ★ 이벤트 스냅샷 (2026-08-27). yolo_depth_publisher 가 **새 이벤트에
+        #   대해서만** 인코딩해 보내준다. 프론트가 핑을 눌렀을 때 "그때 무슨
+        #   일이 있었나" 를 보여줄 사진 한 장이다.
+        self.create_subscription(
+            String, self.get_parameter('snapshot_topic').value,
+            self._snapshot_cb, 10)
         self.create_subscription(Odometry, ekf_topic, self._ekf_cb, 10)
         # ★ ship_pose는 ship_survey_node가 측량 끝날 때 딱 1번만 발행하고, 그 시점은
         #   매핑 랩 도중이라 이 노드보다 먼저 끝나 있을 수 있다. 기본 QoS(VOLATILE)로
@@ -250,6 +257,30 @@ class WebSocketClient(Node):
         level = extract_level(class_id)
         if level is not None:
             self._handle_block_level(class_id, level)
+
+    def _snapshot_cb(self, msg: String):
+        """이벤트 스냅샷을 서버로 그대로 넘긴다.
+
+        서버는 이 base64 를 파일로 저장하고 DB 에는 경로만 남긴다
+        (docs 협의: 이벤트 문서에 이미지를 통째로 넣으면 재접속 복원 때마다
+        이미지가 전부 다시 흐른다).
+        """
+        try:
+            d = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        if not d.get('image_b64'):
+            return
+        self._enqueue({
+            'event_type': 'event_snapshot',
+            'block_id': self.block_id,
+            'event_id': d.get('event_id'),
+            'cls': d.get('class_id'),
+            'image_b64': d['image_b64'],
+        })
+        self.get_logger().info(
+            f"[스냅샷 큐] {d.get('class_id')} event_id={d.get('event_id')} "
+            f"{len(d['image_b64'])/1024:.0f} KB")
 
     def _map_point_cb(self, msg: String):
         """change_point_detector 가 위치 기준 중복 제거를 마친 위험 이벤트.

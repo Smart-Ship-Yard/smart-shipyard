@@ -43,6 +43,7 @@ Astra+ 카메라로 Color+Depth를 받아 YOLO로 객체를 검출하고,
 """
 
 import array
+import base64
 import json
 import time
 import math
@@ -78,6 +79,10 @@ def is_level_class(class_name: str) -> bool:
 #   전역값(기본 0.2)을 그대로 씁니다.
 #   예: no_helmet/fallen_person 은 놓치면 안 되니 낮게, fire/helmet 처럼
 #   배경 오탐이 잦은 클래스는 높게 두는 식으로 조정하세요.
+# 이벤트 스냅샷을 남길 클래스 (위험 이벤트만). 프론트가 핑을 눌렀을 때
+# "그때 무슨 일이 있었나" 를 보여주는 사진 한 장이다.
+SNAPSHOT_CLASSES = ('fire', 'fallen_person', 'no_helmet')
+
 CLASS_CONFIDENCE = {
     'no_helmet': 0.15,
     'fallen_person': 0.15,
@@ -214,6 +219,29 @@ class YoloDepthPublisher(Node):
         # 1차 통과 문턱은 '가장 낮은 클래스 임계값'. 클래스별 판정은
         # _evaluate_box 가 _conf_for() 로 다시 한다.
         self._min_conf = min([self.conf_threshold] + list(self.class_conf.values()))
+
+        # ★ 이벤트 스냅샷 (2026-08-27).
+        #   프론트에서 핑을 누르면 "그 이벤트가 감지되던 순간의 사진" 을 본다.
+        #   ★★ 인코딩은 **중복 제거를 통과한 새 이벤트에 대해서만** 한다.
+        #   매 프레임 crop->JPEG 하면 초당 수십 번이 되어 CPU 그림이 완전히
+        #   달라진다(실측: crop 인코딩 1.28 ms + base64 0.12 ms). 그래서
+        #   여기서는 **자르기만 해서 들고 있고**(numpy 슬라이스 복사, 0.05 ms
+        #   수준), change_point_detector 가 새 이벤트를 확정해 발행했을 때
+        #   그 시점에 딱 한 번 인코딩한다.
+        self.declare_parameter('snapshot_enabled', True)
+        self.declare_parameter('snapshot_jpeg_quality', 70)
+        self.declare_parameter('snapshot_margin_px', 40)
+        self.snapshot_enabled = bool(self.get_parameter('snapshot_enabled').value)
+        self.snapshot_quality = int(self.get_parameter('snapshot_jpeg_quality').value)
+        self.snapshot_margin = int(self.get_parameter('snapshot_margin_px').value)
+        self._last_crop = {}          # class_name -> BGR crop (인코딩 전)
+        self._crop_lock = threading.Lock()
+
+        if self.snapshot_enabled:
+            self.snapshot_pub = self.create_publisher(
+                String, '/event_detection/snapshot', 10)
+            self.create_subscription(
+                String, '/event_detection/map_point', self._snapshot_cb, 10)
 
         self.pub = self.create_publisher(String, topic, 10)
         # 화면 중앙 뎁스 탐침 결과 (measure_ship_center.py 가 쓴다)
@@ -651,6 +679,60 @@ class YoloDepthPublisher(Node):
                                    None, depth_image, display_image, draw_box=False)
 
     # ------------------------------------------------------------------
+    def _stash_crop(self, class_name, color_image, x1, y1, x2, y2):
+        """검출 영역을 잘라서 들고만 있는다. 인코딩은 하지 않는다."""
+        h, w = color_image.shape[:2]
+        m = self.snapshot_margin
+        cx1 = max(0, int(x1) - m)
+        cy1 = max(0, int(y1) - m)
+        cx2 = min(w, int(x2) + m)
+        cy2 = min(h, int(y2) + m)
+        if cx2 - cx1 < 8 or cy2 - cy1 < 8:
+            return
+        crop = color_image[cy1:cy2, cx1:cx2].copy()
+        with self._crop_lock:
+            self._last_crop[class_name] = crop
+
+    def _snapshot_cb(self, msg):
+        """change_point_detector 가 **새 이벤트**를 확정했을 때만 불린다.
+
+        중복 제거를 통과한 것만 여기 오므로, 인코딩은 이벤트당 한 번뿐이다.
+        한 바퀴에 몇 건 수준이라 CPU 부담은 사실상 없다.
+        """
+        try:
+            det = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        cls = str(det.get('class_id', ''))
+        if cls not in SNAPSHOT_CLASSES:
+            return
+        with self._crop_lock:
+            crop = self._last_crop.get(cls)
+        if crop is None:
+            self.get_logger().warn(
+                f"[스냅샷] {cls} 이벤트인데 들고 있는 crop 이 없다 - 건너뜀")
+            return
+        try:
+            ok, enc = cv2.imencode(
+                '.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, self.snapshot_quality])
+            if not ok:
+                return
+            b64 = base64.b64encode(enc.tobytes()).decode('ascii')
+        except Exception as e:
+            self.get_logger().warn(f"[스냅샷] 인코딩 실패(무시): {e}")
+            return
+        out = String()
+        out.data = json.dumps({
+            'event_id': det.get('event_id'),
+            'class_id': cls,
+            'image_b64': b64,
+        })
+        self.snapshot_pub.publish(out)
+        self.get_logger().info(
+            f"[스냅샷] {cls} event_id={det.get('event_id')} "
+            f"{crop.shape[1]}x{crop.shape[0]} -> {len(b64)/1024:.0f} KB(base64)")
+
+    # ------------------------------------------------------------------
     # YOLO 처리 (캡처 스레드가 채워둔 최신 프레임을 가져다 씀, 카메라 속도와 무관)
     def _process_frame(self):
         color_image, depth_image = self._get_latest_frame()
@@ -717,6 +799,13 @@ class YoloDepthPublisher(Node):
             # None 을 넘겨 모든 검출이 연속 프레임 확인 경로를 타게 한다.
             self._evaluate_box(class_name, conf, x1, y1, x2, y2, None,
                                depth_image, display_image)
+
+            # ★ 자르기만 해두고 인코딩은 안 한다 (위 snapshot 주석 참고).
+            #   display_image 가 아니라 color_image 를 쓴다 — 박스가 그려지기
+            #   전의 깨끗한 화면이어야 사진으로서 쓸모가 있다.
+            if (self.snapshot_enabled and class_name in SNAPSHOT_CLASSES
+                    and conf >= self._conf_for(class_name)):
+                self._stash_crop(class_name, color_image, x1, y1, x2, y2)
 
             # person 은 confidence 미달이면 crop 대상에서도 제외
             if (self.person_crop_enabled and class_name == 'person'
