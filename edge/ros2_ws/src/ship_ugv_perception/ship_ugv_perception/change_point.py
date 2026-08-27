@@ -296,6 +296,11 @@ class ChangePointDetector(Node):
             #     - cleared 가 안 나가 프론트 핑이 영영 안 지워진다.
             #   증상이 인지 문제처럼 보여서 원인을 두 번 놓쳤다.
             watched_since = ev['arrived_at']
+            # ★ fov_seen 도 clear 확정 시 0.0 으로 되돌아온다. arrived_at 과
+            #   똑같이 **덮어쓰기 전에** 붙잡아야 로그가 진짜 값을 찍는다.
+            #   (2026-08-27: 이걸 빠뜨려 판정 근거가 항상 '0.0초' 로 찍혔다.
+            #    믿을 수 없는 진단 로그는 없느니만 못하다.)
+            fov_before = ev['fov_seen']
             in_fov = in_camera_fov(robot_yaw, self.cam_yaw, self.hfov,
                                    rx, ry, ev['x'], ev['y'])
             verdict, ev['left_vantage'], ev['arrived_at'], ev['fov_seen'] = clear_verdict(
@@ -322,7 +327,7 @@ class ChangePointDetector(Node):
                        if watched_since is not None else '(체류시간 불명)')
             # 왜 지웠는지 숫자로 남긴다 — 오판이 나면 이 줄만 보면 된다
             self.get_logger().info(
-                f"  근거: 카메라가 그쪽을 본 시간 {ev.get('fov_seen', 0.0):.1f}초"
+                f"  근거: 카메라가 그쪽을 본 시간 {fov_before:.1f}초"
                 f"(>={self.revisit_grace}초 필요), 구역 체류 {watched}, "
                 f"마지막 검출은 도착보다 {now_s - ev['last_seen'].nanoseconds/1e9:.1f}초 전")
             self.get_logger().info(
