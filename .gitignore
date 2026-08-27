@@ -54,3 +54,14 @@ graphify-out/.graphify_analysis.json
 
 # 모델 백업 (21MB 바이너리). 되돌릴 때만 쓰고 레포에는 안 올린다.
 edge/ros2_ws/src/ship_ugv_perception/weights/*.bak-*
+
+# 이벤트 스냅샷 — 위험 이벤트가 감지된 순간의 사진 (2026-08-27)
+#   ★ 절대 올리지 않는다. 용량 때문이 아니라 **사생활** 때문이다.
+#   현장 카메라가 찍은 것이라 작업자 얼굴이 그대로 들어간다. 한 번 올라가면
+#   나중에 지워도 git 이력에 남으므로, 처음부터 막는다.
+#   (용량도 이유이긴 하다 — 이벤트당 약 9 KB 가 계속 쌓인다)
+#   실제 파일은 백엔드를 돌리는 컴퓨터에만 두고, DB 에는 경로만 남긴다.
+#   폴더 자체는 남긴다(.gitkeep) — 없으면 새로 clone 했을 때
+#   StaticFiles(directory="snapshots") 가 폴더를 못 찾아 서버가 죽는다.
+backend/snapshots/*
+!backend/snapshots/.gitkeep
