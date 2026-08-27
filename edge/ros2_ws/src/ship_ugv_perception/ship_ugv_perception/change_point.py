@@ -16,6 +16,8 @@ Depth camera 이벤트 감지 (u, v, depth)를 map 좌표계의 절대 위치로
 
 import json
 import math
+import os
+import tempfile
 
 import rclpy
 from rclpy.node import Node
@@ -182,6 +184,12 @@ class ChangePointDetector(Node):
         #   단발 오측정 하나가 곧바로 로봇을 세우는 것을 막는다.
         self.declare_parameter('new_event_confirm_frames', 2)
         self.declare_parameter('new_event_confirm_window_s', 2.0)
+        # ★ 재시작해도 이벤트 기억을 잃지 않게 파일에 남긴다 (2026-08-27).
+        #   지우려면 이 파일을 rm 하면 된다(시작 로그에 경로가 찍힌다).
+        self.declare_parameter(
+            'state_file',
+            os.path.join(os.path.expanduser('~'), '.ros',
+                         'change_point_events.json'))
         # ★ 2026-08-24: confidence 필터. 실측 0.468짜리 한 프레임 오탐이
         #   그대로 새 이벤트(정지 유발)로 등록된 사고가 있었다.
         #   websocket_client 가 이미 쓰는 기준(0.5)과 맞춘다.
@@ -223,6 +231,8 @@ class ChangePointDetector(Node):
         # ★ 2차 필터: 이미 보고한 이벤트 기록
         # 각 항목: {'class_id': str, 'x': float, 'y': float, 'last_seen': rclpy.time.Time}
         self.reported_events = []
+        self.state_file = self.get_parameter('state_file').value
+        self._restore_state()
 
         # ---- TF ----
         self.tf_buffer = Buffer()
@@ -244,6 +254,79 @@ class ChangePointDetector(Node):
             "change_point_detector 시작: map->base_link TF 조회 기반 + "
             f"위치 기반 중복 제거(반경 {self.dedup_radius}m, TTL {self.event_ttl.nanoseconds/1e9:.0f}s)"
         )
+        self.get_logger().info(f"이벤트 기억 파일: {self.state_file} "
+                               "(깨끗이 시작하려면 이 파일을 지울 것)")
+
+    # ------------------------------------------------------------------
+    #  ★ 이벤트 기억을 재시작 너머로 잇는다 (2026-08-27).
+    #
+    #  이게 없으면 change_point 가 뜰 때마다 목록이 비어서, **같은 자리에
+    #  그대로 있는 불을 새 이벤트로 다시 등록하고 로봇을 또 세운다.** 게다가
+    #  예전 이벤트는 "치워짐" 을 보낼 주체가 사라져 프론트 핑이 고아가 된다.
+    #  오늘 재시작할 때마다 둘 다 겪었다.
+    #
+    #  TTL 을 넘긴 항목은 복원하지 않는다 — "이만큼 못 봤으면 잊는다" 는
+    #  기존 규칙이 재시작 여부와 무관하게 그대로 적용되는 것뿐이다.
+    def _restore_state(self):
+        try:
+            with open(self.state_file, encoding='utf-8') as f:
+                saved = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            self.get_logger().warn(f"이벤트 기억 파일을 못 읽었다(빈 상태로 시작): {e}")
+            return
+
+        now = self.get_clock().now()
+        restored, dropped = [], 0
+        for ev in saved:
+            try:
+                last_seen = Time(nanoseconds=int(ev['last_seen_ns']))
+                if (now - last_seen) >= self.event_ttl:
+                    dropped += 1
+                    continue
+                restored.append({
+                    'class_id': ev['class_id'],
+                    'event_id': ev['event_id'],
+                    'x': float(ev['x']), 'y': float(ev['y']),
+                    'last_seen': last_seen,
+                    'seen_from': tuple(ev['seen_from']),
+                    'seen_yaw': float(ev['seen_yaw']),
+                    'left_vantage': bool(ev['left_vantage']),
+                    'arrived_at': ev['arrived_at'],
+                    'fov_seen': float(ev.get('fov_seen', 0.0)),
+                })
+            except Exception:
+                dropped += 1
+        self.reported_events = restored
+        if restored:
+            ids = ', '.join(e['event_id'] for e in restored)
+            self.get_logger().warn(
+                f"이전 세션 이벤트 {len(restored)}건 복원 — 이 자리들은 다시 "
+                f"멈추지 않는다: {ids}")
+        if dropped:
+            self.get_logger().info(f"오래되거나 깨진 항목 {dropped}건은 버렸다")
+
+    def _save_state(self):
+        """목록이 바뀔 때마다 저장. 이벤트는 드물어서 비용은 무시할 만하다."""
+        try:
+            data = [{
+                'class_id': e['class_id'], 'event_id': e['event_id'],
+                'x': e['x'], 'y': e['y'],
+                'last_seen_ns': e['last_seen'].nanoseconds,
+                'seen_from': list(e['seen_from']), 'seen_yaw': e['seen_yaw'],
+                'left_vantage': e['left_vantage'], 'arrived_at': e['arrived_at'],
+                'fov_seen': e.get('fov_seen', 0.0),
+            } for e in self.reported_events]
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+            # 원자적 교체 — 쓰는 도중에 죽어도 파일이 깨지지 않는다.
+            # (이 노드는 오늘 실제로 두 번 죽었다.)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.state_file))
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(data, f)
+            os.replace(tmp, self.state_file)
+        except Exception as e:
+            self.get_logger().warn(f"이벤트 기억을 저장 못 했다(계속 진행): {e}")
 
     # ------------------------------------------------------------------
     def _find_matching_event(self, class_id, map_x, map_y):
@@ -284,7 +367,15 @@ class ChangePointDetector(Node):
         q = transform.transform.rotation
         robot_yaw = quat_to_yaw(q.x, q.y, q.z, q.w)
 
+        # ★ last_seen 갱신을 주기적으로 파일에 반영한다. 등록/치워짐 때만
+        #   저장하면 저장된 last_seen 이 등록 시각에 머물러, 눈앞에 계속
+        #   보이는 불도 재시작 후 TTL 초과로 탈락한다.
         now_s = self.get_clock().now().nanoseconds / 1e9
+        if now_s - getattr(self, '_last_save_s', 0.0) >= 10.0:
+            self._last_save_s = now_s
+            if self.reported_events:
+                self._save_state()
+
         survivors = []
         for ev in self.reported_events:
             # ★ 판정 전에 따로 붙잡아 둔다 (2026-08-27 실측 사고).
@@ -335,7 +426,11 @@ class ChangePointDetector(Node):
                 f"(처음 본 자리로 돌아와 {watched} 지켜봤는데 안 보임)")
             # survivors 에 안 넣는다 -> 목록에서 제거됨
 
-        self.reported_events = survivors
+        if len(survivors) != len(self.reported_events):
+            self.reported_events = survivors
+            self._save_state()
+        else:
+            self.reported_events = survivors
 
     # ------------------------------------------------------------------
     def _detection_cb(self, msg: String):
@@ -515,6 +610,7 @@ class ChangePointDetector(Node):
             f"[{class_id}] 새 이벤트 발행: map=({map_x:.2f}, {map_y:.2f}) "
             f"event_id={event_id}"
         )
+        self._save_state()
 
     # ------------------------------------------------------------------
     def _estimate_position_uncertainty(self) -> float:
