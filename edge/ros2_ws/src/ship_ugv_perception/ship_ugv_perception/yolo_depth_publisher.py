@@ -263,11 +263,29 @@ class YoloDepthPublisher(Node):
         self.reject_level_edge = bool(
             self.get_parameter('reject_level_touching_edge').value)
         self.edge_margin = int(self.get_parameter('edge_margin_px').value)
-        self.declare_parameter('level_starved_warn_s', 120.0)
+        # ★ "온전한 배를 못 본 지 오래됐다" 를 무엇으로 재는가 (2026-08-27)
+        #
+        #   1순위는 **순찰 바퀴 수**다. patrol_mission_node 가 /patrol/status 로
+        #   laps 를 이미 발행하고 있으므로, 로봇 위치를 다시 계산할 필요가 없다.
+        #   "한 바퀴를 다 돌았는데 한 번도 온전히 못 봤다" 가 정확히 우리가
+        #   알고 싶은 것이고, 시간 기준과 달리 주행 속도·이벤트 정지·복구행동에
+        #   흔들리지 않는다. (같은 이유로 change_point 의 치워짐 판정도
+        #   시간 기준에서 위치 기준으로 바꿨다 — 그때 배운 것을 여기 적용한다)
+        #
+        #   다만 이 노드는 systemd 로 항상 떠 있고 Nav2 는 껐다 켠다. 순찰이
+        #   안 돌면 laps 가 영영 안 오므로, 그때는 시간 기준으로 물러난다.
+        self.declare_parameter('level_starved_warn_laps', 1)
+        self.declare_parameter('level_starved_warn_s', 180.0)
+        self.level_starved_laps = int(
+            self.get_parameter('level_starved_warn_laps').value)
         self.level_starved_warn = float(
             self.get_parameter('level_starved_warn_s').value)
         self._level_last_pass = time.time()   # 마지막으로 '온전한 배'를 본 시각
         self._level_edge_rejects = 0
+        self._patrol_laps = None              # 순찰이 안 돌면 None
+        self._level_last_pass_lap = None
+        self.create_subscription(
+            String, '/patrol/status', self._patrol_status_cb, 10)
 
         self.declare_parameter('snapshot_enabled', True)
         self.declare_parameter('snapshot_jpeg_quality', 70)
@@ -581,8 +599,9 @@ class YoloDepthPublisher(Node):
                     "잘려 판정 제외", throttle_duration_sec=10.0)
                 self._warn_if_level_starved()
                 return
-            # 온전히 들어온 배를 봤다 — 굶주림 시계를 되돌린다
+            # 온전히 들어온 배를 봤다 — 굶주림 시계와 바퀴 수를 되돌린다
             self._level_last_pass = time.time()
+            self._level_last_pass_lap = self._patrol_laps
             self._level_edge_rejects = 0
 
         u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
@@ -737,6 +756,15 @@ class YoloDepthPublisher(Node):
                                    None, depth_image, display_image, draw_box=False)
 
     # ------------------------------------------------------------------
+    def _patrol_status_cb(self, msg):
+        """순찰 바퀴 수만 받아둔다. 조립 단계 굶주림 판정에 쓴다."""
+        try:
+            self._patrol_laps = int(json.loads(msg.data).get('laps'))
+        except (ValueError, TypeError):
+            return
+        if self._level_last_pass_lap is None:
+            self._level_last_pass_lap = self._patrol_laps
+
     def _warn_if_level_starved(self):
         """배가 계속 잘려서 조립 단계가 한 번도 갱신되지 못하는 상황을 알린다.
 
@@ -744,12 +772,27 @@ class YoloDepthPublisher(Node):
         순찰 궤도가 배에 너무 붙었거나 배가 커지면 **판정이 영영 안 나올 수
         있다.** 그런데 그건 에러가 아니라 그냥 조용함이라 눈치채기 어렵다.
         조용한 실패가 제일 나쁘므로 여기서 시끄럽게 만든다.
+
+        판정 기준은 **순찰 바퀴 수**다 — "한 바퀴를 다 돌았는데 한 번도
+        온전히 못 봤다" 가 정확히 알고 싶은 것이고, 주행 속도·이벤트 정지·
+        복구행동에 흔들리지 않는다. 순찰이 안 돌아 laps 가 없으면 시간으로
+        물러난다.
         """
-        idle = time.time() - self._level_last_pass
-        if idle < self.level_starved_warn:
-            return
+        laps = self._patrol_laps
+        base = self._level_last_pass_lap
+        if laps is not None and base is not None:
+            behind = laps - base
+            if behind < self.level_starved_laps:
+                return
+            how = f"{behind}바퀴째"
+        else:
+            idle = time.time() - self._level_last_pass
+            if idle < self.level_starved_warn:
+                return
+            how = f"{idle/60:.0f}분째(순찰 정지 중이라 시간으로 잼)"
+
         self.get_logger().warn(
-            f"[조립단계] {idle/60:.0f}분째 배가 화면에 온전히 안 담긴다 "
+            f"[조립단계] {how} 배가 화면에 온전히 안 담긴다 "
             f"(잘려서 제외한 검출 {self._level_edge_rejects}건). "
             "공정률이 갱신되지 않고 있다 — 순찰 반경을 넓히거나, "
             "reject_level_touching_edge 를 False 로 두고 부분 뷰 학습 모델을 쓸 것",
