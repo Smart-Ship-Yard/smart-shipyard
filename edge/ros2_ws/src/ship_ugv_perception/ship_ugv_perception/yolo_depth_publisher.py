@@ -88,6 +88,14 @@ CLASS_CONFIDENCE = {
     'fallen_person': 0.15,
     'fire': 0.45,
     'helmet': 0.35,
+    # ★ 조립 단계(level1~5) 임계값 신설 (2026-08-27).
+    #   여태 여기 없어서 전역값(0.1)을 그대로 썼고, 그 결과
+    #   conf 0.02~0.08 짜리 쓰레기 검출이 그대로 발행돼 대시보드 공정률이
+    #   요동쳤다. 실측: 깨끗한 정면 프레임에서 level3 0.434 가 1위인데
+    #   level1 0.036 / 0.014 가 같이 딸려 나왔다.
+    #   진짜 판정은 0.43~0.83 에서 나오므로 0.35 로 가른다.
+    'level1': 0.35, 'level2': 0.35, 'level3': 0.35,
+    'level4': 0.35, 'level5': 0.35,
 }
 
 
@@ -228,6 +236,24 @@ class YoloDepthPublisher(Node):
         #   여기서는 **자르기만 해서 들고 있고**(numpy 슬라이스 복사, 0.05 ms
         #   수준), change_point_detector 가 새 이벤트를 확정해 발행했을 때
         #   그 시점에 딱 한 번 인코딩한다.
+        # ★ 배가 화면에서 잘리면 조립 단계를 오판한다 (2026-08-27 실측).
+        #   같은 배를 잘라가며 재보니:
+        #       전체        level3 0.434
+        #       왼쪽 40% 잘림 level3 0.629 + level4 0.345
+        #       왼쪽 50% 잘림 level4 0.561   <- 뒤집힘
+        #   그래서 bbox 가 화면 테두리에 닿으면(= 잘린 것) 조립 단계 판정에서
+        #   제외한다.
+        #
+        #   ⚠️ 이건 **모형 배 시연 전용**이다. 실물 배는 순찰 거리에서 절대
+        #   화면에 다 안 들어오므로, 이 규칙을 켜두면 **모든 검출을 버린다.**
+        #   실물 전환 시 반드시 False 로 두고, 대신 부분 뷰로 학습된 모델을
+        #   쓸 것. (이 트레이드오프를 놓치기 쉬워서 여기 적어둔다)
+        self.declare_parameter('reject_level_touching_edge', True)
+        self.declare_parameter('edge_margin_px', 3)
+        self.reject_level_edge = bool(
+            self.get_parameter('reject_level_touching_edge').value)
+        self.edge_margin = int(self.get_parameter('edge_margin_px').value)
+
         self.declare_parameter('snapshot_enabled', True)
         self.declare_parameter('snapshot_jpeg_quality', 70)
         self.declare_parameter('snapshot_margin_px', 40)
@@ -526,6 +552,18 @@ class YoloDepthPublisher(Node):
                       depth_image, display_image, draw_box=True):
         if conf < self._conf_for(class_name):
             return
+
+        # ★ 잘린 배로 조립 단계를 판정하지 않는다 (위 reject_level_touching_edge
+        #   주석 참고). 위험 이벤트(fire 등)는 잘려도 "거기 있다" 는 사실이
+        #   중요하므로 이 규칙을 적용하지 않는다 — 조립 단계만 대상이다.
+        if self.reject_level_edge and class_name.startswith('level'):
+            h, w = depth_image.shape[:2]
+            m = self.edge_margin
+            if x1 <= m or y1 <= m or x2 >= w - m or y2 >= h - m:
+                self.get_logger().info(
+                    f"[조립단계] {class_name} conf={conf:.2f} — 배가 화면에서 "
+                    "잘려 판정 제외", throttle_duration_sec=10.0)
+                return
 
         u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
 

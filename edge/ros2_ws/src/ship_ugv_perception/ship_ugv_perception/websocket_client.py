@@ -40,6 +40,7 @@ timestamp는 서버가 붙이므로 생략.
 """
 
 import json
+from collections import Counter, deque
 import math
 import queue
 import re
@@ -99,6 +100,9 @@ class WebSocketClient(Node):
         self.declare_parameter('fail_log_interval_s', 15.0)
         self.declare_parameter('block_id', 'B1')
         self.declare_parameter('block_level_stability_s', 3.0)
+        # ★ 다수결 투표로 바꿨다 (2026-08-27). 아래 _handle_block_level 참고.
+        self.declare_parameter('block_level_vote_ratio', 0.6)
+        self.declare_parameter('block_level_min_samples', 6)
 
         # ★ 2026-08-21: 카메라 오프셋·TF 파라미터를 지웠다. map_xy 변환은
         #   change_point_detector 가 전담하고, 이 노드는 그 결과만 받는다.
@@ -144,8 +148,11 @@ class WebSocketClient(Node):
         self._ekf_lock = threading.Lock()
         self._ping_count = 0
 
-        self._level_candidate = None
-        self._level_candidate_since = None
+        self._level_window = deque()      # (시각, level) — 최근 창
+        self._level_vote_ratio = float(
+            self.get_parameter('block_level_vote_ratio').value)
+        self._level_min_samples = int(
+            self.get_parameter('block_level_min_samples').value)
         self._level_confirmed = None
         self._level_lock = threading.Lock()
 
@@ -358,37 +365,64 @@ class WebSocketClient(Node):
             f"[치워짐 큐] {payload['cls']} event_id={payload['event_id']}")
 
     def _handle_block_level(self, class_id, level):
+        """최근 창에서 **다수결**로 조립 단계를 확정한다.
+
+        ★ 왜 다수결인가 (2026-08-27)
+
+        예전에는 "마지막 값이 block_level_stability_s 동안 계속 같아야" 확정했다.
+        값이 하나만 달라도 시계가 리셋되는 구조라, 검출이 조금만 흔들려도
+        영영 확정이 안 되거나, 반대로 틀린 값이 우연히 연속으로 나오면
+        그게 그대로 확정됐다.
+
+        실물에서 조립 단계 검출은 이렇게 흔들린다(실측):
+            깨끗한 정면      level3 0.434 (+ level1 0.036 딸려 나옴)
+            배가 40% 잘림    level3 0.629 + level4 0.345
+            배가 50% 잘림    level4 0.561   <- 뒤집힘
+            모션블러 7px     검출 없음
+
+        그래서 한 표씩 모아 다수결로 본다. 의견이 갈리면(득표율이
+        block_level_vote_ratio 미만) **아무것도 확정하지 않는다** — 틀린 값을
+        내보내는 것보다 조용한 편이 낫다.
+
+        (잘린 화면을 아예 안 받도록 하는 것은 yolo_depth_publisher 의
+         reject_level_touching_edge 가 맡는다. 여기까지 오는 표는 이미
+         "온전히 담긴 배" 에서 나온 것이다.)
+        """
         now = self.get_clock().now()
 
         with self._level_lock:
-            if self._level_candidate != level:
-                self._level_candidate = level
-                self._level_candidate_since = now
+            self._level_window.append((now, level))
+            cutoff = now - self.block_level_stability
+            while self._level_window and self._level_window[0][0] < cutoff:
+                self._level_window.popleft()
+
+            if len(self._level_window) < self._level_min_samples:
+                return
+
+            counts = Counter(lv for _, lv in self._level_window)
+            winner, votes = counts.most_common(1)[0]
+            ratio = votes / len(self._level_window)
+            if ratio < self._level_vote_ratio:
                 self.get_logger().info(
-                    f"[조립단계] 새 후보 감지: class_id={class_id} level={level} (안정화 대기 시작)")
+                    f"[조립단계] 의견이 갈림 {dict(counts)} — 확정 보류",
+                    throttle_duration_sec=10.0)
                 return
 
-            elapsed = now - self._level_candidate_since
-            if elapsed < self.block_level_stability:
+            if self._level_confirmed == winner:
                 return
-
-            if self._level_confirmed == level:
-                return
-
-            self._level_confirmed = level
+            self._level_confirmed = winner
 
         payload = {
             'event_type': 'block_level',
             'block_id': self.block_id,
-            'level': level,
+            'level': winner,
         }
         self._enqueue(payload)
-
-        # ★ ship_survey_node의 재측량 트리거 (interface.md ④: 조립 단계가 바뀌면
-        #   조립 과정에서 배가 밀리거나 돌아갔을 수 있으므로 다시 측량해야 함)
-        self.block_level_pub.publish(Int32(data=level))
-
-        self.get_logger().info(f"[조립단계 확정] level={level} -> 전송 + 재측량 트리거")
+        self.block_level_pub.publish(Int32(data=winner))
+        self.get_logger().info(
+            f"[조립단계 확정] level={winner} "
+            f"({votes}/{len(self._level_window)}표, {100*ratio:.0f}%) "
+            "-> 전송 + 재측량 트리거")
 
     def _ship_pose_cb(self, msg: String):
         try:
