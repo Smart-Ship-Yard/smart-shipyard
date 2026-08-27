@@ -244,15 +244,30 @@ class YoloDepthPublisher(Node):
         #   그래서 bbox 가 화면 테두리에 닿으면(= 잘린 것) 조립 단계 판정에서
         #   제외한다.
         #
-        #   ⚠️ 이건 **모형 배 시연 전용**이다. 실물 배는 순찰 거리에서 절대
-        #   화면에 다 안 들어오므로, 이 규칙을 켜두면 **모든 검출을 버린다.**
-        #   실물 전환 시 반드시 False 로 두고, 대신 부분 뷰로 학습된 모델을
-        #   쓸 것. (이 트레이드오프를 놓치기 쉬워서 여기 적어둔다)
+        #   ★ 실물에서도 True 로 둔다 (2026-08-27 판단).
+        #   실물 배는 순찰 거리에서 대개 화면에 다 안 들어온다. 그래서 처음엔
+        #   "실물이면 꺼야 한다" 고 봤는데, 다시 따져보니 그 반대다:
+        #     - 조립 단계는 **위험 이벤트가 아니다.** 빨리 갱신될 필요가 없고,
+        #       한 바퀴에 한 번만 맞게 갱신돼도 충분하다.
+        #     - 순찰 궤도 어딘가에는 배가 온전히 들어오는 지점이 생긴다.
+        #       그 지점의 판정만 받으면 된다.
+        #     - 잘린 화면으로 자주 갱신하는 것보다, 드물게 맞는 편이 낫다.
+        #   즉 **갱신 빈도를 내주고 정확도를 산다.** 위험 이벤트였다면
+        #   반대로 골랐겠지만 조립 단계는 그래도 된다.
+        #
+        #   ⚠️ 대신 위험이 하나 생긴다: 배가 **한 번도** 온전히 안 잡히면
+        #   공정률이 조용히 멈춘다. 그래서 아래 _warn_if_level_starved 로
+        #   시끄럽게 알린다. 조용한 실패가 제일 나쁘다.
         self.declare_parameter('reject_level_touching_edge', True)
         self.declare_parameter('edge_margin_px', 3)
         self.reject_level_edge = bool(
             self.get_parameter('reject_level_touching_edge').value)
         self.edge_margin = int(self.get_parameter('edge_margin_px').value)
+        self.declare_parameter('level_starved_warn_s', 120.0)
+        self.level_starved_warn = float(
+            self.get_parameter('level_starved_warn_s').value)
+        self._level_last_pass = time.time()   # 마지막으로 '온전한 배'를 본 시각
+        self._level_edge_rejects = 0
 
         self.declare_parameter('snapshot_enabled', True)
         self.declare_parameter('snapshot_jpeg_quality', 70)
@@ -560,10 +575,15 @@ class YoloDepthPublisher(Node):
             h, w = depth_image.shape[:2]
             m = self.edge_margin
             if x1 <= m or y1 <= m or x2 >= w - m or y2 >= h - m:
+                self._level_edge_rejects += 1
                 self.get_logger().info(
                     f"[조립단계] {class_name} conf={conf:.2f} — 배가 화면에서 "
                     "잘려 판정 제외", throttle_duration_sec=10.0)
+                self._warn_if_level_starved()
                 return
+            # 온전히 들어온 배를 봤다 — 굶주림 시계를 되돌린다
+            self._level_last_pass = time.time()
+            self._level_edge_rejects = 0
 
         u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
 
@@ -715,6 +735,25 @@ class YoloDepthPublisher(Node):
                 # 여기서 person 크기 박스를 또 그리면 화면에 두 개가 겹쳐 지저분해짐.
                 self._evaluate_box(hname, hconf, px1, py1, px2, py2,
                                    None, depth_image, display_image, draw_box=False)
+
+    # ------------------------------------------------------------------
+    def _warn_if_level_starved(self):
+        """배가 계속 잘려서 조립 단계가 한 번도 갱신되지 못하는 상황을 알린다.
+
+        reject_level_touching_edge 는 "온전히 보일 때만 판정한다" 는 정책이라,
+        순찰 궤도가 배에 너무 붙었거나 배가 커지면 **판정이 영영 안 나올 수
+        있다.** 그런데 그건 에러가 아니라 그냥 조용함이라 눈치채기 어렵다.
+        조용한 실패가 제일 나쁘므로 여기서 시끄럽게 만든다.
+        """
+        idle = time.time() - self._level_last_pass
+        if idle < self.level_starved_warn:
+            return
+        self.get_logger().warn(
+            f"[조립단계] {idle/60:.0f}분째 배가 화면에 온전히 안 담긴다 "
+            f"(잘려서 제외한 검출 {self._level_edge_rejects}건). "
+            "공정률이 갱신되지 않고 있다 — 순찰 반경을 넓히거나, "
+            "reject_level_touching_edge 를 False 로 두고 부분 뷰 학습 모델을 쓸 것",
+            throttle_duration_sec=60.0)
 
     # ------------------------------------------------------------------
     def _stash_crop(self, class_name, color_image, x1, y1, x2, y2):
