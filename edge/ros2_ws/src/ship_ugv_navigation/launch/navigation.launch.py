@@ -97,6 +97,9 @@ navigation.launch.py — Nav2 자율주행 스택 기동 (Step 5)
 
 import glob
 import os
+import subprocess
+import sys
+import time
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -366,7 +369,8 @@ def launch_setup(context, *args, **kwargs):
     #   **경로 추종이 통째로 망가졌다** (Nav2 조향과 bridge 조향이 서로 싸움).
     #   런치 로그가 워낙 길어 이 ERROR 한 줄은 눈에 띄지도 않는다.
     #   그래서 성공할 때까지 재시도하고, 끝내 실패하면 크게 찍는다.
-    nodes.append(_set_heading_hold('false', 'Nav2 시작', tries=30))
+    # heading_hold off 는 위 _wait_heading_hold_off() 가 런치 전에 이미 끝냈다.
+    # 여기서 또 비동기로 쏘면 경쟁이 되살아나므로 넣지 않는다.
 
     # ★ 그리고 Nav2 가 꺼질 때 반드시 되돌린다 (2026-08-17).
     #   되돌리지 않으면 이런 함정이 생긴다:
@@ -459,6 +463,66 @@ def launch_setup(context, *args, **kwargs):
 
 
 
+def _wait_heading_hold_off(timeout_s: float = 60.0):
+    """Nav2 를 띄우기 **전에** heading_hold 를 끄고, 꺼질 때까지 기다린다.
+
+    ★ 왜 런치가 뜨기 전에 하는가 (2026-08-27)
+
+    wheel_odom_bridge 의 heading_hold 는 "직진 의도(|w| < 0.02)" 일 때 자체
+    yaw 보정을 넣는다. Nav2 가 조향하는 동안 이게 켜져 있으면 **두 컨트롤러가
+    같은 바퀴를 두고 싸운다.** 순찰 웨이포인트 사이 구간은 거의 직선이라 w 가
+    수시로 0 근처로 떨어지므로, heading_hold 가 끼어들었다 빠졌다 하며
+    로봇이 덜덜 떤다.
+
+    예전에는 이걸 ExecuteProcess 로 노드들과 **함께** 띄웠는데, `ros2 param set`
+    은 매번 새 ROS 노드를 만들어 디스커버리를 처음부터 하므로 실측 **9~11초**가
+    걸렸다(런치 로그 전수 조사: 성공 75회 / 성공 전에 죽음 12회). 그동안
+    patrol_mission_node 는 지연 없이(create_timer 0.2초) 목표를 쏘기 시작하므로,
+    **Nav2 켠 뒤 약 10초 동안 두 컨트롤러가 동시에 조향할 수 있었다.**
+
+    그래서 순서를 뒤집었다. 이 함수는 LaunchDescription 을 만들기 전에
+    동기적으로 돌아서, 꺼진 것을 확인하기 전에는 **노드가 하나도 안 뜬다.**
+    로봇이 움직일 방법 자체가 없으므로 경쟁이 구조적으로 사라진다.
+    """
+    bar = '=' * 68
+    print('\n' + bar)
+    print('⏳  heading_hold 가 꺼지길 기다립니다 — 아직 로봇은 움직이지 않습니다')
+    print('')
+    print('    wheel_odom_bridge 의 heading_hold 가 켜진 채로 Nav2 가 조향하면')
+    print('    두 컨트롤러가 같은 바퀴를 두고 싸워 로봇이 덜덜 떱니다.')
+    print('    꺼진 것을 확인하기 전에는 Nav2 노드를 하나도 띄우지 않습니다.')
+    print(bar, flush=True)
+
+    started = time.time()
+    tries = 0
+    while time.time() - started < timeout_s:
+        tries += 1
+        try:
+            out = subprocess.run(
+                ['ros2', 'param', 'set', '/wheel_odom_bridge',
+                 'enable_heading_hold', 'false'],
+                capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            out = ''
+        if 'successful' in out:
+            waited = time.time() - started
+            print('\n' + bar)
+            print(f'✅  heading_hold 를 껐습니다 ({tries}번째 시도, {waited:.0f}초)')
+            print('    이제 Nav2 를 띄우고 로봇이 움직이기 시작합니다.')
+            print(bar + '\n', flush=True)
+            return
+        time.sleep(1.0)
+
+    print('\n' + bar)
+    print('❌  heading_hold 를 끄지 못했습니다 — Nav2 를 시작하지 않습니다')
+    print('')
+    print('    이 상태로 순찰하면 조향이 싸워서 주행이 망가집니다.')
+    print('    로컬라이제이션이 떠 있는지 확인할 것:')
+    print('        ros2 node list | grep wheel_odom_bridge')
+    print(bar + '\n', flush=True)
+    sys.exit(1)
+
+
 def _set_heading_hold(value: str, label: str, tries: int = 30):
     """wheel_odom_bridge 의 enable_heading_hold 를 확실하게 바꾼다.
 
@@ -488,6 +552,10 @@ def _set_heading_hold(value: str, label: str, tries: int = 30):
 
 
 def generate_launch_description():
+    # ★ 다른 어떤 것보다 먼저. 꺼진 것을 확인하기 전에는 노드가 하나도 안 뜬다.
+    #   (자세한 이유는 _wait_heading_hold_off 주석 참고)
+    _wait_heading_hold_off()
+
     pkg_share = get_package_share_directory('ship_ugv_navigation')
 
     args = [
