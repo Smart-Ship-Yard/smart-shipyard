@@ -17,6 +17,10 @@
 | 다른 망에서 접속 | 불가 | 서버만 열면 됨 |
 | 젯슨 CPU | 0.43 코어 | 0.42 코어 |
 
+이전 직후 실측 (2026-08-28): 젯슨→서버 **152 KB/s = 1.2 Mbps**, H.264 1트랙.
+`[path ugv1] stream is available and online, 1 track (H264)` — 재인코딩 없이
+그대로 통과한다.
+
 ---
 
 ## 설치 (이 노트북 = Ubuntu 22.04 / x86_64)
@@ -113,7 +117,7 @@ journalctl -u mediamtx -f        # 젯슨이 붙으면 여기 로그가 뜬다
 ## 하지 말 것
 
 - **녹화를 같이 켜지 말 것.** 이전이 잘 됐는지 못 가린다. 나중에 따로.
-  (H.264 640×360 기준 하루 약 16GB — 켤 때 `recordDeleteAfter` 필수)
+  (실측 1.2 Mbps → 하루 약 13GB — 켤 때 `recordDeleteAfter` 필수)
 - **mediamtx 에만 비밀번호를 걸지 말 것.** 백엔드에 인증이 없어서 프론트 소스에
   그 비밀번호가 그대로 박힌다. 백엔드 로그인이 생기면 그때
   `authMethod: http` + `authHTTPAddress` 로 백엔드에 물어보게 묶는다.
@@ -124,6 +128,20 @@ journalctl -u mediamtx -f        # 젯슨이 붙으면 여기 로그가 뜬다
 
 지금은 **같은 망의 누구나 보고, 누구나 송출할 수 있다.** 방화벽의
 `192.168.0.0/24` 제한이 유일한 방어선이다. 현장 적용 전 반드시 막을 것.
+
+## 참고 — 로그에 뜨는 "RTP packets are too big"
+
+```
+[path ugv1] RTP packets are too big (1460 > 1440), remuxing them into smaller ones
+```
+
+**정상이다. 재인코딩이 아니다.** 젯슨의 ffmpeg 가 이더넷 MTU(1500) 기준으로
+RTP 패킷을 만드는데, mediamtx 는 WebRTC 로 내보낼 때 더 작은 상한(1440)을 쓴다.
+그래서 패킷을 쪼개기만 한다 — H.264 데이터 자체는 손대지 않는다.
+바로 윗줄의 `stream is available and online, 1 track (H264)` 이 그 증거다.
+
+"remuxing" 이라는 말 때문에 CPU 를 먹는 재인코딩으로 오해하기 쉽다.
+없애고 싶으면 젯슨 ffmpeg 에 `-pkt_size 1200` 을 주면 되지만, 굳이 할 필요는 없다.
 
 ## 참고 — 포트가 백엔드와 겹쳐 보이는 것
 
