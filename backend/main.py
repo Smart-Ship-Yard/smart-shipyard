@@ -346,6 +346,17 @@ RESTORE_FLOOR_AT = datetime.now(KST)
 #     DB 기록도 한 건 남긴다 — 복원이 시각만으로도 성립하게 하는 안전장치다.
 jetson_live_event_ids: set = set()
 
+# 지금 백필이 돌고 있는 event_id.
+#
+# ★ 왜 필요한가 (2026-08-29)
+#   _backfill_replay_event 는 "있나 확인 → 없으면 넣기" 인데 그 사이가 비어 있다.
+#   재통보는 **묶음으로** 온다(젯슨이 복원한 것을 재연결 때 한꺼번에 올린다).
+#   젯슨이 짧은 간격으로 두 번 붙으면 같은 event_id 의 백필 두 개가 동시에 돌아
+#   둘 다 "없음" 을 보고 각각 넣는다 —— 중복 기록이 생긴다.
+#
+#   여기 넣어두고 끝나면 뺀다. 이미 돌고 있으면 두 번째는 그냥 넘어간다.
+_backfill_inflight: set = set()
+
 
 async def _backfill_replay_event(doc: dict):
     """재통보로만 알게 된 이벤트를 처음 한 번 기록한다.
@@ -357,6 +368,9 @@ async def _backfill_replay_event(doc: dict):
     것" 이라는 사실을 남겨야 나중에 감사할 때 감지 시각을 오해하지 않는다.
     """
     eid = doc.get("event_id")
+    if eid in _backfill_inflight:
+        return              # 같은 이벤트를 이미 넣는 중이다
+    _backfill_inflight.add(eid)
     try:
         # ★ "아예 없을 때" 가 아니라 "이번 세션 기록이 없을 때" 저장한다
         #   (2026-08-29 수정).
@@ -383,6 +397,8 @@ async def _backfill_replay_event(doc: dict):
         print(f"💾 [재통보] 이번 세션 기록으로 남김: {eid}")
     except Exception as e:
         print(f"⚠️ [재통보] 기록 실패({type(e).__name__}): {eid}")
+    finally:
+        _backfill_inflight.discard(eid)
 
 
 def schedule_replay_backfill(doc: dict):
