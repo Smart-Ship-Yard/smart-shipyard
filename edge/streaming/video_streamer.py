@@ -31,6 +31,7 @@ yolo_depth_publisher.py가 `/camera/color/compressed_raw` 토픽으로 발행하
   (또는 파라미터 지정: python3 video_streamer.py --ros-args -p image_topic:=/camera/color/compressed)
 """
 
+import os
 import subprocess
 import sys
 
@@ -48,8 +49,18 @@ LOW_LATENCY_QOS = QoSProfile(
     depth=1,
 )
 
-FFMPEG_PATH = "/home/ship_yard/ffmpeg"
-RTSP_URL = "rtsp://127.0.0.1:8554/ugv1"
+FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "/home/ship_yard/ffmpeg")
+
+# ★ 송출 목적지 (2026-08-28)
+#   기본값은 젯슨 자신의 mediamtx 다. 중앙 미디어 서버로 옮길 때는 **코드를
+#   고치지 말고** systemd 유닛의 Environment= 만 바꾼다:
+#
+#       Environment=RTSP_URL=rtsp://192.168.0.5:8554/ugv1
+#
+#   그러면 ffmpeg 이 인코딩한 H.264 스트림이 그대로 서버로 올라간다.
+#   재인코딩이 없으므로 젯슨 CPU 는 오히려 mediamtx 몫(약 1.2%)만큼 줄고,
+#   시청자가 몇 명이든 젯슨은 **스트림 하나만** 올려보낸다.
+RTSP_URL = os.environ.get("RTSP_URL", "rtsp://127.0.0.1:8554/ugv1")
 
 
 class VideoStreamer(Node):

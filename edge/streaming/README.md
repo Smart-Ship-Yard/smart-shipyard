@@ -34,6 +34,20 @@ mediamtx    1.2%  of 1 core
 젯슨에 인코더는 있다(`ffmpeg -encoders | grep v4l2m2m`). 다만 지연·화질이
 나빠지는 사례가 있어 **실측 후에 바꿀 것.** `video_streamer.py` 한 줄이다.
 
+## 파일 위치 — 심링크로 하나만 둔다
+
+```
+/home/ship_yard/video_streamer.py  ->  edge/streaming/video_streamer.py (심링크)
+```
+
+systemd 가 `/home/ship_yard/video_streamer.py` 를 실행하는데, 그게 저장소
+파일을 가리키는 심링크다. **사본을 두 벌 두지 않는다** — 젯슨 로컬본과
+저장소본이 갈라지면 "고쳤는데 안 바뀐다" 가 된다. 2026-08-27 에 YOLO 에서
+정확히 그 문제로 몇 시간을 썼다(systemd 가 옛 코드를 붙잡고 있었다).
+
+`mediamtx.yml` 은 아직 사본이다 — mediamtx 가 심링크를 따라가긴 하지만
+설정 변경이 드물어 그냥 두었다. 고칠 때는 **양쪽 다** 고칠 것.
+
 ## 중앙 미디어 서버로 옮기려면
 
 지금은 mediamtx 가 **젯슨 위**에 있다. 산업 표준 배치는 미디어 서버가
@@ -45,11 +59,22 @@ mediamtx    1.2%  of 1 core
 표준:  젯슨 ──RTSP push──> mediamtx(중앙)  ──WebRTC──> 시청자들
 ```
 
-바꿀 것은 문자열 두 개와 mediamtx 실행 위치뿐이다:
+**코드는 안 고친다.** 젯슨 쪽은 systemd 환경변수 한 줄이다:
 
-1. `video_streamer.py` 의 `RTSP_URL` -> `rtsp://<서버IP>:8554/ugv1`
-2. 프론트 `DIRECT_CAMERA_URL` -> `http://<서버IP>:8889/ugv1`
-3. 같은 mediamtx 바이너리를 서버에서 실행
+```bash
+# /etc/systemd/system/video-streamer.service 의 주석 한 줄을 푼다
+Environment=RTSP_URL=rtsp://192.168.0.5:8554/ugv1
+
+sudo systemctl daemon-reload
+sudo systemctl restart video-streamer
+sudo systemctl disable --now mediamtx     # 젯슨의 mediamtx 는 이제 불필요
+```
+
+서버 쪽은 같은 mediamtx 바이너리를 띄우고, 프론트의 `DIRECT_CAMERA_URL` 을
+`http://<서버IP>:8889/ugv1` 로 바꾼다.
+
+`video-streamer.service` 의 mediamtx 의존은 `Requires` 가 아니라 `Wants` 다.
+`Requires` 였다면 젯슨에서 mediamtx 를 내리는 순간 video-streamer 도 안 뜬다.
 
 **얻는 것:** 시청자가 늘어도 로봇이 아니라 서버가 감당한다. 다른 망에서도
 접속된다. 중앙 인증·녹화를 붙일 수 있다.
