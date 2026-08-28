@@ -164,6 +164,27 @@ class WebSocketClient(Node):
         #   (참조 대입 하나라 CPython 에서는 락 없이도 원자적이다)
         self._last_ship_pose = None
 
+        # ★ 위치 핑은 큐에 넣지 않는다 (2026-08-29).
+        #   서버가 꺼져 있는 동안에도 0.5초마다 만들어지므로 큐에 넣으면
+        #   1시간 끊김 = 7,200건이 쌓였다가 재연결 순간 한꺼번에 쏟아진다.
+        #   서버와 프론트가 과거 좌표를 순서대로 재생하게 된다.
+        #   **위치는 최신 하나만 의미가 있으므로** 슬롯 하나로 덮어쓴다.
+        #   (이벤트는 하나도 버리면 안 되므로 큐를 그대로 쓴다)
+        self._pending_position = None
+
+        # ★ 지금 현장에 살아있는 위험 이벤트 거울 (2026-08-29).
+        #   서버가 재시작하면 프론트가 빈 화면으로 시작하는데, 로봇은
+        #   change_point 가 이미 기억하고 있어 **재발행을 하지 않는다.**
+        #   그래서 불이 눈앞에 있는데 화면에는 아무것도 없는 상태가
+        #   **무기한** 이어진다 (event_ttl 은 재검출마다 갱신되므로 만료되지
+        #   않는다). 재연결할 때 다시 알려서 화면을 진실과 맞춘다.
+        #   조립 단계·배 위치가 이미 쓰는 방식과 같다.
+        #
+        #   change_point 는 건드리지 않는다 — 로봇이 멈추는 판단
+        #   (/map_point -> event_gate)에는 영향이 없어야 하기 때문이다.
+        self._active_events = {}          # event_id -> payload
+        self._active_lock = threading.Lock()
+
         # ★ 서버 -> 젯슨 수신 메시지를 그대로 중계할 퍼블리셔 (해석하지 않음)
         self.inbound_pub = self.create_publisher(String, inbound_topic, 10)
 
@@ -234,11 +255,12 @@ class WebSocketClient(Node):
         if ekf_global is None or yaw is None:
             return
 
-        self._enqueue({
+        # ★ 큐가 아니라 슬롯에 덮어쓴다 (위 _pending_position 주석 참고)
+        self._pending_position = {
             'event_type': 'position',
             'ekf_global': ekf_global,
             'yaw': yaw,
-        })
+        }
 
         self._ping_count += 1
         if self._ping_count % 10 == 0:
@@ -334,6 +356,12 @@ class WebSocketClient(Node):
             'event_id': det.get('event_id'),
             'ekf_global': ekf_global,
         }
+        # ★ 거울에 넣는다 — 재연결 때 다시 알리려고
+        #   (위 _active_events 주석 참고)
+        _eid = payload.get('event_id')
+        if _eid:
+            with self._active_lock:
+                self._active_events[_eid] = dict(payload)
         self._enqueue(payload)
         self.get_logger().info(
             f"[위험이벤트 큐] {event_type} conf={confidence:.2f} "
@@ -360,6 +388,11 @@ class WebSocketClient(Node):
             self.get_logger().warn(f"/cleared 파싱 실패: {e}")
             return
 
+        # 치워졌으므로 거울에서도 뺀다
+        _eid = payload.get('event_id')
+        if _eid:
+            with self._active_lock:
+                self._active_events.pop(_eid, None)
         self._enqueue(payload)
         self.get_logger().info(
             f"[치워짐 큐] {payload['cls']} event_id={payload['event_id']}")
@@ -503,11 +536,31 @@ class WebSocketClient(Node):
                     self.get_logger().info(
                         f"[배위치 재통보] map_xy={last_pose['map_xy']} 재전송")
 
+                # ★ 지금 살아있는 위험 이벤트도 다시 알린다 (2026-08-29).
+                #   서버가 재시작하면 프론트는 빈 화면인데 change_point 는
+                #   이미 기억하고 있어 재발행하지 않는다. 그대로 두면 불이
+                #   눈앞에 있는데 화면에는 아무것도 없는 상태가 **무기한**
+                #   이어진다(event_ttl 은 재검출마다 갱신되므로 만료 안 됨).
+                #   replay 를 실어 보내 프론트가 팝업 없이 핑만 그리게 한다.
+                with self._active_lock:
+                    revive = [dict(v) for v in self._active_events.values()]
+                for ev in revive:
+                    ev['replay'] = True
+                    self._enqueue(ev)
+                if revive:
+                    self.get_logger().info(
+                        f"[위험이벤트 재통보] {len(revive)}건 재전송: "
+                        + ', '.join(str(e.get('event_id')) for e in revive))
+
                 while not self._stop_event.is_set():
+                    # 이벤트가 먼저다. 큐가 비었을 때만 최신 위치를 보낸다.
                     try:
-                        payload = self.send_queue.get(timeout=1.0)
+                        payload = self.send_queue.get(timeout=0.2)
                     except queue.Empty:
-                        continue
+                        payload = self._pending_position
+                        self._pending_position = None
+                        if payload is None:
+                            continue
 
                     try:
                         ws.send(json.dumps(payload))
