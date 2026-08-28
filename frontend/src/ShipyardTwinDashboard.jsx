@@ -31,14 +31,18 @@ const EVENT_WS_URL = `ws://${SERVER_HOST}/ws/frontend`;
  *   즉 지금까지와 똑같이 동작한다 — 팀원이 각자 노트북에서 받아 그대로 실행할
  *   수 있어야 하기 때문이다.
  *
- * sessionStorage 에 둔다: 탭을 닫으면 사라지고 다른 탭과 섞이지 않는다.
- * 관제 화면을 켜둔 채 자리를 비웠을 때 위험이 오래 남지 않게 하려는 것이다. */
+ * localStorage 에 둔다. sessionStorage 는 **탭마다 따로**라, 탭을 새로 열 때마다
+ * 다시 로그인해야 했다. 관제 중에 창을 하나 더 여는 일이 잦아 성가시다.
+ *
+ * 대신 브라우저를 닫아도 남는다. 시연·개발 환경에서는 그 편이 실용적이고,
+ * 자리를 뜰 때 화면을 잠그고 싶으면 브라우저 데이터를 지우거나 암호를 바꾼다.
+ * (토큰은 암호에서 유도하므로 암호를 바꾸면 전부 무효가 된다) */
 const TOKEN_KEY = "shipyard_token";
 function getToken() {
-  try { return sessionStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
+  try { return localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
 }
 function setToken(t) {
-  try { if (t) sessionStorage.setItem(TOKEN_KEY, t); else sessionStorage.removeItem(TOKEN_KEY); } catch { /* 무시 */ }
+  try { if (t) localStorage.setItem(TOKEN_KEY, t); else localStorage.removeItem(TOKEN_KEY); } catch { /* 무시 */ }
 }
 /* 토큰이 있으면 주소에 붙인다. 없으면 원래 주소 그대로. */
 function withToken(url) {
@@ -1891,6 +1895,8 @@ function DashboardInner() {
   // 리렌더를 일으키지 않으므로, 화면에 그릴 값은 state 로 따로 둔다.
   const [robotConnected, setRobotConnected] = useState(null);
   const [showHistory, setShowHistory] = useState(false);  // 지난 기록 조회 화면
+  // 이벤트 로그를 심각도로 거른다. null 이면 전체. 위험/경고 칸을 눌러 바꾼다.
+  const [logFilter, setLogFilter] = useState(null);
   // 로봇이 실제로 일할 수 있는 상태인가 (jetson_ready).
   //
   // ★ "연결됨" 과 다르다. 소켓은 살아 있는데 AMCL·Nav2 가 아직 안 뜬 구간이
@@ -2169,7 +2175,25 @@ function DashboardInner() {
         // (재)연결될 때마다 최신 스냅샷을 다시 읽는다.
         fetchInitData();
       },
-      onClose: () => { console.log("[이벤트 채널] 연결 끊김"); setConnected(false); },
+      onClose: () => {
+        console.log("[이벤트 채널] 연결 끊김");
+        setConnected(false);
+        // 🔒 토큰이 더는 안 통하면 영원히 재접속만 반복하게 된다.
+        //   (예전엔 서버 재시작이 토큰을 무효로 만들어 실제로 그랬다)
+        //   끊길 때마다 한 번 확인해서, 인증이 필요한데 우리 토큰이 거부되면
+        //   토큰을 버리고 로그인 화면으로 되돌린다.
+        if (getToken()) {
+          fetch(withToken(`http://${SERVER_HOST}/api/init-data`))
+            .then((r) => {
+              if (r.status === 401) {
+                console.warn("[인증] 토큰이 더 이상 유효하지 않다 — 다시 로그인해야 한다");
+                setToken("");
+                window.location.reload();
+              }
+            })
+            .catch(() => { /* 서버가 꺼진 것이면 그냥 재시도에 맡긴다 */ });
+        }
+      },
       onError: () => setConnected(false),
       onMessage: (data) => {
         const type = data.event_type;
@@ -2537,9 +2561,16 @@ function DashboardInner() {
           <div className="panel">
             <div className="panel-h">실시간 위험 요약</div>
             <div className="kpis">
-              <Kpi label="위험" value={stats.danger} color={SEV_COLOR.danger} pulse={dangerCount > 0} />
-              <Kpi label="경고" value={stats.warn} color={SEV_COLOR.warn} />
-              <Kpi label="정상" value={stats.info} color={SEV_COLOR.info} />
+              {/* "정상" 은 뺐다 — 아무 일도 없다는 것을 숫자로 세는 칸이라
+                  관제사가 볼 이유가 없고, 늘 0 이라 화면만 차지했다.
+                  대신 두 칸을 눌러 로그를 걸러 볼 수 있게 했다. */}
+              <Kpi label="위험" value={stats.danger} color={SEV_COLOR.danger}
+                   pulse={dangerCount > 0}
+                   active={logFilter === SEVERITY.DANGER}
+                   onClick={() => setLogFilter(logFilter === SEVERITY.DANGER ? null : SEVERITY.DANGER)} />
+              <Kpi label="경고" value={stats.warn} color={SEV_COLOR.warn}
+                   active={logFilter === SEVERITY.WARN}
+                   onClick={() => setLogFilter(logFilter === SEVERITY.WARN ? null : SEVERITY.WARN)} />
             </div>
           </div>
 
@@ -2605,8 +2636,16 @@ function DashboardInner() {
         <aside className="right">
           <div className="panel grow">
             <div className="panel-h">
-              위험 이벤트 로그
-              <span className="log-count">{events.length}</span>
+              {logFilter === SEVERITY.DANGER ? "위험 기록"
+                : logFilter === SEVERITY.WARN ? "경고 기록" : "이벤트 로그"}
+              <span className="log-count">
+                {(logFilter ? events.filter((e) => e._meta?.severity === logFilter) : events).length}
+              </span>
+              {logFilter && (
+                <button type="button" className="log-filter-off" onClick={() => setLogFilter(null)}>
+                  전체 보기
+                </button>
+              )}
               <button
                 type="button"
                 className="log-reset"
@@ -2617,8 +2656,21 @@ function DashboardInner() {
               </button>
             </div>
             <div className="log">
-              {events.length === 0 && <div className="log-empty">이벤트 수신 대기 중…</div>}
-              {events.map((e) => (
+              {(() => {
+                const shown = logFilter
+                  ? events.filter((e) => e._meta?.severity === logFilter)
+                  : events;
+                if (events.length === 0)
+                  return <div className="log-empty">이벤트 수신 대기 중…</div>;
+                if (shown.length === 0)
+                  return (
+                    <div className="log-empty">
+                      {logFilter === SEVERITY.DANGER ? "위험" : "경고"} 기록이 없습니다
+                    </div>
+                  );
+                return null;
+              })()}
+              {(logFilter ? events.filter((e) => e._meta?.severity === logFilter) : events).map((e) => (
                 <button key={e.id} className={`log-row sev-${e._meta.severity}`} onClick={() => openBlockView(e)}>
                   <span className="log-dot" style={{ background: SEV_COLOR[e._meta.severity] }} />
                   <span className="log-cls">{e._meta.label}</span>
@@ -2707,9 +2759,16 @@ function DashboardInner() {
   );
 }
 
-function Kpi({ label, value, color, pulse }) {
+/* 누르면 아래 이벤트 로그가 그 심각도만 남는다. 다시 누르면 해제.
+ * 위험(화재·쓰러짐)과 경고(안전모·결함)를 갈라 보기 위한 것이다. */
+function Kpi({ label, value, color, pulse, active, onClick }) {
   return (
-    <div className={`kpi ${pulse ? "kpi-pulse" : ""}`}>
+    <div
+      className={`kpi ${pulse ? "kpi-pulse" : ""} ${onClick ? "kpi-click" : ""} ${active ? "kpi-active" : ""}`}
+      onClick={onClick}
+      role={onClick ? "button" : undefined}
+      title={onClick ? `${label} 기록만 보기 (다시 누르면 전체)` : undefined}
+    >
       <div className="kpi-val" style={{ color }}>{value}</div>
       <div className="kpi-label">{label}</div>
     </div>
@@ -2822,6 +2881,12 @@ const CSS = `
 .kpi-val { font-size:26px; font-weight:800; font-variant-numeric:tabular-nums; line-height:1; }
 .kpi-label { font-size:11px; color:#7d8aa3; margin-top:6px; }
 .kpi-pulse { animation:dangerPulse 1.1s infinite; border-color:#ff3b47; }
+.kpi-click { cursor:pointer; }
+.kpi-click:hover { background:#16202f; }
+.kpi-active { border-color:#2dd4bf; box-shadow:0 0 0 1px #2dd4bf inset; }
+.log-filter-off { margin-left:8px; font-size:10px; padding:2px 7px; cursor:pointer;
+  background:#16202f; color:#7d8aa3; border:1px solid #2a3a52; border-radius:5px; }
+.log-filter-off:hover { color:#e6edf6; }
 @keyframes dangerPulse { 0%,100%{box-shadow:0 0 0 rgba(255,59,71,0)} 50%{box-shadow:0 0 16px rgba(255,59,71,.45)} }
 
 .progress-list { display:flex; flex-direction:column; gap:9px; overflow-y:auto; flex:1 1 auto; }

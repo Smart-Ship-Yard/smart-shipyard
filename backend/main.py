@@ -286,23 +286,37 @@ app.mount("/snapshots", StaticFiles(directory=SNAPSHOT_DIR), name="snapshots")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
 AUTH_ENABLED = bool(DASHBOARD_PASSWORD)
 
-# 발급한 토큰들. 프로세스 메모리에만 둔다 — 서버를 다시 켜면 다시 로그인해야
-# 한다. 시연 규모에서는 그게 오히려 안전하고, 저장소가 따로 필요 없다.
-_valid_tokens: set = set()
+# 토큰은 암호에서 **유도**한다. 무작위로 만들어 메모리에 두지 않는다.
+#
+# ★ 왜 바꿨나 (2026-08-29)
+#   처음에는 무작위 토큰을 메모리 집합에 넣어뒀다. 그랬더니 **서버를 재시작하는
+#   순간 모든 토큰이 무효**가 됐다. 대시보드는 그 사실을 모른 채 옛 토큰으로
+#   계속 재접속을 시도했고, 서버 로그에는 "토큰 없음/불일치" 만 끝없이 찍혔다.
+#   화면은 "서버와의 연결이 끊겼습니다" 에서 영원히 못 벗어났다.
+#
+#   암호에서 유도하면 서버를 껐다 켜도 같은 토큰이 유효하다. 재시작이 잦은
+#   개발·시연 환경에서 이게 훨씬 실용적이다.
+#
+# ★ 보안상 무엇을 포기했나
+#   이 토큰은 사실상 "암호를 안다는 증명" 이다. 새어 나가면 암호가 샌 것과 같고,
+#   개별 취소도 안 된다(암호를 바꾸면 전부 무효가 된다). 계정별 추적이 필요해지면
+#   그때 무작위 토큰 + 저장소로 바꾼다. 지금 막으려는 것은 "같은 망의 아무나
+#   들어오는 것" 이고, 그 목적에는 이걸로 충분하다.
+_TOKEN_SALT = "shipyard-dashboard-v1"
 
 
 def issue_token() -> str:
-    """추측할 수 없는 토큰을 하나 만들어 기억한다."""
-    t = secrets.token_urlsafe(32)
-    _valid_tokens.add(t)
-    return t
+    """암호에서 토큰을 유도한다. 같은 암호면 항상 같은 값이다."""
+    return hashlib.sha256((_TOKEN_SALT + DASHBOARD_PASSWORD).encode("utf-8")).hexdigest()
 
 
 def token_ok(token: Optional[str]) -> bool:
-    """암호를 안 걸었으면 항상 통과. 걸었으면 발급한 토큰만 통과."""
+    """암호를 안 걸었으면 항상 통과. 걸었으면 유도한 토큰만 통과."""
     if not AUTH_ENABLED:
         return True
-    return bool(token) and token in _valid_tokens
+    if not token:
+        return False
+    return secrets.compare_digest(token, issue_token())
 
 
 @app.post("/api/login")
@@ -544,6 +558,14 @@ async def _active_danger_events(limit: int = 300):
         if d["event_type"] == EVENT_CLEARED:
             alive.pop(eid, None)
         else:
+            # ★ 사진을 잃지 않게 이어붙인다 (2026-08-29).
+            #   같은 event_id 의 문서가 여럿일 수 있다 — 처음 감지된 기록(사진 있음)과
+            #   재통보로 남긴 기록(사진 없음)이 그렇다. 뒤엣것이 그냥 덮으면
+            #   **복원된 이벤트에서 감지 순간 사진이 사라진다.**
+            #   실제로 구획·핑을 눌러도 사진이 안 나오는 증상이 됐다.
+            prev = alive.get(eid)
+            if prev and not d.get("image_url") and prev.get("image_url"):
+                d = {**d, "image_url": prev["image_url"]}
             alive[eid] = d
     return list(alive.values())
 
