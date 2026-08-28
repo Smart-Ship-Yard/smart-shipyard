@@ -1493,6 +1493,11 @@ export default function ShipyardTwinDashboard() {
   // 3D 씬을 못 띄운 이유. null 이면 정상.
   // ★ 이게 있어야 WebGL 실패가 대시보드 전체를 무너뜨리지 않는다 (아래 참고).
   const [sceneError, setSceneError] = useState(null);
+  // 로봇 연결 알림 팝업. null 이면 안 떠 있음. true=재연결됨 / false=끊김.
+  const [robotNotice, setRobotNotice] = useState(null);
+  // 직전 연결 상태. 처음 받은 값은 "변화"가 아니므로 팝업을 띄우지 않는다
+  // (단, 처음부터 끊겨 있으면 알려줘야 하므로 그때는 띄운다 — 아래 참고).
+  const robotConnectedRef = useRef(null);
   const sceneRef = useRef(null);
   const [events, setEvents] = useState([]);          // 이벤트 로그
   const [activeBlock, setActiveBlock] = useState(null);
@@ -1772,6 +1777,26 @@ export default function ShipyardTwinDashboard() {
           return;
         }
 
+        // ⑥ 로봇 연결 상태 — 서버가 알려준다. {"connected": true/false}
+        //
+        // 로봇이 꺼져도 화면의 위험 핑은 그대로 남는다(위험이 사라진 게 아니므로
+        // 맞는 동작이다). 그래서 화면만 봐서는 실시간 정보가 멈춘 걸 알 수 없다.
+        //
+        // ★ 팝업은 "상태가 바뀌었을 때"만 띄운다. 다만 대시보드를 여는 순간
+        //   이미 끊겨 있으면 그것도 알려야 하므로, 첫 수신이어도 끊김이면 띄운다.
+        //   (첫 수신이 "연결됨" 이면 평상시라 조용히 넘어간다)
+        if (type === "jetson_status") {
+          const now = data.connected === true;
+          const prev = robotConnectedRef.current;
+          robotConnectedRef.current = now;
+          if (prev === null ? !now : prev !== now) {
+            // 이전 알림이 아직 떠 있어도 그냥 덮어쓴다 — 최신 상태가 항상 이긴다.
+            // (끊김 팝업을 안 닫은 채로 재연결되면 자동으로 재연결 팝업으로 바뀐다)
+            setRobotNotice(now);
+          }
+          return;
+        }
+
         // ⑤ 감지 순간 사진 — 위험 이벤트 **바로 뒤에** 같은 event_id 로 따라온다.
         // {"event_type":"event_snapshot","block_id":"B1","event_id":"fire@0.63,-0.23",
         //  "cls":"fire","image_url":"/snapshots/f5edf801....jpg"}
@@ -2032,6 +2057,37 @@ export default function ShipyardTwinDashboard() {
         </aside>
       </div>
 
+      {robotNotice !== null && (
+        <div className="robot-notice-backdrop" onClick={() => setRobotNotice(null)}>
+          <div
+            className={`robot-notice ${robotNotice ? "ok" : "lost"}`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="robot-notice-title">
+              {robotNotice ? "🤖 로봇과 재연결되었습니다" : "⚠️ 로봇과의 연결이 끊겼습니다"}
+            </div>
+            <p className="robot-notice-body">
+              {robotNotice
+                ? "실시간 순찰 정보 관제를 재개합니다."
+                : "로봇과 재연결될 때까지 실시간 순찰 정보 관제가 제한됩니다."}
+            </p>
+            {!robotNotice && (
+              <p className="robot-notice-sub">
+                이미 감지된 위험 핑은 화면에 그대로 남아 있습니다.
+              </p>
+            )}
+            <button
+              type="button"
+              className="robot-notice-btn"
+              onClick={() => setRobotNotice(null)}
+              autoFocus
+            >
+              확인
+            </button>
+          </div>
+        </div>
+      )}
+
       <CctvPopup
         block={activeBlock}
         event={activeEvent}
@@ -2200,6 +2256,24 @@ const CSS = `
 .stage-fallback strong { color:#e6edf6; }
 .stage-fallback-how { font-size:12px; color:#5f6b80; }
 .stage-fallback code { color:#2dd4bf; font-family:monospace; }
+
+/* 로봇 연결 알림. CCTV 팝업(z-index 기본)보다 위에 떠서 먼저 눈에 들어오게 한다. */
+.robot-notice-backdrop { position:fixed; inset:0; background:rgba(4,7,12,.72);
+  display:flex; align-items:center; justify-content:center; z-index:60; }
+.robot-notice { width:min(420px, 90vw); background:#0e1420; border:1px solid #1e2a3f;
+  border-radius:12px; padding:22px 24px; text-align:center;
+  box-shadow:0 18px 50px rgba(0,0,0,.55); }
+.robot-notice.lost { border-color:#ffb020; }
+.robot-notice.ok { border-color:#36d399; }
+.robot-notice-title { font-size:16px; font-weight:700; margin-bottom:10px; }
+.robot-notice.lost .robot-notice-title { color:#ffb020; }
+.robot-notice.ok .robot-notice-title { color:#36d399; }
+.robot-notice-body { margin:0; font-size:13px; color:#e6edf6; line-height:1.6; }
+.robot-notice-sub { margin:8px 0 0; font-size:12px; color:#7d8aa3; line-height:1.5; }
+.robot-notice-btn { margin-top:16px; width:100%; padding:10px 0; cursor:pointer;
+  background:#16202f; color:#e6edf6; border:1px solid #2a3a52; border-radius:8px;
+  font-size:13px; font-weight:600; }
+.robot-notice-btn:hover { background:#1c283a; }
 
 /* 감지 순간 스냅샷. 젯슨이 보낸 crop 이라 가로세로가 제각각이므로
    높이만 묶어두고 비율은 유지한다(object-fit:contain). */

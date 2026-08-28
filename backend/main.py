@@ -125,6 +125,16 @@ WEBRTC_SIGNAL = "webrtc_signal"
 # (예: {"event_type": "event_ack"})
 EVENT_ACK = "event_ack"
 
+# 로봇 연결 상태 알림 (서버 → 프론트, DB 저장 안 함).
+#
+# ★ 왜 필요한가 (2026-08-29)
+#   로봇이 꺼져도 화면의 위험 핑은 그대로 남는다(위험이 사라진 게 아니니 맞는
+#   동작이다). 문제는 **관제사가 그 사실을 모른다**는 것이다. 화면은 평소와
+#   똑같은데 실시간 순찰 정보만 조용히 멈춘다. 그래서 서버가 알려준다.
+#
+#   {"event_type": "jetson_status", "connected": true/false}
+JETSON_STATUS = "jetson_status"
+
 # 프론트→서버→젯슨 방향으로 '그대로 전달'하는 메시지 종류 모음.
 # (젯슨→프론트 방향은 기존 브로드캐스트가 모든 메시지를 전달하므로 목록 불필요)
 JETSON_BOUND_TYPES = {WEBRTC_SIGNAL, EVENT_ACK}
@@ -309,6 +319,14 @@ SERVER_STARTED_AT = datetime.now(KST)
 #   젯슨이 이 판정의 주인이다 — 로봇이 그 자리를 다시 보고 확인하므로 며칠 전
 #   기록보다 훨씬 믿을 만하다. 젯슨 연결이 새로 열리면 통째로 비우고 다시 채운다.
 jetson_live_event_ids: set = set()
+
+
+async def broadcast_jetson_status():
+    """로봇 연결 상태를 프론트 전체에 알린다. DB에 저장하지 않는다."""
+    await manager.broadcast({
+        "event_type": JETSON_STATUS,
+        "connected": jetson_connection is not None,
+    })
 
 
 async def _active_danger_events(limit: int = 300):
@@ -738,6 +756,17 @@ async def websocket_frontend(websocket: WebSocket):
     await manager.connect(websocket)
     print(f"🖥️ [프론트엔드] 대시보드 연결됨 — {manager.status_line()}")
 
+    # 지금 로봇이 붙어 있는지 먼저 알려준다.
+    # 로봇이 이미 꺼진 상태에서 대시보드를 여는 경우, 이게 없으면 관제사는
+    # 화면이 멀쩡해 보여서 실시간 정보가 멈춘 줄 모른다.
+    try:
+        await websocket.send_json({
+            "event_type": JETSON_STATUS,
+            "connected": jetson_connection is not None,
+        })
+    except Exception as e:
+        print(f"⚠️ [프론트엔드] 로봇 상태 전송 실패({type(e).__name__})")
+
     # ★ 재접속 복원 (2026-08-27).
     #   프론트는 WebSocket 으로 받은 것만 그리므로, 새로고침하면 화면의 위험
     #   핑이 전부 사라진다. 불이 그 자리에 그대로 있어도 안 뜬다.
@@ -833,6 +862,7 @@ async def websocket_jetson(websocket: WebSocket):
     # 그것으로 다시 채워야 젯슨이 이미 잊은 이벤트가 남지 않는다.
     jetson_live_event_ids.clear()
     print("🚗 [젯슨 RC카] 연결됨 — 현재 접속 중")
+    await broadcast_jetson_status()
 
     try:
         while True:
@@ -904,6 +934,9 @@ async def websocket_jetson(websocket: WebSocket):
         if jetson_connection is websocket:
             jetson_connection = None
             print("🚗 [젯슨 RC카] 연결 끊어짐 — 현재 접속 없음")
+            # 재접속이면 새 연결이 이미 알렸으므로 여기서는 보내지 않는다.
+            # (그래야 "끊김 → 연결됨" 이 순서가 뒤집혀 도착하지 않는다)
+            await broadcast_jetson_status()
         else:
             print("🚗 [젯슨 RC카] 옛 연결 정리됨 (재접속) — 현재 접속 중")
 
