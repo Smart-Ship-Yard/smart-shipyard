@@ -10,6 +10,7 @@ ship_ugv_localization/launch/localization.launch.py
 이 launch에 포함하지 않았다. 실제 로봇 연결 후 별도 드라이버 launch를 추가할 것.
 """
 
+import json
 import os
 import sys
 
@@ -116,6 +117,46 @@ def _check_yolo_freshness():
 
     return '🔄', (f'옛 코드 감지 -> 재시작함 ({old} -> 방금) — '
                   f'systemd 구동이라 git pull 만으론 최신화 안 됨')
+
+
+def _remembered_events(ttl_s: float = 600.0):
+    """change_point 가 재시작 후 되살릴 이벤트를 미리 읽어 요약한다.
+
+    ★ 왜 배너에 넣나 (2026-08-28)
+
+    이벤트 기억이 복원되면 **그 자리에서는 로봇이 다시 멈추지 않는다.**
+    의도된 동작이지만, 모르고 그 자리에 불을 놓으면 "왜 안 멈추지?" 가 된다.
+    2026-08-27~28 이틀 동안 바로 그 증상으로 몇 시간을 썼다 — 원인은 매번
+    달랐지만(YOLO predictor 누수, change_point 사망, clock_type 불일치)
+    겉으로 보이는 모습은 늘 같았다.
+
+    change_point 노드도 같은 내용을 로그로 찍지만 수십 줄 사이에 묻힌다.
+    사람이 실제로 읽는 것은 이 배너뿐이라 여기에도 낸다.
+
+    반환: (복원될 목록, 버려질 개수, 파일경로). 읽기 실패면 목록이 None.
+    """
+    path = os.path.join(os.path.expanduser('~'), '.ros',
+                        'change_point_events.json')
+    try:
+        with open(path, encoding='utf-8') as f:
+            saved = json.load(f)
+    except FileNotFoundError:
+        return [], 0, path
+    except Exception:
+        return None, 0, path
+
+    now_ns = time.time() * 1e9
+    alive, dropped = [], 0
+    for ev in saved:
+        try:
+            age = (now_ns - float(ev['last_seen_ns'])) / 1e9
+            if age >= ttl_s:
+                dropped += 1
+            else:
+                alive.append((ev['event_id'], age))
+        except Exception:
+            dropped += 1
+    return alive, dropped, path
 
 
 def generate_launch_description():
@@ -570,6 +611,24 @@ def generate_launch_description():
         msg=f"  {'✅' if calib_file else '⏸️'} {'캘리브 불러오기':<12} "
             + (os.path.basename(calib_file) if calib_file
                else '끔 — 새로 잰다 (되살리려면 calib:=<맵이름>)')))
+    # ★ 되살아날 이벤트 — 그 자리에서는 로봇이 다시 안 멈춘다
+    _remembered, _dropped, _mem_path = _remembered_events()
+    if _remembered is None:
+        banner.append(LogInfo(
+            msg=f"  ⚠️ {'이벤트 기억':<12} 파일을 못 읽음 — 빈 상태로 시작한다"))
+    elif _remembered:
+        _ids = ', '.join(f'{e}({a:.0f}초전)' for e, a in _remembered[:4])
+        _more = f' 외 {len(_remembered) - 4}건' if len(_remembered) > 4 else ''
+        banner.append(LogInfo(
+            msg=f"  🧠 {'이벤트 기억':<12} {len(_remembered)}건 되살아남 — "
+                "이 자리들은 다시 안 멈춘다"))
+        banner.append(LogInfo(msg=f"       {_ids}{_more}"))
+        banner.append(LogInfo(msg=f"       깨끗이 시작하려면:  rm {_mem_path}"))
+    else:
+        banner.append(LogInfo(
+            msg=f"  ✅ {'이벤트 기억':<12} 비어 있음 — 모든 이벤트를 새로 잡는다"
+                + (f' (오래된 {_dropped}건 버림)' if _dropped else '')))
+
     if not yolo_up:
         banner.append(LogInfo(msg='━' * 60))
         banner.append(LogInfo(
