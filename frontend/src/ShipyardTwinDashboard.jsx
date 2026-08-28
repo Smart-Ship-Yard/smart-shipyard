@@ -1545,6 +1545,116 @@ function ConnNotice({ tone, title, lines, btnLabel, onConfirm }) {
   );
 }
 
+/* 지난 기록 조회 — 날짜를 골라 그날의 위험 이벤트와 감지 순간 사진을 본다.
+ *
+ * 실시간 관제와 목적이 다르다. 여기는 "그때 무슨 일이 있었나" 를 되짚는 화면이라
+ * 시간·사진·치워진 시각을 함께 보여준다.
+ *
+ * 날짜 선택기는 **이벤트가 있었던 날만** 고를 수 있게 한다. 빈 날짜를 고르고
+ * "왜 아무것도 없지" 하는 일을 없애기 위함이다. */
+function HistoryPanel({ onClose }) {
+  const [days, setDays] = useState([]);
+  const [date, setDate] = useState(null);
+  const [events, setEvents] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [zoom, setZoom] = useState(null);   // 사진 크게 보기
+
+  useEffect(() => {
+    fetch(`http://${SERVER_HOST}/api/event-days`)
+      .then((r) => r.json())
+      .then((d) => {
+        const list = d.days || [];
+        setDays(list);
+        setDate(list.length ? list[0].date : null);
+        if (!list.length) setLoading(false);
+      })
+      .catch((e) => { setError(String(e)); setLoading(false); });
+  }, []);
+
+  useEffect(() => {
+    if (!date) return;
+    setLoading(true); setError(null);
+    fetch(`http://${SERVER_HOST}/api/events?date=${date}`)
+      .then((r) => r.json())
+      .then((d) => { setEvents(d.events || []); setLoading(false); })
+      .catch((e) => { setError(String(e)); setLoading(false); });
+  }, [date]);
+
+  const hhmmss = (t) => (t ? String(t).slice(11, 19) : "—");
+
+  return (
+    <div className="hist-backdrop" onClick={onClose}>
+      <div className="hist" onClick={(e) => e.stopPropagation()}>
+        <div className="hist-head">
+          <span>📚 지난 기록</span>
+          <select
+            className="hist-date"
+            value={date || ""}
+            onChange={(e) => setDate(e.target.value)}
+            disabled={!days.length}
+          >
+            {days.map((d) => (
+              <option key={d.date} value={d.date}>{d.date} ({d.count}건)</option>
+            ))}
+          </select>
+          <button type="button" className="hist-close" onClick={onClose}>닫기</button>
+        </div>
+
+        <div className="hist-body">
+          {error && <div className="hist-msg">불러오지 못했습니다 — {error}</div>}
+          {!error && loading && <div className="hist-msg">불러오는 중…</div>}
+          {!error && !loading && !days.length && (
+            <div className="hist-msg">아직 기록이 없습니다.</div>
+          )}
+          {!error && !loading && days.length > 0 && events.length === 0 && (
+            <div className="hist-msg">이 날짜에는 위험 이벤트가 없습니다.</div>
+          )}
+          {!error && !loading && events.map((e, i) => {
+            const m = CLASS_META[e.event_type];
+            return (
+              <div className="hist-row" key={e.event_id || i}>
+                {e.image_url ? (
+                  <img
+                    className="hist-thumb"
+                    src={SNAPSHOT_BASE_URL + e.image_url}
+                    alt="감지 순간"
+                    onClick={() => setZoom(SNAPSHOT_BASE_URL + e.image_url)}
+                    onError={(ev) => { ev.currentTarget.style.visibility = "hidden"; }}
+                  />
+                ) : (
+                  <div className="hist-thumb hist-nothumb">사진 없음</div>
+                )}
+                <div className="hist-info">
+                  <div className="hist-cls" style={{ color: m ? SEV_COLOR[m.severity] : "#e6edf6" }}>
+                    {m ? m.label : e.event_type}
+                    {e.confidence != null && (
+                      <span className="hist-conf">{(e.confidence * 100).toFixed(0)}%</span>
+                    )}
+                  </div>
+                  <div className="hist-meta">
+                    감지 {hhmmss(e.timestamp)}
+                    {e.cleared_at
+                      ? <> · 치워짐 {hhmmss(e.cleared_at)}</>
+                      : <span className="hist-open"> · 치워짐 기록 없음</span>}
+                  </div>
+                  <div className="hist-meta hist-id">{e.event_id}</div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {zoom && (
+        <div className="hist-zoom" onClick={(e) => { e.stopPropagation(); setZoom(null); }}>
+          <img src={zoom} alt="감지 순간 크게" />
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* 확대 팝업 — 위험(빨강) 자동 송출 + 클릭 시 표시 공용.
  * ESC 키로도 닫을 수 있게 한다 (X 버튼 클릭 없이 키보드로 종료). */
 function CctvPopup({ block, event, group, auto, onClose, onAck, onClearPing }) {
@@ -1681,6 +1791,7 @@ export default function ShipyardTwinDashboard() {
   // null = 아직 서버로부터 상태를 못 받음. robotConnectedRef 는 "직전 값"이라
   // 리렌더를 일으키지 않으므로, 화면에 그릴 값은 state 로 따로 둔다.
   const [robotConnected, setRobotConnected] = useState(null);
+  const [showHistory, setShowHistory] = useState(false);  // 지난 기록 조회 화면
   // 직전 연결 상태. 처음 받은 값은 "변화"가 아니므로 팝업을 띄우지 않는다
   // (단, 처음부터 끊겨 있으면 알려줘야 하므로 그때는 띄운다 — 아래 참고).
   const robotConnectedRef = useRef(null);
@@ -2272,6 +2383,14 @@ export default function ShipyardTwinDashboard() {
             {robotConnected === true ? "로봇 연결됨"
               : robotConnected === false ? "로봇 끊김" : "로봇 상태 확인 중"}
           </span>
+          <button
+            type="button"
+            className="hist-open-btn"
+            onClick={() => setShowHistory(true)}
+            title="날짜를 골라 지난 위험 이벤트와 감지 순간 사진을 봅니다"
+          >
+            📚 지난 기록
+          </button>
           <span className="clock-badge">{new Date().toLocaleDateString("ko-KR")}</span>
         </div>
       </header>
@@ -2427,6 +2546,8 @@ export default function ShipyardTwinDashboard() {
         </div>
       )}
 
+      {showHistory && <HistoryPanel onClose={() => setShowHistory(false)} />}
+
       <CctvPopup
         block={activeBlock}
         event={activeEvent}
@@ -2491,6 +2612,42 @@ const CSS = `
 .conn-dot { width:7px; height:7px; border-radius:50%; background:#ff3b47; }
 .conn.on .conn-dot { background:#36d399; box-shadow:0 0 8px #36d399; animation:blink 2s infinite; }
 .clock-badge { font-size:12px; color:#7d8aa3; font-variant-numeric:tabular-nums; }
+.hist-open-btn { font-size:12px; padding:5px 11px; cursor:pointer; border-radius:20px;
+  background:#16202f; color:#aebbd2; border:1px solid #1e2a3f; }
+.hist-open-btn:hover { background:#1c283a; color:#e6edf6; }
+
+/* 지난 기록 조회 */
+.hist-backdrop { position:fixed; inset:0; background:rgba(4,7,12,.78); z-index:70;
+  display:flex; align-items:center; justify-content:center; padding:24px; }
+.hist { width:min(760px, 96vw); max-height:86vh; display:flex; flex-direction:column;
+  background:#0e1420; border:1px solid #1e2a3f; border-radius:12px; overflow:hidden;
+  box-shadow:0 18px 50px rgba(0,0,0,.55); }
+.hist-head { display:flex; align-items:center; gap:10px; padding:14px 16px;
+  border-bottom:1px solid #1a2336; font-size:14px; font-weight:700; color:#e6edf6; }
+.hist-date { margin-left:auto; background:#16202f; color:#e6edf6; font-size:12px;
+  border:1px solid #2a3a52; border-radius:6px; padding:5px 8px; }
+.hist-close { background:#16202f; color:#aebbd2; font-size:12px; cursor:pointer;
+  border:1px solid #2a3a52; border-radius:6px; padding:5px 11px; }
+.hist-close:hover { background:#1c283a; color:#e6edf6; }
+.hist-body { overflow-y:auto; padding:8px 16px 16px; }
+.hist-msg { padding:28px 0; text-align:center; color:#7d8aa3; font-size:13px; }
+.hist-row { display:flex; gap:12px; align-items:center; padding:10px 0;
+  border-bottom:1px solid #161f2e; }
+.hist-thumb { width:104px; height:76px; object-fit:contain; flex:0 0 auto; cursor:zoom-in;
+  background:#0c1118; border:1px solid #1d2836; border-radius:6px; }
+.hist-nothumb { display:flex; align-items:center; justify-content:center; cursor:default;
+  color:#5f6b80; font-size:11px; }
+.hist-info { min-width:0; }
+.hist-cls { font-size:13px; font-weight:700; }
+.hist-conf { margin-left:8px; font-size:11px; color:#7d8aa3; font-weight:400; }
+.hist-meta { margin-top:4px; font-size:12px; color:#7d8aa3;
+  font-variant-numeric:tabular-nums; }
+.hist-open { color:#ffb020; }
+.hist-id { font-size:11px; color:#5f6b80; font-family:monospace; }
+.hist-zoom { position:fixed; inset:0; background:rgba(4,7,12,.92); z-index:80;
+  display:flex; align-items:center; justify-content:center; cursor:zoom-out; padding:24px; }
+.hist-zoom img { max-width:92vw; max-height:92vh; object-fit:contain;
+  border:1px solid #1d2836; border-radius:8px; }
 
 .body { flex:1 1 auto; display:grid; grid-template-columns:280px 1fr 320px; gap:12px; padding:12px; min-height:0; }
 .left,.right { display:flex; flex-direction:column; gap:12px; min-height:0; }

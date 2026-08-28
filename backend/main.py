@@ -811,6 +811,72 @@ async def get_init_data():
     }
 
 
+@app.get("/api/event-days")
+async def get_event_days():
+    """이벤트가 하루라도 있었던 날짜 목록 (최신순).
+
+    프론트의 날짜 선택기가 "고를 수 있는 날" 만 보여주게 하기 위한 것이다.
+    빈 날짜를 고르고 "왜 아무것도 없지" 하는 일을 없앤다.
+
+    timestamp 는 "2026-08-29T05:12:33+09:00" 같은 KST ISO 문자열이라
+    앞 10글자가 곧 날짜다. 파싱 없이 자를 수 있다.
+    """
+    try:
+        days = await event_collection.aggregate([
+            {"$match": {"event_type": {"$in": list(DANGER_TYPES)},
+                        "timestamp": {"$exists": True}}},
+            {"$group": {"_id": {"$substrBytes": ["$timestamp", 0, 10]},
+                        "count": {"$sum": 1}}},
+            {"$sort": {"_id": -1}},
+            {"$limit": 60},
+        ]).to_list(length=60)
+    except Exception as e:
+        print(f"⚠️ [조회] 날짜 목록 실패({type(e).__name__})")
+        return {"days": []}
+    return {"days": [{"date": d["_id"], "count": d["count"]} for d in days if d["_id"]]}
+
+
+@app.get("/api/events")
+async def get_events(date: Optional[str] = None, limit: int = 200):
+    """하루치 위험 이벤트를 시간순으로. 사진 URL 도 함께 준다.
+
+    date 는 "YYYY-MM-DD" (KST 기준). 없으면 오늘.
+
+    ★ 위험 4종만 준다. 관제 기록을 되짚어 보는 화면이라 position·block_level
+      같은 것은 잡음이다. event_cleared 는 "언제 치워졌나" 를 붙이는 데 쓰려고
+      함께 읽되, 목록에는 위험 이벤트만 남긴다.
+    """
+    day = date or datetime.now(KST).date().isoformat()
+    try:
+        docs = await event_collection.find({
+            "event_type": {"$in": list(DANGER_TYPES) + [EVENT_CLEARED]},
+            "timestamp": {"$gte": day, "$lt": day + "\uffff"},
+        }).sort("_id", 1).to_list(length=max(limit, 1) * 3)
+    except Exception as e:
+        print(f"⚠️ [조회] {day} 이벤트 실패({type(e).__name__})")
+        return {"date": day, "events": [], "error": str(e)}
+
+    cleared_at = {}
+    for d in docs:
+        if d.get("event_type") == EVENT_CLEARED and d.get("event_id"):
+            cleared_at[d["event_id"]] = d.get("timestamp")
+
+    out = []
+    for d in docs:
+        if d.get("event_type") == EVENT_CLEARED:
+            continue
+        d.pop("_id", None)
+        eid = d.get("event_id")
+        # 같은 event_id 가 여러 번이면(재통보 등) 한 번만 보여준다.
+        if eid and any(e.get("event_id") == eid for e in out):
+            continue
+        d["cleared_at"] = cleared_at.get(eid)
+        out.append(d)
+        if len(out) >= limit:
+            break
+    return {"date": day, "events": out}
+
+
 @app.get("/api/history")
 async def get_history():
     """프론트엔드 통계 페이지가 켜질 때, DB에서 과거 이벤트 기록을 꺼내서 준다."""

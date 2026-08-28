@@ -218,7 +218,9 @@ backend/snapshots/*          ← 사진 전부 차단
 | WebSocket | `/ws/frontend` | 대시보드가 실시간 알림을 받는 채널 |
 | GET | `/snapshots/<해시>.jpg` | 감지 순간 사진 (정적 파일, 위 항목 참고) |
 | GET | `/api/init-data` | 대시보드 초기 3D 맵 정보 |
-| GET | `/api/history` | 과거 이벤트 로그 조회 (최근 50건) |
+| GET | `/api/event-days` | 이벤트가 있었던 날짜와 건수 (최신순 60일) |
+| GET | `/api/events?date=YYYY-MM-DD` | 그날의 위험 이벤트 + 사진 URL + 치워진 시각 |
+| GET | `/api/history` | 과거 이벤트 로그 조회 (최근 50건, 종류 구분 없음) |
 
 영상 채널은 없습니다 — 영상은 이 서버를 거치지 않습니다 (위 항목 참고).
 
