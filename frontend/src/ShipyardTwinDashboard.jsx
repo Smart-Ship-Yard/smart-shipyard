@@ -1495,6 +1495,10 @@ export default function ShipyardTwinDashboard() {
   const [sceneError, setSceneError] = useState(null);
   // 로봇 연결 알림 팝업. null 이면 안 떠 있음. true=재연결됨 / false=끊김.
   const [robotNotice, setRobotNotice] = useState(null);
+  // 상단 배지에 항상 표시할 현재 로봇 연결 상태.
+  // null = 아직 서버로부터 상태를 못 받음. robotConnectedRef 는 "직전 값"이라
+  // 리렌더를 일으키지 않으므로, 화면에 그릴 값은 state 로 따로 둔다.
+  const [robotConnected, setRobotConnected] = useState(null);
   // 직전 연결 상태. 처음 받은 값은 "변화"가 아니므로 팝업을 띄우지 않는다
   // (단, 처음부터 끊겨 있으면 알려줘야 하므로 그때는 띄운다 — 아래 참고).
   const robotConnectedRef = useRef(null);
@@ -1789,6 +1793,7 @@ export default function ShipyardTwinDashboard() {
           const now = data.connected === true;
           const prev = robotConnectedRef.current;
           robotConnectedRef.current = now;
+          setRobotConnected(now); // 상단 배지는 팝업과 무관하게 항상 최신으로
           if (prev === null ? !now : prev !== now) {
             // 이전 알림이 아직 떠 있어도 그냥 덮어쓴다 — 최신 상태가 항상 이긴다.
             // (끊김 팝업을 안 닫은 채로 재연결되면 자동으로 재연결 팝업으로 바뀐다)
@@ -1955,8 +1960,25 @@ export default function ShipyardTwinDashboard() {
           </div>
         </div>
         <div className="top-status">
+          {/* 서버 연결과 로봇 연결은 다른 것이다 — 서버는 붙어 있는데 로봇만
+              꺼져 있는 상황이 흔하므로 배지를 따로 둔다. 팝업의 확인을 눌러
+              닫았어도 여기는 계속 남아 있어 지금 상태를 언제든 볼 수 있다. */}
           <span className={`conn ${connected ? "on" : ""}`}>
-            <span className="conn-dot" />{connected ? "WebSocket 연결됨" : "연결 끊김"}
+            <span className="conn-dot" />{connected ? "서버 연결됨" : "서버 끊김"}
+          </span>
+          <span
+            className={`conn ${robotConnected === true ? "on" : robotConnected === false ? "warn" : ""}`}
+            title={
+              robotConnected === false
+                ? "로봇과 재연결될 때까지 실시간 순찰 정보 관제가 제한됩니다"
+                : robotConnected === true
+                  ? "로봇이 순찰 정보를 보내오고 있습니다"
+                  : "아직 로봇 상태를 받지 못했습니다"
+            }
+          >
+            <span className="conn-dot" />
+            {robotConnected === true ? "로봇 연결됨"
+              : robotConnected === false ? "로봇 끊김" : "로봇 상태 확인 중"}
           </span>
           <span className="clock-badge">{new Date().toLocaleDateString("ko-KR")}</span>
         </div>
@@ -2145,6 +2167,10 @@ const CSS = `
 .conn { display:flex; align-items:center; gap:7px; font-size:12px; color:#7d8aa3;
   border:1px solid #1e2a3f; padding:5px 11px; border-radius:20px; }
 .conn.on { color:#36d399; }
+/* 로봇이 끊긴 상태 — 빨강(위험)이 아니라 노랑(주의)으로 둔다.
+   빨강은 위험 이벤트 색이라, 연결 문제와 화재를 같은 색으로 두면 헷갈린다. */
+.conn.warn { color:#ffb020; border-color:#3a2f16; }
+.conn.warn .conn-dot { background:#ffb020; box-shadow:0 0 8px #ffb020; animation:blink 1.4s infinite; }
 .conn-dot { width:7px; height:7px; border-radius:50%; background:#ff3b47; }
 .conn.on .conn-dot { background:#36d399; box-shadow:0 0 8px #36d399; animation:blink 2s infinite; }
 .clock-badge { font-size:12px; color:#7d8aa3; font-variant-numeric:tabular-nums; }
