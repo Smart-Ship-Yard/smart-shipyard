@@ -25,7 +25,7 @@ from rclpy.time import Time
 from rclpy.duration import Duration
 from rclpy.qos import (QoSProfile, QoSDurabilityPolicy,
                        QoSReliabilityPolicy)
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from geometry_msgs.msg import PointStamped, PoseWithCovarianceStamped
 from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs  # noqa: F401  (PointStamped 변환을 위해 필요한 등록)
@@ -401,6 +401,16 @@ class ChangePointDetector(Node):
             QoSProfile(depth=1,
                        durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
                        reliability=QoSReliabilityPolicy.RELIABLE))
+        # ★ 이 노드가 이벤트를 등록할 준비가 됐는지 (2026-08-29).
+        #   대시보드의 "연결됨" 은 소켓이 열린 시점이라 로컬라이제이션만 떠도
+        #   켜진다. 그런데 그때는 AMCL 이 없어 좌표를 못 믿으므로 이벤트를
+        #   등록하지 않는다 — 화면은 준비됐다는데 로봇은 아무것도 못 잡는
+        #   구간이 생긴다. 준비 여부는 이 노드가 아니까 여기서 알린다.
+        self.armed_pub = self.create_publisher(
+            Bool, '/event_detection/armed',
+            QoSProfile(depth=1,
+                       durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=QoSReliabilityPolicy.RELIABLE))
         self.clear_pub = self.create_publisher(
             String, self.get_parameter('clear_topic').value, 10)
         clear_hz = max(0.1, self.get_parameter('clear_check_hz').value)
@@ -416,6 +426,7 @@ class ChangePointDetector(Node):
         # 복원한 목록도 바로 알린다 — 이게 없으면 websocket_client 가
         # 이번 세션에 새로 본 것만 알아 재통보가 빠진다.
         self._publish_active()
+        self.armed_pub.publish(Bool(data=self._amcl_ready))
 
     # ------------------------------------------------------------------
     #  ★ 이벤트 기억을 재시작 너머로 잇는다 (2026-08-27).
@@ -537,6 +548,7 @@ class ChangePointDetector(Node):
         if self._amcl_ready:
             return
         self._amcl_ready = True
+        self.armed_pub.publish(Bool(data=True))
         self.get_logger().warn(
             "✅ AMCL 확인 — 이제부터 이벤트를 등록한다 "
             "(그 전에는 heading 보정이 없어 좌표를 믿을 수 없다)")

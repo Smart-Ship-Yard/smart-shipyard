@@ -51,7 +51,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
-from std_msgs.msg import String, Int32
+from std_msgs.msg import String, Int32, Bool
 from nav_msgs.msg import Odometry
 
 try:
@@ -191,6 +191,16 @@ class WebSocketClient(Node):
         #   순서가 어떻든 결과가 같다.
         self._announced = set()
         self._ws_live = False
+        # ★ "로봇 준비 완료" 신호 (2026-08-29).
+        #   서버의 connected 는 소켓이 열린 시점이라 로컬라이제이션만 떠도
+        #   켜진다. 그때는 AMCL 도 Nav2 도 없어서 로봇이 순찰도 못 하고
+        #   이벤트도 못 잡는다. 화면만 준비된 것처럼 보이는 구간이다.
+        #   실제로 준비된 시점은 두 가지가 다 맞아야 한다:
+        #     · change_point 가 armed (AMCL 확인 -> 좌표를 믿을 수 있다)
+        #     · patrol 이 WAIT_NAV2 를 벗어남 (Nav2 액션 서버가 응답했다)
+        self._armed = False
+        self._nav_ready = False
+        self._ready_sent = False
 
         # ★ 서버 -> 젯슨 수신 메시지를 그대로 중계할 퍼블리셔 (해석하지 않음)
         self.inbound_pub = self.create_publisher(String, inbound_topic, 10)
@@ -228,6 +238,13 @@ class WebSocketClient(Node):
             QoSProfile(depth=1,
                        durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
                        reliability=QoSReliabilityPolicy.RELIABLE))
+        self.create_subscription(
+            Bool, '/event_detection/armed', self._armed_cb,
+            QoSProfile(depth=1,
+                       durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=QoSReliabilityPolicy.RELIABLE))
+        self.create_subscription(
+            String, '/patrol/status', self._patrol_status_cb, 10)
         self.create_subscription(Odometry, ekf_topic, self._ekf_cb, 10)
         # ★ ship_pose는 ship_survey_node가 측량 끝날 때 딱 1번만 발행하고, 그 시점은
         #   매핑 랩 도중이라 이 노드보다 먼저 끝나 있을 수 있다. 기본 QoS(VOLATILE)로
@@ -362,6 +379,38 @@ class WebSocketClient(Node):
             self.get_logger().info(
                 f"[활성목록] change_point 기준으로 맞춤: {before} -> {len(mirror)}건")
         self._reannounce()
+
+    def _armed_cb(self, msg: Bool):
+        self._armed = bool(msg.data)
+        self._check_ready()
+
+    def _patrol_status_cb(self, msg: String):
+        try:
+            state = json.loads(msg.data).get('state')
+        except (ValueError, TypeError):
+            return
+        # WAIT_NAV2 를 벗어났다 = Nav2 액션 서버가 응답했다.
+        # STOPPED/BLOCKED 도 준비된 상태다 — 멈춰 있을 뿐 Nav2 는 살아있다.
+        if state and state != 'WAIT_NAV2':
+            self._nav_ready = True
+            self._check_ready()
+
+    def _check_ready(self):
+        """둘 다 맞으면 한 번만 알린다."""
+        if self._ready_sent or not (self._armed and self._nav_ready):
+            return
+        self._ready_sent = True
+        self.get_logger().warn(
+            "🤖 로봇 준비 완료 — change_point armed + Nav2 응답. 서버에 알린다")
+        self._send_ready()
+
+    def _send_ready(self):
+        self._enqueue({
+            'event_type': 'jetson_ready',
+            'block_id': self.block_id,
+            'armed': self._armed,
+            'nav_ready': self._nav_ready,
+        })
 
     def _reannounce(self):
         """아직 서버에 안 알린 활성 이벤트를 replay 로 내보낸다.
@@ -639,6 +688,9 @@ class WebSocketClient(Node):
                     self._announced.clear()
                 self._ws_live = True
                 self._reannounce()
+                if self._ready_sent:
+                    # 프론트가 새로고침됐을 수 있다. 준비 상태를 다시 알린다.
+                    self._send_ready()
 
                 while not self._stop_event.is_set():
                     # 이벤트가 먼저다. 큐가 비었을 때만 최신 위치를 보낸다.
