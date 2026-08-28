@@ -141,6 +141,22 @@ EVENT_ACK = "event_ack"
 #   기준선만 밀면 화면에서 사라지고, 기록은 감사용으로 남는다.
 RESET_EVENTS = "reset_events"
 
+# 로봇이 실제로 일할 수 있게 됐다는 통보 (젯슨 → 서버 → 프론트, DB 저장 안 함).
+#
+#   {"event_type":"jetson_ready", "block_id":"B1", "armed":true, "nav_ready":true}
+#
+# ★ jetson_status(연결됨)와 **다른 것**이다. 서로 대체할 수 없다.
+#   젯슨의 websocket_client 는 로컬라이제이션에서 뜨는데 AMCL·Nav2 는 그보다
+#   늦게 뜬다. 그 사이 소켓은 살아 있어서 화면에는 "연결됨" 이 뜨지만, 로봇은
+#   순찰도 못 하고 이벤트도 못 잡는다. 그때 관제사가 확인을 눌러봐야 소용이 없다.
+#
+#     jetson_status  소켓이 살아 있나        (서버가 판단)
+#     jetson_ready   로봇이 일할 수 있나      (젯슨이 판단: armed + nav_ready)
+#
+# 둘 다 갖춰졌을 때 1회 오고, 재연결 시 다시 온다(프론트가 새로고침됐을 수 있어서).
+# 저장 대상이 아니라 그대로 프론트로 흘러간다 — 추가 중계 코드가 필요 없다.
+JETSON_READY = "jetson_ready"
+
 # 로봇 연결 상태 알림 (서버 → 프론트, DB 저장 안 함).
 #
 # ★ 왜 필요한가 (2026-08-29)

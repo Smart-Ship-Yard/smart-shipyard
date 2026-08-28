@@ -1891,6 +1891,16 @@ function DashboardInner() {
   // 리렌더를 일으키지 않으므로, 화면에 그릴 값은 state 로 따로 둔다.
   const [robotConnected, setRobotConnected] = useState(null);
   const [showHistory, setShowHistory] = useState(false);  // 지난 기록 조회 화면
+  // 로봇이 실제로 일할 수 있는 상태인가 (jetson_ready).
+  //
+  // ★ "연결됨" 과 다르다. 소켓은 살아 있는데 AMCL·Nav2 가 아직 안 뜬 구간이
+  //   있고, 그때 로봇은 순찰도 못 하고 이벤트도 못 잡는다. 화면이 "연결됨" 만
+  //   보여주면 관제사가 준비된 줄 알고 기다리지 않는다. 그래서 2단계로 나눈다.
+  const [robotReady, setRobotReady] = useState(false);
+  const [readyNotice, setReadyNotice] = useState(false);
+  // 이번 연결에서 준비 팝업을 이미 띄웠나. 젯슨이 재연결 때 다시 보내므로
+  // 중복을 막는다. 끊기면 다시 false 로 되돌려 다음 준비는 알려준다.
+  const readyShownRef = useRef(false);
   // 직전 연결 상태. 처음 받은 값은 "변화"가 아니므로 팝업을 띄우지 않는다
   // (단, 처음부터 끊겨 있으면 알려줘야 하므로 그때는 띄운다 — 아래 참고).
   const robotConnectedRef = useRef(null);
@@ -2039,6 +2049,9 @@ function DashboardInner() {
     // 여기부터는 connected === false
     robotConnectedRef.current = null;
     setRobotConnected(null);
+    setRobotReady(false);
+    setReadyNotice(false);
+    readyShownRef.current = false;
 
     if (serverConnectedRef.current === true) {
       // 붙어 있다가 끊겼다 — 확실하다. 바로 알린다.
@@ -2222,6 +2235,19 @@ function DashboardInner() {
           return;
         }
 
+        // ⑦ 로봇 준비 완료 — AMCL 확인 + Nav2 응답이 둘 다 됐을 때 온다.
+        //   {"event_type":"jetson_ready","block_id":"B1","armed":true,"nav_ready":true}
+        //
+        //   이 메시지가 오면 핑·상태가 이미 다 도착한 뒤다. 수동 새로고침이 필요 없다.
+        if (type === "jetson_ready") {
+          setRobotReady(true);
+          if (!readyShownRef.current) {
+            readyShownRef.current = true;   // 재연결 시 재발송되므로 한 번만
+            setReadyNotice(true);
+          }
+          return;
+        }
+
         // ⑥ 로봇 연결 상태 — 서버가 알려준다. {"connected": true/false}
         //
         // 로봇이 꺼져도 화면의 위험 핑은 그대로 남는다(위험이 사라진 게 아니므로
@@ -2240,6 +2266,12 @@ function DashboardInner() {
           const prev = robotConnectedRef.current;
           robotConnectedRef.current = now;
           setRobotConnected(now); // 상단 배지는 팝업과 무관하게 항상 최신으로
+          if (!now) {
+            // 끊기면 "준비됨" 도 더 이상 사실이 아니다. 다음 준비는 다시 알린다.
+            setRobotReady(false);
+            setReadyNotice(false);
+            readyShownRef.current = false;
+          }
           if (prev === null ? !now : prev !== now) {
             // 이전 알림이 아직 떠 있어도 그냥 덮어쓴다 — 최신 상태가 항상 이긴다.
             // (끊김 팝업을 안 닫은 채로 재연결되면 자동으로 재연결 팝업으로 바뀐다)
@@ -2469,17 +2501,22 @@ function DashboardInner() {
             <span className="conn-dot" />{connected ? "서버 연결됨" : "서버 끊김"}
           </span>
           <span
-            className={`conn ${robotConnected === true ? "on" : robotConnected === false ? "warn" : ""}`}
+            className={`conn ${
+              robotConnected === true ? (robotReady ? "on" : "warn")
+              : robotConnected === false ? "warn" : ""}`}
             title={
               robotConnected === false
                 ? "로봇과 재연결될 때까지 실시간 순찰 정보 관제가 제한됩니다"
                 : robotConnected === true
-                  ? "로봇이 순찰 정보를 보내오고 있습니다"
+                  ? (robotReady
+                      ? "로봇이 순찰 정보를 보내오고 있습니다"
+                      : "연결은 됐지만 자율주행(Nav2)이 아직 뜨지 않았습니다 — 준비되면 알려드립니다")
                   : "아직 로봇 상태를 받지 못했습니다"
             }
           >
             <span className="conn-dot" />
-            {robotConnected === true ? "로봇 연결됨"
+            {robotConnected === true
+              ? (robotReady ? "로봇 준비 완료" : "로봇 연결됨 (준비 중…)")
               : robotConnected === false ? "로봇 끊김" : "로봇 상태 확인 중"}
           </span>
           <button
@@ -2597,16 +2634,16 @@ function DashboardInner() {
         </aside>
       </div>
 
-      {(robotNotice !== null || serverNotice !== null) && (
+      {(robotNotice !== null || serverNotice !== null || readyNotice) && (
         <div className="notice-backdrop">
           {/* 로봇과 서버를 나란히. 로봇을 먼저 둔다 — 원인이 로봇 쪽일 때
               그것이 먼저 눈에 들어와야 한다. */}
           {robotNotice !== null && (
             <ConnNotice
               tone={robotNotice ? "ok" : "lost"}
-              title={robotNotice ? "🤖 로봇과 재연결되었습니다" : "⚠️ 로봇과의 연결이 끊겼습니다"}
+              title={robotNotice ? "🤖 로봇과 연결되었습니다" : "⚠️ 로봇과의 연결이 끊겼습니다"}
               lines={robotNotice
-                ? ["실시간 순찰 정보 관제를 재개합니다.",
+                ? ["아직 준비 중입니다 — 자율주행이 뜨면 다시 알려드립니다.",
                    "확인을 누르면 화면을 새로 불러와 로봇의 최신 정보를 반영합니다."]
                 : ["로봇과 재연결될 때까지 실시간 순찰 정보 관제가 제한됩니다.",
                    "이미 감지된 핑과 로봇의 마지막 위치는 화면에 그대로 남아 있습니다."]}
@@ -2615,6 +2652,16 @@ function DashboardInner() {
                 if (robotNotice) window.location.reload();
                 else setRobotNotice(null);
               }}
+            />
+          )}
+          {readyNotice && (
+            <ConnNotice
+              tone="ok"
+              title="🤖 로봇 준비 완료"
+              lines={["자율주행과 이벤트 감지가 모두 준비됐습니다.",
+                      "실시간 순찰 정보 관제를 재개합니다. 최신 상태는 이미 반영돼 있습니다."]}
+              btnLabel="확인"
+              onConfirm={() => setReadyNotice(false)}
             />
           )}
           {serverNotice !== null && (
