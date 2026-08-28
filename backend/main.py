@@ -318,6 +318,12 @@ SERVER_STARTED_AT = datetime.now(KST)
 #
 #   젯슨이 이 판정의 주인이다 — 로봇이 그 자리를 다시 보고 확인하므로 며칠 전
 #   기록보다 훨씬 믿을 만하다. 젯슨 연결이 새로 열리면 통째로 비우고 다시 채운다.
+#
+#   ⚠️ 다만 이것만 믿으면 안 된다 (2026-08-29).
+#     이 목록은 젯슨이 재연결할 때마다 비워지고 그 연결의 재통보로 다시 찬다.
+#     젯슨 소켓이 한 번 끊겼다 붙는 사이에 대시보드를 새로고침하면 목록이 비어
+#     있어 핑이 통째로 사라진다. 그래서 _backfill_replay_event 가 이번 세션의
+#     DB 기록도 한 건 남긴다 — 복원이 시각만으로도 성립하게 하는 안전장치다.
 jetson_live_event_ids: set = set()
 
 
@@ -332,15 +338,29 @@ async def _backfill_replay_event(doc: dict):
     """
     eid = doc.get("event_id")
     try:
+        # ★ "아예 없을 때" 가 아니라 "이번 세션 기록이 없을 때" 저장한다
+        #   (2026-08-29 수정).
+        #
+        #   원래는 같은 event_id 기록이 하나라도 있으면 건너뛰었다. 그러면 그
+        #   이벤트는 복원될 때 **메모리의 jetson_live_event_ids 에만** 기대게 되는데,
+        #   그 목록은 젯슨이 재연결할 때마다 비워진다. 젯슨 소켓이 한 번만 끊겼다
+        #   붙어도(재연결 루프가 있다) 목록이 날아가고, 그 뒤 대시보드를
+        #   새로고침하면 **살아있는 위험 핑이 통째로 사라졌다.**
+        #
+        #   이번 세션(SERVER_STARTED_AT 이후) 기록을 한 번 남겨두면 복원이
+        #   시각만으로 성립해서, 메모리 상태가 어떻든 흔들리지 않는다.
+        #   세션당 event_id 하나에 최대 한 건이라 무한히 쌓이지도 않는다.
         exists = await event_collection.find_one(
-            {"event_id": eid, "event_type": {"$in": list(DANGER_TYPES)}},
+            {"event_id": eid,
+             "event_type": {"$in": list(DANGER_TYPES)},
+             "timestamp": {"$gte": SERVER_STARTED_AT.isoformat()}},
             {"_id": 1},
         )
         if exists:
             return
         doc["timestamp"] = datetime.now(KST).isoformat()
         await event_collection.insert_one(doc)
-        print(f"💾 [재통보] 처음 보는 이벤트라 기록함: {eid}")
+        print(f"💾 [재통보] 이번 세션 기록으로 남김: {eid}")
     except Exception as e:
         print(f"⚠️ [재통보] 기록 실패({type(e).__name__}): {eid}")
 
