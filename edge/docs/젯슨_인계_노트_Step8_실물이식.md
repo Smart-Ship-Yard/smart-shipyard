@@ -142,6 +142,45 @@ source install/setup.bash
 
 ---
 
+## 1-1. ★ 저장소 밖에 있던 파일들 — 심링크로 끌어왔다 (2026-08-28)
+
+젯슨 로컬에만 있고 git 에 없던 파일이 셋 있었다. **젯슨이 죽으면 복구할 수
+없는 상태**였다. 지금은 저장소 안에 원본을 두고, 원래 위치에서 심링크로
+가리킨다.
+
+| 원래 위치 | 저장소 안 원본 |
+|---|---|
+| `/home/ship_yard/video_streamer.py` | `edge/streaming/video_streamer.py` |
+| `edge/ros2_ws/src/wit_ros2_imu/config/im10a.yml` | `edge/config/witmotion_im10a.yml` |
+| `/home/ship_yard/mediamtx.yml` | `edge/streaming/mediamtx.yml` (사본, 심링크 아님) |
+
+**왜 심링크인가.** 사본을 두 벌 두면 갈라진다. 2026-08-27 에 YOLO 가
+systemd 로 돌면서 옛 코드를 붙잡고 있어 "고쳤는데 안 바뀐다" 로 몇 시간을
+썼다. 같은 실수를 반복하지 않으려고 **원본을 하나만 둔다.**
+
+`im10a.yml` 이 서브모듈 안에 있어 특히 위험했다. `wit_ros2_imu` 는 남의
+저장소라 우리가 커밋할 수 없는데, 그 안의 covariance 값들은 이 IMU 로
+**실측해 넣은 것**이라 잃으면 다시 재야 한다.
+
+### 젯슨을 새로 세팅할 때
+
+`git clone` 만으로는 심링크가 원래 위치에 안 생긴다. 두 줄을 다시 걸어라:
+
+```bash
+cd ~/smart-shipyard
+ln -sf ~/smart-shipyard/edge/streaming/video_streamer.py ~/video_streamer.py
+ln -sf ../../../../config/witmotion_im10a.yml \
+       edge/ros2_ws/src/wit_ros2_imu/config/im10a.yml
+cp edge/streaming/mediamtx.yml ~/mediamtx.yml
+sudo cp edge/streaming/*.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now mediamtx video-streamer
+```
+
+바이너리(`~/mediamtx`, `~/ffmpeg`)는 용량 때문에 저장소에 없다. 공식
+배포본을 받아 같은 경로에 둔다.
+
+---
+
 ## 2. 실물에서 달라지는 것 — 딱 두 가지, 둘 다 자동
 
 | | 시뮬 | 실물 |
