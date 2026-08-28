@@ -1154,6 +1154,15 @@ class SceneManager {
   // 관제사가 팝업의 "핑 직접 지우기"를 눌렀을 때 호출 — 서버에 아무것도 보내지 않고
   // 화면에서만 그 구획의 지속 핑을 지운다(사람이 눈으로 보고 이미 처리됐다고 판단한 경우용).
   // 백엔드가 나중에 event_cleared를 보내도 이미 지워진 핑이라 그냥 "못 찾음" 경고만 뜨고 끝난다.
+  // 화면의 핑을 전부 지운다 ([초기화] 전용).
+  // 블록의 위험 표시도 같이 되돌린다 — 핑이 없는데 구획만 빨간 채로 남으면
+  // "지웠는데 뭔가 남았다" 로 보인다.
+  clearAllPings() {
+    for (const p of this.pings) this._disposePing(p);
+    this.pings = [];
+    this.blockMeshes.forEach((rec, id) => this._setBlockDanger(id, false));
+  }
+
   clearBlockPing(blockId) {
     this.pings = this.pings.filter((p) => {
       if (p.blockId !== blockId || !p.persistent) return true;
@@ -2187,6 +2196,44 @@ export default function ShipyardTwinDashboard() {
     closePopup();
   };
 
+  // 🧹 이벤트 기억 초기화.
+  //
+  //   유령 핑이나 엉뚱한 자리의 이벤트가 생겼을 때, 프로세스를 껐다 켜지 않고
+  //   화면과 로봇 기억을 한 번에 정리한다. 젯슨이 reset_events 를 받으면
+  //   보고 이력과 재통보 거울을 비우고, 서버는 복원 기준선을 지금으로 민다.
+  //
+  //   ★ 되돌릴 수 없고, 누른 뒤에는 같은 자리의 불에 로봇이 **다시 멈춘다**
+  //     (기억이 비었으므로). 그것이 정상 동작이지만 모르고 누르면 당황하므로
+  //     확인을 받는다. 다만 방향은 안전하다 — 놓치는 것이 아니라 한 번 더 알린다.
+  const handleResetEvents = useCallback(() => {
+    const n = Object.keys(dangerByIdRef.current).length;
+    const ok = window.confirm(
+      `이벤트 기억을 초기화합니다. (지금 살아있는 위험 ${n}건)\n\n` +
+      "· 화면의 핑이 모두 사라집니다\n" +
+      "· 로봇도 이 자리들을 잊습니다 — 같은 불에 다시 멈춥니다\n" +
+      "· 되돌릴 수 없습니다 (기록은 DB 에 남습니다)\n\n" +
+      "계속할까요?"
+    );
+    if (!ok) return;
+
+    if (wsControlRef.current?.send) {
+      wsControlRef.current.send({ event_type: "reset_events" });
+      console.log("[이벤트 채널] reset_events 전송");
+    } else {
+      console.warn("[초기화] 서버에 못 보냈다 — 화면만 정리한다");
+    }
+
+    if (sceneRef.current) sceneRef.current.clearAllPings();
+    dangerByIdRef.current = {};
+    setEvents([]);
+    setStats({ danger: 0, warn: 0, info: 0 });
+    setActiveBlock(null);
+    setActiveEvent(null);
+    setActiveGroup([]);
+    setWarnEvent(null);
+    setAutoPopup(false);
+  }, []);
+
   const dangerCount = stats.danger;
   const sortedBlocks = useMemo(
     () => BLOCKS.map((b) => ({ ...b, p: progress[b.id] ?? 0 })), [progress]);
@@ -2305,6 +2352,14 @@ export default function ShipyardTwinDashboard() {
             <div className="panel-h">
               위험 이벤트 로그
               <span className="log-count">{events.length}</span>
+              <button
+                type="button"
+                className="log-reset"
+                onClick={handleResetEvents}
+                title="화면의 핑과 로봇의 이벤트 기억을 모두 지웁니다 (되돌릴 수 없음)"
+              >
+                🧹 초기화
+              </button>
             </div>
             <div className="log">
               {events.length === 0 && <div className="log-empty">이벤트 수신 대기 중…</div>}
@@ -2507,6 +2562,11 @@ const CSS = `
 .log { display:flex; flex-direction:column; gap:5px; overflow-y:auto; flex:1 1 auto; }
 .log-empty { color:#5a6580; font-size:12px; text-align:center; padding:30px 0; }
 .log-count { background:#1a2336; color:#aebbd2; font-size:11px; padding:2px 8px; border-radius:10px; }
+/* 초기화 버튼. 오른쪽 끝으로 밀어 제목·개수와 섞이지 않게 한다.
+   눈에 띄되 먼저 누르고 싶어지지는 않도록 평소엔 차분한 색을 쓴다. */
+.log-reset { margin-left:auto; font-size:11px; padding:3px 9px; cursor:pointer;
+  background:#16202f; color:#7d8aa3; border:1px solid #2a3a52; border-radius:6px; }
+.log-reset:hover { background:#1c283a; color:#e6edf6; border-color:#3a4d6a; }
 .log-row { display:grid; grid-template-columns:auto 1fr auto auto auto; align-items:center; gap:8px;
   background:#121a28; border:1px solid #1e2a3f; border-left:3px solid #1e2a3f; border-radius:7px;
   padding:8px 10px; cursor:pointer; text-align:left; color:#e6edf6; transition:transform .1s,background .15s; }

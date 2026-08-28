@@ -125,6 +125,21 @@ WEBRTC_SIGNAL = "webrtc_signal"
 # (예: {"event_type": "event_ack"})
 EVENT_ACK = "event_ack"
 
+# 이벤트 기억 초기화 (프론트 → 서버 → 젯슨, DB 저장 안 함).
+#
+# 유령 핑이나 엉뚱한 자리의 이벤트가 생겼을 때, 프로세스를 껐다 켜지 않고
+# 화면과 로봇 기억을 한 번에 정리한다. 젯슨은 이걸 받으면 change_point 의
+# 보고 이력과 재통보 거울을 비운다.
+#
+# ★ 서버도 같이 움직여야 한다.
+#   젯슨만 비우면 서버는 계속 옛 이벤트를 복원한다. 아래 복원 기준선을
+#   지금 시각으로 밀어야 새로고침해도 안 돌아온다.
+#
+# ★ DB 는 지우지 않는다.
+#   기록은 증빙이다. "안 보이게 하는 것" 과 "지우는 것" 은 다르다.
+#   기준선만 밀면 화면에서 사라지고, 기록은 감사용으로 남는다.
+RESET_EVENTS = "reset_events"
+
 # 로봇 연결 상태 알림 (서버 → 프론트, DB 저장 안 함).
 #
 # ★ 왜 필요한가 (2026-08-29)
@@ -137,7 +152,7 @@ JETSON_STATUS = "jetson_status"
 
 # 프론트→서버→젯슨 방향으로 '그대로 전달'하는 메시지 종류 모음.
 # (젯슨→프론트 방향은 기존 브로드캐스트가 모든 메시지를 전달하므로 목록 불필요)
-JETSON_BOUND_TYPES = {WEBRTC_SIGNAL, EVENT_ACK}
+JETSON_BOUND_TYPES = {WEBRTC_SIGNAL, EVENT_ACK, RESET_EVENTS}
 
 # 이벤트 timestamp 기록용 한국 표준시.
 # 시간대 정보 없는(naive) 시각은 환경마다 해석이 달라지므로 +09:00을 명시한다.
@@ -300,7 +315,12 @@ DANGER_TYPES = {SHIP_DEFECT, NO_HELMET, FALLEN_PERSON, FIRE}
 #
 #     DB 의 timestamp 는 datetime.now(KST) 로 쓰므로 바닥도 같은 시간대여야
 #     문자열 비교가 곧 시간 비교가 된다.
-SERVER_STARTED_AT = datetime.now(KST)
+# 이 시각보다 오래된 이벤트는 복원하지 않는다.
+#
+# 이름이 "서버 시작 시각" 이 아닌 이유 — 서버가 켜질 때뿐 아니라
+# 프론트의 [초기화](reset_events)로도 지금 시각으로 밀린다. 즉 "복원의 바닥"
+# 이지 "프로세스가 뜬 시각" 이 아니다.
+RESTORE_FLOOR_AT = datetime.now(KST)
 
 # 젯슨이 "이건 아직 살아있다"고 알려준 이벤트 id 들.
 #
@@ -310,7 +330,7 @@ SERVER_STARTED_AT = datetime.now(KST)
 #   실제로 그 시각에 감지된 것도 아니라 감사 기록을 흐린다.
 #
 #   그런데 저장을 안 하면 구멍이 하나 생긴다. 서버를 재시작한 뒤라면 그 이벤트의
-#   원래 DB 기록은 SERVER_STARTED_AT 아래에 있어 복원 대상이 아니다. 그래서
+#   원래 DB 기록은 RESTORE_FLOOR_AT 아래에 있어 복원 대상이 아니다. 그래서
 #   젯슨 재통보로 핑은 떴는데 **브라우저를 새로고침하면 사라진다.**
 #
 #   그래서 저장하는 대신 "젯슨이 살아있다고 한 것" 을 여기 기억해두고, 복원할 때
@@ -347,13 +367,13 @@ async def _backfill_replay_event(doc: dict):
         #   붙어도(재연결 루프가 있다) 목록이 날아가고, 그 뒤 대시보드를
         #   새로고침하면 **살아있는 위험 핑이 통째로 사라졌다.**
         #
-        #   이번 세션(SERVER_STARTED_AT 이후) 기록을 한 번 남겨두면 복원이
+        #   이번 세션(RESTORE_FLOOR_AT 이후) 기록을 한 번 남겨두면 복원이
         #   시각만으로 성립해서, 메모리 상태가 어떻든 흔들리지 않는다.
         #   세션당 event_id 하나에 최대 한 건이라 무한히 쌓이지도 않는다.
         exists = await event_collection.find_one(
             {"event_id": eid,
              "event_type": {"$in": list(DANGER_TYPES)},
-             "timestamp": {"$gte": SERVER_STARTED_AT.isoformat()}},
+             "timestamp": {"$gte": RESTORE_FLOOR_AT.isoformat()}},
             {"_id": 1},
         )
         if exists:
@@ -391,8 +411,8 @@ async def _active_danger_events(limit: int = 300):
     최신 limit 건만 훑는다. 그보다 오래된 것이 아직 살아있을 가능성은 낮고,
     전체 스캔은 접속할 때마다 도는 경로라 비용을 묶어두는 편이 안전하다.
     """
-    # SERVER_STARTED_AT 도 KST 라 timestamp 와 표기가 같다 → 사전순 = 시간순.
-    cutoff = SERVER_STARTED_AT.isoformat()
+    # RESTORE_FLOOR_AT 도 KST 라 timestamp 와 표기가 같다 → 사전순 = 시간순.
+    cutoff = RESTORE_FLOOR_AT.isoformat()
     docs = await event_collection.find({
         "event_type": {"$in": list(DANGER_TYPES) + [EVENT_CLEARED]},
         "$or": [
@@ -865,10 +885,23 @@ async def websocket_frontend(websocket: WebSocket):
 
             event_type = data.get("event_type")
 
-            # 프론트→젯슨 전달 대상: webrtc_signal(시그널링), event_ack(이벤트 확인).
+            # 프론트→젯슨 전달 대상: webrtc_signal(시그널링), event_ack(이벤트 확인),
+            # reset_events(기억 초기화).
             # 서버는 내용을 판단하지 않고 젯슨에게 그대로 배달만 한다 —
             # webrtc_signal 의 payload 는 WebRTC 라이브러리가 만든 것이고
             # event_ack 는 젯슨의 Nav2 가 해석할 것이라, 서버가 검사할 게 없다.
+            # 🧹 이벤트 기억 초기화 — 젯슨으로 보내기 전에 **서버도 같이** 비운다.
+            #   젯슨만 비우면 서버는 계속 옛 이벤트를 복원해서, 새로고침하면
+            #   방금 지운 핑이 되살아난다.
+            if event_type == RESET_EVENTS:
+                global RESTORE_FLOOR_AT
+                RESTORE_FLOOR_AT = datetime.now(KST)
+                cleared = len(jetson_live_event_ids)
+                jetson_live_event_ids.clear()
+                print(f"🧹 [초기화] 복원 기준선을 지금으로 밀었다 "
+                      f"({RESTORE_FLOOR_AT.isoformat()[11:19]}) · 생존 목록 {cleared}건 비움. "
+                      f"DB 기록은 그대로 둔다(증빙).")
+
             if event_type in JETSON_BOUND_TYPES:
                 if jetson_connection is None:
                     print(f"⚠️ [중계] {event_type} 전달 실패: 젯슨 미접속 상태")
