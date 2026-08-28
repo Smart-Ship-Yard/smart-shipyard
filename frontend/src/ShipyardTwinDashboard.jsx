@@ -2179,6 +2179,13 @@ function DashboardInner({ authed }) {
   // block_level 웹소켓 이벤트, /api/init-data 초기 로딩 둘 다 이 함수를 같이 쓴다.
   // ⚠️ 배가 한 척(B1)뿐이라 구획별이 아니라 "몇 번째 구획까지 끝났는지"로 계산한다 —
   // 젯슨이 보내는 block_id("B1")는 배 자체의 id지, BLOCKS의 S1~S5(구획)가 아니다.
+  // "07:55" 다섯 글자. toLocaleTimeString("ko-KR") 은 "7시 55분 31초" 라 칸을 넘친다.
+  const hhmm = (iso) => {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return "";
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  };
+
   const applyStageProgress = useCallback((stage, at) => {
     const clamped = Math.max(0, Math.min(BLOCKS.length, Number(stage) || 0));
     // 완성된 시각을 함께 남긴다.
@@ -2878,10 +2885,15 @@ function DashboardInner({ authed }) {
               {sortedBlocks.map((b) => (
                 <div key={b.id} className="prog-row">
                   <div className="prog-name">
-                    <span className="prog-id">{b.id}</span> {b.name}
+                    <span className="prog-id">{b.id}</span>
+                    <span className="prog-label">{b.name}</span>
+                    {/* ★ toLocaleTimeString("ko-KR") 은 "7시 55분 31초" 처럼 뽑는다.
+                        12글자라 이 좁은 칸을 넘쳐 "7시 5…" 로 잘렸다.
+                        HH:MM 다섯 글자로 줄인다 — 초까지는 필요 없다. */}
                     {completedAt[b.id] && (
-                      <span className="prog-when">
-                        {new Date(completedAt[b.id]).toLocaleTimeString("ko-KR", { hour12: false })} 완성
+                      <span className="prog-when"
+                            title={`${new Date(completedAt[b.id]).toLocaleString("ko-KR")} 완성`}>
+                        {hhmm(completedAt[b.id])}
                       </span>
                     )}
                   </div>
@@ -3232,9 +3244,13 @@ const CSS = `
 .prog-row { display:grid; grid-template-columns:1fr 70px 36px; align-items:center; gap:8px;
   background:none; border:none; padding:7px 6px; border-radius:8px; cursor:pointer; text-align:left;
   color:#e6edf6; transition:background .15s; }
-.prog-when { margin-left:8px; font-size:11px; color:#5f6b80; font-variant-numeric:tabular-nums; }
+.prog-name { display:flex; align-items:baseline; gap:4px; min-width:0; }
+/* 시각은 밀리지 않게 고정, 긴 것은 구획 이름 쪽이 줄어든다 */
+.prog-when { flex:0 0 auto; font-size:10px; color:#5f6b80;
+  font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
+.prog-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .prog-row:hover { background:#121a28; }
-.prog-name { font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.prog-name { font-size:12px; }
 .prog-id { color:#2dd4bf; font-weight:700; font-size:11px; margin-right:4px; }
 .prog-bar { height:7px; background:#1a2336; border-radius:5px; overflow:hidden; }
 .prog-fill { height:100%; border-radius:5px; transition:width .5s ease; }
