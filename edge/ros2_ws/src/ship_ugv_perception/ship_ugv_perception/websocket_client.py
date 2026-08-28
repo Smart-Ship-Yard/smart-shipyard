@@ -184,6 +184,13 @@ class WebSocketClient(Node):
         #   (/map_point -> event_gate)에는 영향이 없어야 하기 때문이다.
         self._active_events = {}          # event_id -> payload
         self._active_lock = threading.Lock()
+        # ★ 이번 연결에서 서버에 이미 알린 event_id (2026-08-29).
+        #   재통보를 "연결 성립 순간 한 번" 으로 두면, change_point 의 활성
+        #   목록이 그보다 늦게 도착할 때(실측 1.47초) 거울이 비어 있어 아무것도
+        #   못 보내고 다시는 기회가 없다. 무엇을 알렸는지로 판단하면 도착
+        #   순서가 어떻든 결과가 같다.
+        self._announced = set()
+        self._ws_live = False
 
         # ★ 서버 -> 젯슨 수신 메시지를 그대로 중계할 퍼블리셔 (해석하지 않음)
         self.inbound_pub = self.create_publisher(String, inbound_topic, 10)
@@ -348,9 +355,33 @@ class WebSocketClient(Node):
         with self._active_lock:
             before = len(self._active_events)
             self._active_events = mirror
+            # 목록에서 빠진 것은 "알린 적 없음" 으로 되돌린다. 치웠다가 같은
+            # 자리에 다시 생기면 그때 또 알려야 하기 때문이다.
+            self._announced &= set(mirror)
         if before != len(mirror):
             self.get_logger().info(
                 f"[활성목록] change_point 기준으로 맞춤: {before} -> {len(mirror)}건")
+        self._reannounce()
+
+    def _reannounce(self):
+        """아직 서버에 안 알린 활성 이벤트를 replay 로 내보낸다.
+
+        연결 직후에도, 활성 목록이 늦게 도착했을 때도 같은 함수를 부른다.
+        무엇을 알렸는지로 판단하므로 두 번 불려도 중복 전송이 없다.
+        """
+        if not self._ws_live:
+            return            # 연결되면 그때 다시 부른다
+        with self._active_lock:
+            pending = [dict(v) for k, v in self._active_events.items()
+                       if k not in self._announced]
+            self._announced.update(self._active_events)
+        for ev in pending:
+            ev['replay'] = True
+            self._enqueue(ev)
+        if pending:
+            self.get_logger().info(
+                f"[위험이벤트 재통보] {len(pending)}건 재전송: "
+                + ', '.join(str(e.get('event_id')) for e in pending))
 
     def _reset_if_asked(self, data):
         """프론트 [초기화] 버튼이 서버를 거쳐 오면 거울도 비운다.
@@ -365,6 +396,7 @@ class WebSocketClient(Node):
         with self._active_lock:
             n = len(self._active_events)
             self._active_events.clear()
+            self._announced.clear()
         self.get_logger().warn(f"🧹 재통보 거울 초기화 — {n}건 지움")
 
     def _map_point_cb(self, msg: String):
@@ -418,6 +450,7 @@ class WebSocketClient(Node):
         if _eid:
             with self._active_lock:
                 self._active_events[_eid] = dict(payload)
+                self._announced.add(_eid)
         self._enqueue(payload)
         self.get_logger().info(
             f"[위험이벤트 큐] {event_type} conf={confidence:.2f} "
@@ -603,14 +636,9 @@ class WebSocketClient(Node):
                 #   이어진다(event_ttl 은 재검출마다 갱신되므로 만료 안 됨).
                 #   replay 를 실어 보내 프론트가 팝업 없이 핑만 그리게 한다.
                 with self._active_lock:
-                    revive = [dict(v) for v in self._active_events.values()]
-                for ev in revive:
-                    ev['replay'] = True
-                    self._enqueue(ev)
-                if revive:
-                    self.get_logger().info(
-                        f"[위험이벤트 재통보] {len(revive)}건 재전송: "
-                        + ', '.join(str(e.get('event_id')) for e in revive))
+                    self._announced.clear()
+                self._ws_live = True
+                self._reannounce()
 
                 while not self._stop_event.is_set():
                     # 이벤트가 먼저다. 큐가 비었을 때만 최신 위치를 보낸다.
@@ -649,6 +677,7 @@ class WebSocketClient(Node):
                     self._last_fail_log = now
                     self._fail_count = 0
             finally:
+                self._ws_live = False
                 if ws is not None:
                     try:
                         ws.close()

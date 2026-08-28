@@ -33,6 +33,8 @@ class Fake:
         self._pending_position = None
         self._active_events = {}
         self._active_lock = threading.Lock()
+        self._announced = set()
+        self._ws_live = False
 
     # 실제 코드와 같은 순서로 동작
     def on_danger(self, event_id, cls='fire'):
@@ -40,6 +42,7 @@ class Fake:
         if event_id:
             with self._active_lock:
                 self._active_events[event_id] = dict(payload)
+                self._announced.add(event_id)
         self.send_queue.put(payload)
 
     def on_cleared(self, event_id):
@@ -52,17 +55,40 @@ class Fake:
     def on_position(self):
         self._pending_position = {'event_type': 'position', 'ekf_global': [0, 0]}
 
-    def reannounce(self):
+    def on_active_list(self, items):
+        """change_point 의 latch 목록 도착 — 거울을 통째로 맞춘다."""
+        mirror = {eid: {'event_type': 'fire', 'event_id': eid, 'map_xy': [0, 0]}
+                  for eid in items}
         with self._active_lock:
-            revive = [dict(v) for v in self._active_events.values()]
-        for ev in revive:
+            self._active_events = mirror
+            self._announced &= set(mirror)
+        return self.reannounce()
+
+    def on_connect(self):
+        with self._active_lock:
+            self._announced.clear()
+        self._ws_live = True
+        return self.reannounce()
+
+    def on_disconnect(self):
+        self._ws_live = False
+
+    def reannounce(self):
+        if not self._ws_live:
+            return []
+        with self._active_lock:
+            pending = [dict(v) for k, v in self._active_events.items()
+                       if k not in self._announced]
+            self._announced.update(self._active_events)
+        for ev in pending:
             ev['replay'] = True
             self.send_queue.put(ev)
-        return revive
+        return pending
 
 
 if __name__ == '__main__':
     f = Fake()
+    f._ws_live = True          # 아래 기존 시나리오는 연결된 상태를 전제한다
 
     # 위치 핑은 아무리 많이 만들어도 큐에 안 쌓인다
     for _ in range(7200):          # 1시간치
@@ -79,7 +105,7 @@ if __name__ == '__main__':
     print('  이벤트는 큐에 그대로 쌓임  OK')
 
     # 재연결 -> 살아있는 것만 replay 플래그를 달고 재전송
-    revive = f.reannounce()
+    revive = f.on_connect()
     assert len(revive) == 2, f'재통보 대상이 2건이 아니다: {len(revive)}'
     assert all(e['replay'] is True for e in revive), 'replay 플래그가 없다'
     ids = {e['event_id'] for e in revive}
@@ -88,7 +114,7 @@ if __name__ == '__main__':
 
     # 치워진 것은 재통보 대상에서 빠진다 (되살아나면 안 된다)
     f.on_cleared('fire@0.1,-1.2')
-    revive = f.reannounce()
+    revive = f.on_connect()
     ids = {e['event_id'] for e in revive}
     assert ids == {'no_helmet@0.5,0.3'}, f'치워진 것이 되살아났다: {ids}'
     print('  치워진 것은 재통보 안 함  OK')
@@ -120,6 +146,7 @@ if __name__ == '__main__':
             return
         with f._active_lock:
             f._active_events.clear()
+            f._announced.clear()
 
     reset({'event_type': 'stream_boost'})          # 다른 명령은 무시
     with f._active_lock:
@@ -127,8 +154,57 @@ if __name__ == '__main__':
     reset({'event_type': 'reset_events'})
     with f._active_lock:
         assert len(f._active_events) == 0, '초기화가 안 됐다'
-    assert f.reannounce() == [], '초기화 뒤에도 재통보가 나간다'
+    assert f.on_connect() == [], '초기화 뒤에도 재통보가 나간다'
     print('  [초기화] -> 거울 비움, 재통보 없음  OK')
     print('  다른 명령에는 반응 안 함  OK')
+
+    # ★ 실물에서 터진 경쟁 (2026-08-29)
+    #   실측 로그:
+    #     098.012  서버 연결 성공        <- 재통보가 여기서 한 번만 돌았다
+    #     098.369  change_point 발행
+    #     099.480  활성목록 도착 0 -> 2건  <- 1.47초 늦음
+    #   거울이 빈 채로 재통보가 끝나 replay 0건. 다시는 기회가 없어서 불이
+    #   눈앞에 있는데 대시보드는 빈 화면이었다. 도착 순서와 무관해야 한다.
+    g = Fake()
+    assert g.on_connect() == [], '거울이 비었는데 재통보가 나갔다'
+    late = g.on_active_list(['fire@0.49,-1.22', 'fire@-0.19,-1.16'])
+    ids = {e['event_id'] for e in late}
+    assert ids == {'fire@0.49,-1.22', 'fire@-0.19,-1.16'}, \
+        f'늦게 온 활성목록이 재통보되지 않았다: {ids}'
+    assert all(e['replay'] is True for e in late), 'replay 플래그가 없다'
+    print('  연결 -> 활성목록이 1.47초 늦게 도착해도 재통보됨  OK')
+
+    # 같은 목록이 또 와도 두 번 보내지 않는다
+    assert g.on_active_list(['fire@0.49,-1.22', 'fire@-0.19,-1.16']) == [], \
+        '같은 이벤트를 두 번 재통보했다'
+    print('  같은 목록 재수신 -> 중복 전송 없음  OK')
+
+    # 반대 순서(목록 먼저, 연결 나중)도 결과가 같아야 한다
+    h = Fake()
+    assert h.on_active_list(['fire@7,7']) == [], '연결 전에 보냈다'
+    first = h.on_connect()
+    assert {e['event_id'] for e in first} == {'fire@7,7'}, first
+    print('  활성목록 먼저 -> 연결 나중이어도 재통보됨  OK')
+
+    # 새 이벤트는 정상 전송되므로 replay 로 또 나가면 안 된다
+    k = Fake()
+    k.on_connect()
+    k.on_danger('fire@3,3')
+    assert k.reannounce() == [], '방금 보낸 새 이벤트가 replay 로 또 나갔다'
+    print('  새 이벤트는 정상 전송 1회뿐, replay 중복 없음  OK')
+
+    # 끊겼다 붙으면 살아있는 것을 다시 알린다
+    k.on_disconnect()
+    assert k.reannounce() == [], '끊긴 상태에서 전송했다'
+    again = k.on_connect()
+    assert {e['event_id'] for e in again} == {'fire@3,3'}, again
+    print('  재연결 -> 살아있는 것 다시 알림  OK')
+
+    # 치웠다가 같은 자리에 다시 생기면 또 알려야 한다
+    k.on_active_list([])
+    revived = k.on_active_list(['fire@3,3'])
+    assert {e['event_id'] for e in revived} == {'fire@3,3'}, \
+        f'치운 뒤 다시 생긴 이벤트를 안 알렸다: {revived}'
+    print('  치운 뒤 재발생 -> 다시 알림  OK')
 
     print('\n통과')
