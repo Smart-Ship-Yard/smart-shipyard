@@ -153,7 +153,18 @@ function serverToWorld(blockId, local = { x: 0.5, y: 1, z: 0.5 }) {
   // 그 z 위치에서 실제 선체가 얼마나 넓은지(hullBeamFactor)를 반영해서 x를 계산한다.
   // 이걸 안 하면 뱃머리(S1)처럼 배가 뾰족해지는 구간에서 핑이 실제 선체보다 훨씬
   // 바깥쪽 — 즉 화재/사고가 없는 빈 물 위 — 에 찍힌 것처럼 보인다.
-  const localWidth = SHIP_BEAM * hullBeamFactor(t);
+  // ★ 선폭계수에 하한을 둔다 (2026-08-29).
+  //   hullBeamFactor 는 뱃머리·선미 끝에서 0.03 까지 떨어진다. 그대로 곱하면
+  //   좌우 오프셋이 통째로 눌려, **끝에 놓인 대상은 좌우가 정확해도 화면에서
+  //   가운데로 보인다.** 실제로 뱃머리 끝 3.5cm 지점(t=0.974, 계수 0.073)에서
+  //   좌우 표시가 사라졌다.
+  //
+  //   원래 의도(뾰족한 뱃머리에서 핑이 선체 밖 허공에 뜨는 것 방지)는 살리되,
+  //   하한 0.35 를 둬서 좌우 구분은 남긴다. 아주 뾰족한 끝에서는 핑이 선체선을
+  //   조금 넘칠 수 있는데, 관제 화면에서는 "선체선 안" 보다 "어느 쪽인지" 가
+  //   더 중요하다고 보고 그쪽을 택했다.
+  const HULL_BEAM_FLOOR = 0.35;
+  const localWidth = SHIP_BEAM * Math.max(hullBeamFactor(t), HULL_BEAM_FLOOR);
   const x = (local.x - 0.5) * localWidth * 0.8;      // 폭 방향(해당 지점 실제 선폭 기준)
   const y = DECK_Y + (local.y ?? 1) * 0.9;           // 갑판 위
   return new THREE.Vector3(x, y, z);
