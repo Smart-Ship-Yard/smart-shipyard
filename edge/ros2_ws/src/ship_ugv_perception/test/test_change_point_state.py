@@ -100,12 +100,25 @@ if __name__ == '__main__':
     print('  TTL 넘긴 항목은 안 복원함  OK')
 
     src = a.reported_events[0]
-    for k in ('class_id', 'event_id', 'x', 'y', 'seen_yaw',
-              'left_vantage', 'arrived_at', 'fov_seen'):
+    # 정체성 정보는 그대로 살아야 한다
+    for k in ('class_id', 'event_id', 'x', 'y', 'seen_yaw'):
         assert r[k] == src[k], f'{k} 가 왕복에서 달라졌다: {r[k]!r} != {src[k]!r}'
     assert r['seen_from'] == src['seen_from'], 'seen_from 이 튜플로 안 돌아왔다'
-    assert r['last_seen'].nanoseconds == src['last_seen'].nanoseconds
-    print('  모든 필드가 왕복에서 보존됨  OK')
+    print('  정체성 필드(위치·id·seen_from)는 보존됨  OK')
+
+    # ★ 판정 진행상황은 **일부러 초기화된다** (2026-08-29 사고).
+    #   종료 전 값을 되살리면 켜자마자 치워짐이 나간다:
+    #     now - last_seen = 꺼져 있던 시간 >= min_unseen_s
+    #     max_departure   = 지난 세션 값   >= min_departure_m
+    #     fov_seen        = 3초 이상이면 그대로 통과
+    #   -> 불이 눈앞에 있는데 시동 몇 초 만에 "치워졌다" 를 보냈다.
+    assert r['left_vantage'] is False, '진행상황(left_vantage)이 되살아났다'
+    assert r['arrived_at'] is None, '진행상황(arrived_at)이 되살아났다'
+    assert r['fov_seen'] == 0.0, '진행상황(fov_seen)이 되살아났다'
+    assert r['max_departure'] == 0.0, '진행상황(max_departure)이 되살아났다'
+    assert r['last_seen'].nanoseconds == b._now.nanoseconds, \
+        'last_seen 이 종료 전 시각 그대로다 — 켜자마자 min_unseen_s 를 통과한다'
+    print('  판정 진행상황은 초기화됨 (켜자마자 치워짐 방지)  OK')
 
     # 깨진 파일 -> 빈 상태로 시작하고 죽지 않는다
     with open(path, 'w') as f:
