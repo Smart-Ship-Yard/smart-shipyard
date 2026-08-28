@@ -1359,6 +1359,9 @@ function CctvPopup({ block, event, auto, onClose, onAck, onClearPing }) {
  * ------------------------------------------------------------------------- */
 export default function ShipyardTwinDashboard() {
   const canvasRef = useRef(null);
+  // 3D 씬을 못 띄운 이유. null 이면 정상.
+  // ★ 이게 있어야 WebGL 실패가 대시보드 전체를 무너뜨리지 않는다 (아래 참고).
+  const [sceneError, setSceneError] = useState(null);
   const sceneRef = useRef(null);
   const [events, setEvents] = useState([]);          // 이벤트 로그
   const [activeBlock, setActiveBlock] = useState(null);
@@ -1451,12 +1454,33 @@ export default function ShipyardTwinDashboard() {
   }, []);
 
   // 씬 초기화
+  //
+  // ★ 반드시 try 로 감싼다 (2026-08-28).
+  //   THREE.WebGLRenderer 는 브라우저가 WebGL 컨텍스트를 못 주면 예외를 던진다.
+  //   그런데 여기는 useEffect 안이라, 던진 예외가 React 를 타고 올라가
+  //   <ShipyardTwinDashboard> 를 통째로 언마운트시킨다 —— 3D 뷰만 못 쓰는 게
+  //   아니라 위험 이벤트 로그·영상·알람까지 전부 사라지고 흰 화면이 된다.
+  //
+  //   실제로 겪었다: 크롬의 GPU 프로세스가 간헐적으로 실패하면서
+  //   "BindToCurrentSequence failed" 로 컨텍스트 생성이 거부됐다. OS 쪽 드라이버는
+  //   멀쩡했고(OpenGL 4.6 정상), 크롬을 다시 켜면 되기도 해서 원인을 잡기 어려웠다.
+  //
+  //   관제 화면이 GPU 딸꾹질 한 번에 통째로 멎으면 안 된다. 3D 만 끄고 나머지는
+  //   계속 돌린다. sceneRef 를 쓰는 곳은 전부 이미 null 검사가 있어서 안전하다.
   useEffect(() => {
-    const sm = new SceneManager(canvasRef.current, { onPickBlock: handlePickBlock });
+    let sm;
+    try {
+      sm = new SceneManager(canvasRef.current, { onPickBlock: handlePickBlock });
+    } catch (err) {
+      console.error("[3D] 씬 초기화 실패 — 3D 뷰만 끄고 나머지는 계속 동작합니다:", err);
+      setSceneError(err);
+      return;
+    }
     sceneRef.current = sm;
+    setSceneError(null);
     const ro = new ResizeObserver(() => sm.resize());
     ro.observe(canvasRef.current.parentElement);
-    return () => { ro.disconnect(); sm.dispose(); };
+    return () => { ro.disconnect(); sm.dispose(); sceneRef.current = null; };
   }, [handlePickBlock]);
 
   // 이벤트 소스 연결 — 위험/경고 이벤트가 감지됐을 때 공통으로 하는 일
@@ -1779,6 +1803,21 @@ export default function ShipyardTwinDashboard() {
         <main className="stage">
           <div className="stage-tag">디지털 트윈 관제 뷰 · 드래그 회전 / 스크롤 줌 / 구획 클릭</div>
           <canvas ref={canvasRef} className="three-canvas" />
+          {sceneError && (
+            <div className="stage-fallback">
+              <div className="stage-fallback-title">3D 뷰를 띄우지 못했습니다</div>
+              <p>
+                브라우저가 WebGL(그래픽 가속)을 쓸 수 없는 상태입니다.
+                <strong> 나머지 관제 기능은 정상 동작합니다</strong> — 이벤트 로그,
+                실시간 영상, 알람은 그대로 받고 있습니다.
+              </p>
+              <p className="stage-fallback-how">
+                되살리려면: 크롬을 완전히 껐다 켜기 → 그래도 안 되면
+                <code> chrome://settings</code> 에서 &ldquo;그래픽 가속 사용&rdquo; 확인 →
+                <code> chrome://gpu</code> 에서 WebGL 상태 보기
+              </p>
+            </div>
+          )}
           <div className="stage-hint">배의 구획을 클릭하면 해당 구역 CCTV가 열립니다 (Click &amp; View)</div>
           <LivePanel
             ugvBlock={ugvBlock}
@@ -1974,6 +2013,16 @@ const CSS = `
 .popup-meta > div { display:flex; justify-content:space-between; font-size:12px; border-bottom:1px solid #161f2e; padding-bottom:7px; }
 .popup-meta .k { color:#7d8aa3; }
 .popup-meta .v { color:#e6edf6; font-weight:600; }
+
+/* 3D 를 못 띄웠을 때 캔버스 자리에 덮는 안내. 나머지 관제 기능은 살아 있다. */
+.stage-fallback { position:absolute; inset:0; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:10px; padding:24px; text-align:center;
+  background:#0a0e17; color:#7d8aa3; font-size:13px; line-height:1.6; z-index:2; }
+.stage-fallback-title { color:#ffb020; font-size:15px; font-weight:700; }
+.stage-fallback p { margin:0; max-width:520px; }
+.stage-fallback strong { color:#e6edf6; }
+.stage-fallback-how { font-size:12px; color:#5f6b80; }
+.stage-fallback code { color:#2dd4bf; font-family:monospace; }
 
 /* 감지 순간 스냅샷. 젯슨이 보낸 crop 이라 가로세로가 제각각이므로
    높이만 묶어두고 비율은 유지한다(object-fit:contain). */
