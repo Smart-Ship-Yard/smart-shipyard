@@ -249,6 +249,28 @@ const CALIBRATION_YAW_OFFSET_RAD = CALIBRATION_YAW_OFFSET_DEG * Math.PI / 180;
  *     최대 0.20m)이다. 이벤트는 군집 평균이 아니라 **한 번의 검출**로 등록되므로
  *     그 한 번이 어디로 튀었느냐가 그대로 핑 위치가 된다.
  *     상수 보정으로 고칠 수 있는 부분은 여기까지다. */
+/* 배 중심에서 이 거리를 넘는 위험 이벤트는 화면에 그리지 않는다 (미터).
+ *
+ * ★ 왜 필요한가 (2026-08-29)
+ *   로봇의 카메라는 순찰 원 **안쪽(배 쪽)** 을 본다. 그러니 배에서 한참 떨어진
+ *   곳의 화재는 원리상 나올 수 없다. 그런데 실제로 벽 근처의 무언가를 불로
+ *   오인한 검출이 대시보드에 유령 핑으로 떴다.
+ *
+ *   실측 (2026-08-29 02~04시, 화재 15건):
+ *     진짜 이벤트 11건 —— 배 중심에서 최대 0.84 m
+ *     유령  4건      —— 최소 1.60 m
+ *   사이에 0.76 m 의 빈 구간이 있어 깨끗하게 갈린다. 1.2 m 로 자른다.
+ *
+ * ★ 이것은 방어선이지 해결책이 아니다.
+ *   근본 원인은 젯슨의 YOLO 오검출이고(그쪽에서 depth 2~4m 짜리 오검출을
+ *   45건 확인했다), 젯슨의 max_depth_m 필터가 1차 방어선이다. 여기는 그것을
+ *   통과해버린 것을 화면에서 막는 마지막 그물이다.
+ *
+ *   ⚠️ 순찰 반경을 크게 바꾸면 이 값도 같이 올려야 한다. 안 그러면 진짜
+ *      이벤트가 조용히 사라진다 —— 그래서 걸러낼 때 콘솔에 반드시 남긴다.
+ */
+const MAX_EVENT_DIST_FROM_SHIP_M = 1.2;
+
 const PING_OFFSET_FORWARD_M = 0.034;  // + 가 뱃머리 쪽 (2026-08-29 실측)
 const PING_OFFSET_BEAM_M = 0.0;       // + 가 좌현 쪽 (실측 결과 편향 없음 — 아래)
 
@@ -305,9 +327,10 @@ function mapXYToBlockLocal(mapXY, shipPose) {
  * 관제사에게 "S3 89%"보다 "S3 왼편 89%"가 훨씬 쓸모 있다 — 배로 뛰어갈 때
  * 어느 쪽으로 돌아야 하는지가 바로 나오기 때문이다.
  *
- * 규칙 (docs/이벤트_스냅샷_및_위치표기_요청.md 1장):
- *   배 앞뒤 범위 안  →  "<구획> <왼편|오른편>"          예) S3 왼편
- *   앞뒤 끝을 넘어감  →  "<구획> <앞쪽|뒤쪽> <왼편|오른편>" 예) S1 앞쪽 왼편
+ * 규칙:
+ *   배 위(선체 안)   →  "<구획> 위"                      예) S1 위
+ *   배 밖, 앞뒤 안   →  "<구획> <왼편|오른편>"            예) S3 왼편
+ *   배 밖, 앞뒤 넘음  →  "<구획> <앞쪽|뒤쪽> <왼편|오른편>" 예) S1 앞쪽 왼편
  *
  * ★ "중앙"은 두지 않는다. 배 폭이 14cm뿐이라 중앙이라고 해봐야 왼쪽 7cm 안이고,
  *   관제사 입장에서는 어느 쪽으로 갈지 정해주는 편이 낫다. 그래서 애매하면
@@ -327,9 +350,25 @@ function describePingLocation(mapXY, shipPose, fallbackBlockId) {
   //   뱃머리가 +x 를 볼 때 +y 는 왼쪽이므로, beam(=배 기준 y)이 양수면 좌현이다.
   //   예전에는 반대로 적어 화면 표기가 실제와 좌우가 뒤바뀌어 있었다.
   //   (3D 핑 위치는 원래 맞게 그리고 있었다 — 글자만 틀렸다)
-  const side = rel.beam >= 0 ? "왼편" : "오른편";
   const halfLength = SHIP_REAL_LENGTH_M / 2;
+  const halfBeam = SHIP_REAL_BEAM_M / 2;
 
+  // ★ 배 위에서는 좌/우를 말하지 않는다 (2026-08-29).
+  //   배 폭이 14cm(반폭 7cm)인데 좌표 오차가 3~5cm 다. 갑판 위 대상의 좌/우는
+  //   센서 정밀도 안쪽이라 자주 뒤집힌다 —— 실측에서 우현에 놓은 불이 좌현으로
+  //   읽혔다. 틀릴 수 있는 정보를 관제 화면에 쓰느니 안 쓰는 편이 낫다.
+  //   구획(S1~S5)은 한 칸이 15cm 라 오차보다 3배 크므로 믿을 수 있다.
+  //
+  //   배 밖은 반대다. 야드는 넓어서 좌/우가 오차보다 훨씬 크고, 관제사가
+  //   어느 쪽으로 돌아가야 하는지 알려면 그 정보가 필요하다. 그래서 유지한다.
+  const onShip =
+    Math.abs(rel.forward) <= halfLength && Math.abs(rel.beam) <= halfBeam;
+  if (onShip) {
+    const id = mapXYToBlockLocal(mapXY, shipPose)?.blockId || fallbackBlockId;
+    return id ? `${id} 위` : null;
+  }
+
+  const side = rel.beam >= 0 ? "왼편" : "오른편";
   if (rel.forward > halfLength) return `${BOW_BLOCK_ID} 앞쪽 ${side}`;
   if (rel.forward < -halfLength) return `${STERN_BLOCK_ID} 뒤쪽 ${side}`;
 
@@ -1179,9 +1218,15 @@ class SceneManager {
         // 있지만, UGV가 저속으로 움직이는 데모 수준에서는 충분히 자연스럽다.
         this.ugv.rotation.y += (tgt.yaw - this.ugv.rotation.y) * lerpSpeed;
       }
-    } else {
-      // 아직 진짜 좌표가 한 번도 안 왔을 때만 장식용 자동 순찰 애니메이션 사용
-      // (서버 연결 전/테스트 중에도 화면이 심심하지 않도록 하는 임시 표시)
+    } else if (!USE_REAL_BACKEND) {
+      // ★ 가짜 순찰 애니메이션은 **mock 모드에서만** 돈다 (2026-08-29).
+      //   예전에는 "진짜 좌표를 아직 못 받았으면" 이 조건이라, 서버가 끊긴
+      //   상태로 새로고침하면 로봇이 제멋대로 사각형을 그리며 돌았다.
+      //   관제 화면에서 그것은 거짓 정보다 —— 실제 로봇은 그 자리에 서 있는데
+      //   화면만 순찰하는 것처럼 보인다.
+      //
+      //   진짜 연동 중에는 좌표가 없으면 **아무것도 하지 않는다.** 마지막으로
+      //   받은 위치에 그대로 서 있고, 한 번도 못 받았으면 처음 자리에 있는다.
       this.ugvT = (this.ugvT ?? 0) + dt * 0.12;
       const sweep = Math.sin(this.ugvT); // -1~1
       const z = sweep * (SHIP_LEN / 2);
@@ -1427,6 +1472,23 @@ function LivePanel({ ugvBlock, warnEvent, onExpand }) {
   );
 }
 
+/* 연결 알림 카드 하나. 로봇용/서버용이 같은 모양을 쓴다.
+ * 배경 클릭으로는 닫히지 않는다 — 관제사가 못 보고 지나치면 안 되는 내용이라
+ * "확인" 을 명시적으로 누르게 한다. */
+function ConnNotice({ tone, title, lines, btnLabel, onConfirm }) {
+  return (
+    <div className={`conn-notice ${tone}`}>
+      <div className="conn-notice-title">{title}</div>
+      {lines.map((t, i) => (
+        <p key={i} className={i === 0 ? "conn-notice-body" : "conn-notice-sub"}>{t}</p>
+      ))}
+      <button type="button" className="conn-notice-btn" onClick={onConfirm} autoFocus>
+        {btnLabel}
+      </button>
+    </div>
+  );
+}
+
 /* 확대 팝업 — 위험(빨강) 자동 송출 + 클릭 시 표시 공용.
  * ESC 키로도 닫을 수 있게 한다 (X 버튼 클릭 없이 키보드로 종료). */
 function CctvPopup({ block, event, group, auto, onClose, onAck, onClearPing }) {
@@ -1549,8 +1611,16 @@ export default function ShipyardTwinDashboard() {
   // 3D 씬을 못 띄운 이유. null 이면 정상.
   // ★ 이게 있어야 WebGL 실패가 대시보드 전체를 무너뜨리지 않는다 (아래 참고).
   const [sceneError, setSceneError] = useState(null);
-  // 로봇 연결 알림 팝업. null 이면 안 떠 있음. true=재연결됨 / false=끊김.
+  // 연결 알림 팝업. 로봇과 서버를 **각각 따로** 들고 있는다 (null = 안 떠 있음).
+  //
+  // ★ 왜 슬롯을 나누나 (2026-08-29)
+  //   둘은 다른 사건이고 동시에 일어날 수 있다. 로봇이 먼저 끊기고 이어서
+  //   서버도 끊기면, 로봇 팝업을 밀어내지 않고 **나란히** 띄워야 관제사가
+  //   무엇이 무엇 때문인지 안다. 슬롯 안에서는 최신 상태가 이긴다 —
+  //   확인을 안 눌렀어도 상태가 바뀌면 그 슬롯의 내용만 바뀐다.
   const [robotNotice, setRobotNotice] = useState(null);
+  const [serverNotice, setServerNotice] = useState(null);
+  const serverConnectedRef = useRef(null);
   // 상단 배지에 항상 표시할 현재 로봇 연결 상태.
   // null = 아직 서버로부터 상태를 못 받음. robotConnectedRef 는 "직전 값"이라
   // 리렌더를 일으키지 않으므로, 화면에 그릴 값은 state 로 따로 둔다.
@@ -1674,6 +1744,30 @@ export default function ShipyardTwinDashboard() {
     setActiveGroup(one ? [one] : []);
     if (sceneRef.current) sceneRef.current.highlightBlock(blockId);
   }, []);
+
+  // 서버 연결이 끊기거나 돌아오면 알린다.
+  //
+  // ★ 서버가 끊기면 로봇 상태를 "모름"으로 되돌린다.
+  //   로봇 상태는 서버가 알려주는 것이라, 서버가 끊긴 뒤의 "로봇 연결됨" 은
+  //   지난 정보다. 확인할 길이 없는 것을 확인된 것처럼 두면 안 된다.
+  //   (상태만 바꾼다 — 로봇 팝업은 jetson_status 를 받을 때만 뜬다)
+  useEffect(() => {
+    const prev = serverConnectedRef.current;
+    serverConnectedRef.current = connected;
+
+    if (!connected) {
+      robotConnectedRef.current = null;
+      setRobotConnected(null);
+    }
+
+    // 첫 평가는 "변화"가 아니다. 다만 처음부터 끊겨 있으면 알려준다
+    // (로봇 알림과 같은 규칙 — 화면이 멀쩡해 보여서 모르고 지나치기 쉬우므로).
+    if (prev === null) {
+      if (!connected) setServerNotice(false);
+      return;
+    }
+    if (prev !== connected) setServerNotice(connected);
+  }, [connected]);
 
   // 씬 초기화
   //
@@ -1903,6 +1997,24 @@ export default function ShipyardTwinDashboard() {
         // 구획에 눌러 붙이면 "화재가 배에서 떨어져 있는데 배 위에 핑이 찍힌다"가 된다.
         const conv = mapXYToPingWorld(data.map_xy ?? null, shipPoseRef.current);
         const blockId = conv?.blockId ?? shipPoseRef.current?.block_id ?? BLOCKS[0].id;
+
+        // 🚫 배에서 너무 먼 검출은 버린다 (MAX_EVENT_DIST_FROM_SHIP_M 참고).
+        //   조용히 버리지 않고 반드시 콘솔에 남긴다 — 진짜 이벤트가 사라졌을 때
+        //   "왜 안 뜨지" 를 여기서 바로 확인할 수 있어야 한다.
+        {
+          const r = mapXYToShipLocalMeters(data.map_xy ?? null, shipPoseRef.current);
+          if (r) {
+            const dist = Math.hypot(r.forward, r.beam);
+            if (dist > MAX_EVENT_DIST_FROM_SHIP_M) {
+              console.warn(
+                `[이벤트 걸러냄] ${type} 이 배에서 ${dist.toFixed(2)}m 떨어져 있어 무시함 ` +
+                `(한계 ${MAX_EVENT_DIST_FROM_SHIP_M}m). 카메라는 순찰 원 안쪽을 보므로 ` +
+                `이 거리는 오검출일 가능성이 높다.`, data
+              );
+              return;
+            }
+          }
+        }
 
         // 📏 핑 위치 보정용 로그. 불을 배 정중앙에 놓고 이 줄의 "원본" 값을 읽어
         //   PING_OFFSET_* 상수에 부호를 뒤집어 넣으면 된다 (상수 설명 참고).
@@ -2140,44 +2252,51 @@ export default function ShipyardTwinDashboard() {
         </aside>
       </div>
 
-      {robotNotice !== null && (
-        <div
-          className="robot-notice-backdrop"
-          onClick={() => { if (robotNotice) window.location.reload(); else setRobotNotice(null); }}
-        >
-          <div
-            className={`robot-notice ${robotNotice ? "ok" : "lost"}`}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="robot-notice-title">
-              {robotNotice ? "🤖 로봇과 재연결되었습니다" : "⚠️ 로봇과의 연결이 끊겼습니다"}
-            </div>
-            <p className="robot-notice-body">
-              {robotNotice
-                ? "실시간 순찰 정보 관제를 재개합니다."
-                : "로봇과 재연결될 때까지 실시간 순찰 정보 관제가 제한됩니다."}
-            </p>
-            <p className="robot-notice-sub">
-              {robotNotice
-                ? "확인을 누르면 화면을 새로 불러와 로봇의 최신 정보를 반영합니다."
-                : "이미 감지된 위험 핑은 화면에 그대로 남아 있습니다."}
-            </p>
-            <button
-              type="button"
-              className="robot-notice-btn"
-              onClick={() => {
-                // 재연결이면 확인과 동시에 새로고침한다. 확인만 누르고 최신
-                // 정보를 보려고 또 새로고침하는 수고를 없앤다. 새로고침 뒤 첫
-                // jetson_status 는 "연결됨" 이라 팝업이 다시 뜨지 않는다
-                // (수신 처리의 첫 수신 규칙) — 무한 반복이 생기지 않는다.
+      {(robotNotice !== null || serverNotice !== null) && (
+        <div className="notice-backdrop">
+          {/* 로봇과 서버를 나란히. 로봇을 먼저 둔다 — 원인이 로봇 쪽일 때
+              그것이 먼저 눈에 들어와야 한다. */}
+          {robotNotice !== null && (
+            <ConnNotice
+              tone={robotNotice ? "ok" : "lost"}
+              title={robotNotice ? "🤖 로봇과 재연결되었습니다" : "⚠️ 로봇과의 연결이 끊겼습니다"}
+              lines={robotNotice
+                ? ["실시간 순찰 정보 관제를 재개합니다.",
+                   "확인을 누르면 화면을 새로 불러와 로봇의 최신 정보를 반영합니다."]
+                : ["로봇과 재연결될 때까지 실시간 순찰 정보 관제가 제한됩니다.",
+                   "이미 감지된 핑과 로봇의 마지막 위치는 화면에 그대로 남아 있습니다."]}
+              btnLabel={robotNotice ? "확인 — 최신 정보 불러오기" : "확인"}
+              onConfirm={() => {
                 if (robotNotice) window.location.reload();
                 else setRobotNotice(null);
               }}
-              autoFocus
-            >
-              {robotNotice ? "확인 — 최신 정보 불러오기" : "확인"}
-            </button>
-          </div>
+            />
+          )}
+          {serverNotice !== null && (
+            <ConnNotice
+              tone={serverNotice ? (robotConnected ? "ok" : "warn") : "lost"}
+              title={serverNotice ? "🖥️ 서버와 재연결되었습니다" : "⚠️ 서버와의 연결이 끊겼습니다"}
+              lines={
+                serverNotice
+                  ? (robotConnected
+                      // 서버도 로봇도 붙었다 — 완전히 정상으로 돌아온 경우
+                      ? ["실시간 순찰 정보 관제를 재개합니다.",
+                         "확인을 누르면 화면을 새로 불러와 로봇의 최신 정보를 반영합니다."]
+                      // 서버만 붙었다 — 아직 관제가 안 된다는 것을 분명히 말한다
+                      : ["다만 로봇이 아직 연결되지 않았습니다.",
+                         "로봇이 연결된 후에 실시간 순찰 정보 관제가 가능합니다."])
+                  : ["서버와 재연결될 때까지 실시간 순찰 정보 관제가 제한됩니다.",
+                     "이미 감지된 핑과 로봇의 마지막 위치는 화면에 그대로 남아 있습니다."]
+              }
+              btnLabel={serverNotice && robotConnected ? "확인 — 최신 정보 불러오기" : "확인"}
+              onConfirm={() => {
+                // 로봇까지 붙어 있을 때만 새로고침한다. 서버만 붙은 상태에서
+                // 새로 불러와봐야 가져올 최신 정보가 없다.
+                if (serverNotice && robotConnected) window.location.reload();
+                else setServerNotice(null);
+              }}
+            />
+          )}
         </div>
       )}
 
@@ -2354,23 +2473,27 @@ const CSS = `
 .stage-fallback-how { font-size:12px; color:#5f6b80; }
 .stage-fallback code { color:#2dd4bf; font-family:monospace; }
 
-/* 로봇 연결 알림. CCTV 팝업(z-index 기본)보다 위에 떠서 먼저 눈에 들어오게 한다. */
-.robot-notice-backdrop { position:fixed; inset:0; background:rgba(4,7,12,.72);
-  display:flex; align-items:center; justify-content:center; z-index:60; }
-.robot-notice { width:min(420px, 90vw); background:#0e1420; border:1px solid #1e2a3f;
+/* 연결 알림. CCTV 팝업보다 위에 떠서 먼저 눈에 들어오게 한다.
+   로봇/서버가 동시에 끊기면 두 장이 나란히 뜬다(좁은 화면에서는 세로로 쌓임). */
+.notice-backdrop { position:fixed; inset:0; background:rgba(4,7,12,.72);
+  display:flex; align-items:center; justify-content:center; gap:14px;
+  flex-wrap:wrap; padding:20px; z-index:60; }
+.conn-notice { width:min(380px, 90vw); background:#0e1420; border:1px solid #1e2a3f;
   border-radius:12px; padding:22px 24px; text-align:center;
   box-shadow:0 18px 50px rgba(0,0,0,.55); }
-.robot-notice.lost { border-color:#ffb020; }
-.robot-notice.ok { border-color:#36d399; }
-.robot-notice-title { font-size:16px; font-weight:700; margin-bottom:10px; }
-.robot-notice.lost .robot-notice-title { color:#ffb020; }
-.robot-notice.ok .robot-notice-title { color:#36d399; }
-.robot-notice-body { margin:0; font-size:13px; color:#e6edf6; line-height:1.6; }
-.robot-notice-sub { margin:8px 0 0; font-size:12px; color:#7d8aa3; line-height:1.5; }
-.robot-notice-btn { margin-top:16px; width:100%; padding:10px 0; cursor:pointer;
+.conn-notice.lost { border-color:#ffb020; }
+.conn-notice.warn { border-color:#ffb020; }
+.conn-notice.ok { border-color:#36d399; }
+.conn-notice-title { font-size:16px; font-weight:700; margin-bottom:10px; }
+.conn-notice.lost .conn-notice-title,
+.conn-notice.warn .conn-notice-title { color:#ffb020; }
+.conn-notice.ok .conn-notice-title { color:#36d399; }
+.conn-notice-body { margin:0; font-size:13px; color:#e6edf6; line-height:1.6; }
+.conn-notice-sub { margin:8px 0 0; font-size:12px; color:#7d8aa3; line-height:1.5; }
+.conn-notice-btn { margin-top:16px; width:100%; padding:10px 0; cursor:pointer;
   background:#16202f; color:#e6edf6; border:1px solid #2a3a52; border-radius:8px;
   font-size:13px; font-weight:600; }
-.robot-notice-btn:hover { background:#1c283a; }
+.conn-notice-btn:hover { background:#1c283a; }
 
 /* 감지 순간 스냅샷. 젯슨이 보낸 crop 이라 가로세로가 제각각이므로
    높이만 묶어두고 비율은 유지한다(object-fit:contain). */
