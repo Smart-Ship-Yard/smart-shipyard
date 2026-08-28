@@ -388,6 +388,19 @@ class ChangePointDetector(Node):
 
         self.pub = self.create_publisher(
             String, self.get_parameter('output_topic').value, 10)
+
+        # ★ 지금 살아있는 이벤트 목록 (2026-08-29).
+        #   /map_point 는 **새 이벤트만** 나가므로, 재시작으로 복원한 것은
+        #   아무도 모른다. 실제로 젯슨이 4건을 기억하는데 서버에는 1건만
+        #   재통보됐다 — 나머지 3건은 "다시 안 멈추는 자리" 인데 대시보드에
+        #   없어서 대조조차 못 한다.
+        #   latch 로 내보내 websocket_client 가 재연결 때 그대로 알리게 한다.
+        #   event_gate 는 이 토픽을 보지 않으므로 로봇 정지에는 영향이 없다.
+        self.active_pub = self.create_publisher(
+            String, '/event_detection/active',
+            QoSProfile(depth=1,
+                       durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=QoSReliabilityPolicy.RELIABLE))
         self.clear_pub = self.create_publisher(
             String, self.get_parameter('clear_topic').value, 10)
         clear_hz = max(0.1, self.get_parameter('clear_check_hz').value)
@@ -400,6 +413,9 @@ class ChangePointDetector(Node):
         )
         self.get_logger().info(f"이벤트 기억 파일: {self.state_file} "
                                "(깨끗이 시작하려면 이 파일을 지울 것)")
+        # 복원한 목록도 바로 알린다 — 이게 없으면 websocket_client 가
+        # 이번 세션에 새로 본 것만 알아 재통보가 빠진다.
+        self._publish_active()
 
     # ------------------------------------------------------------------
     #  ★ 이벤트 기억을 재시작 너머로 잇는다 (2026-08-27).
@@ -477,6 +493,21 @@ class ChangePointDetector(Node):
         if dropped:
             self.get_logger().info(f"오래되거나 깨진 항목 {dropped}건은 버렸다")
 
+    def _publish_active(self):
+        """살아있는 이벤트 목록을 latch 로 알린다 (위 active_pub 주석 참고)."""
+        try:
+            out = [{
+                'class_id': e['class_id'],
+                'event_id': e['event_id'],
+                'map_x': e['x'], 'map_y': e['y'],
+                'confidence': e.get('confidence', 0.0),
+            } for e in self.reported_events]
+            m = String()
+            m.data = json.dumps(out)
+            self.active_pub.publish(m)
+        except Exception as e:
+            self.get_logger().warn(f"활성 목록 발행 실패(무시): {e}")
+
     def _save_state(self):
         """목록이 바뀔 때마다 저장. 이벤트는 드물어서 비용은 무시할 만하다."""
         try:
@@ -487,6 +518,7 @@ class ChangePointDetector(Node):
                 'seen_from': list(e['seen_from']), 'seen_yaw': e['seen_yaw'],
                 'left_vantage': e['left_vantage'], 'arrived_at': e['arrived_at'],
                 'fov_seen': e.get('fov_seen', 0.0),
+                'confidence': e.get('confidence', 0.0),
                 'max_departure': e.get('max_departure', 0.0),
             } for e in self.reported_events]
             os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
@@ -535,6 +567,7 @@ class ChangePointDetector(Node):
         self.reported_events = []
         self._pending = []
         self._save_state()
+        self._publish_active()
         self.get_logger().warn(
             f"🧹 이벤트 기억 초기화 — {n}건 지움" + (f": {ids}" if ids else ""))
         self.get_logger().warn(
@@ -664,6 +697,7 @@ class ChangePointDetector(Node):
         if len(survivors) != len(self.reported_events):
             self.reported_events = survivors
             self._save_state()
+            self._publish_active()
         else:
             self.reported_events = survivors
 
@@ -837,6 +871,7 @@ class ChangePointDetector(Node):
             'event_id': event_id,
             'x': map_x,
             'y': map_y,
+            'confidence': confidence,
             'last_seen': now,
             'seen_from': (robot_x, robot_y),   # 이 불을 처음 본 로봇 위치
             'seen_yaw': robot_yaw,             # 그때 로봇이 보던 방향
@@ -867,6 +902,7 @@ class ChangePointDetector(Node):
             f"event_id={event_id}"
         )
         self._save_state()
+        self._publish_active()
 
     # ------------------------------------------------------------------
     def _estimate_position_uncertainty(self) -> float:

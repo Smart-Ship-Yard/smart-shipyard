@@ -211,6 +211,16 @@ class WebSocketClient(Node):
         self.create_subscription(
             String, self.get_parameter('snapshot_topic').value,
             self._snapshot_cb, 10)
+
+        # ★ change_point 의 살아있는 이벤트 목록 (2026-08-29).
+        #   /map_point 는 새 이벤트만 나가므로, 재시작으로 복원된 것은
+        #   여기서 알 길이 없었다. 실제로 젯슨이 4건을 기억하는데 서버에는
+        #   1건만 재통보됐다. latch 로 받아 거울을 통째로 맞춘다.
+        self.create_subscription(
+            String, '/event_detection/active', self._active_list_cb,
+            QoSProfile(depth=1,
+                       durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=QoSReliabilityPolicy.RELIABLE))
         self.create_subscription(Odometry, ekf_topic, self._ekf_cb, 10)
         # ★ ship_pose는 ship_survey_node가 측량 끝날 때 딱 1번만 발행하고, 그 시점은
         #   매핑 랩 도중이라 이 노드보다 먼저 끝나 있을 수 있다. 기본 QoS(VOLATILE)로
@@ -310,6 +320,37 @@ class WebSocketClient(Node):
         self.get_logger().info(
             f"[스냅샷 큐] {d.get('class_id')} event_id={d.get('event_id')} "
             f"{len(d['image_b64'])/1024:.0f} KB")
+
+    def _active_list_cb(self, msg: String):
+        """change_point 가 알려준 살아있는 목록으로 거울을 맞춘다.
+
+        여기가 진실이다 — change_point 가 재시작으로 복원한 것까지 포함한다.
+        거울을 통째로 교체하므로 치워진 것이 남아 되살아나는 일도 없다.
+        """
+        try:
+            items = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        mirror = {}
+        for it in items:
+            eid = it.get('event_id')
+            etype = DANGER_CLASS_MAP.get(str(it.get('class_id', '')))
+            if not eid or etype is None:
+                continue      # level* 등 위험 이벤트가 아닌 것은 제외
+            mirror[eid] = {
+                'event_type': etype,
+                'confidence': float(it.get('confidence', 0.0)),
+                'map_xy': [float(it.get('map_x', 0.0)),
+                           float(it.get('map_y', 0.0))],
+                'event_id': eid,
+                'ekf_global': self._get_ekf_state()[0],
+            }
+        with self._active_lock:
+            before = len(self._active_events)
+            self._active_events = mirror
+        if before != len(mirror):
+            self.get_logger().info(
+                f"[활성목록] change_point 기준으로 맞춤: {before} -> {len(mirror)}건")
 
     def _reset_if_asked(self, data):
         """프론트 [초기화] 버튼이 서버를 거쳐 오면 거울도 비운다.
