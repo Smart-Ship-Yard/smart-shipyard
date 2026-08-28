@@ -24,6 +24,28 @@ const USE_REAL_BACKEND = true;   // false로 두면 예전처럼 2.2초마다 �
 const USE_REAL_VIDEO = true;     // false로 두면 예전처럼 Canvas 가짜 CCTV
 const SERVER_HOST = "192.168.0.5:8000"; // ← 백엔드 서버 IP:포트로 교체 (예: 192.168.0.42:8000)
 const EVENT_WS_URL = `ws://${SERVER_HOST}/ws/frontend`;
+
+/* 접근 토큰. 서버가 암호를 걸었을 때만 쓴다.
+ *
+ * ★ 서버가 암호를 안 걸었으면 이 값은 계속 빈 문자열이고, 로그인 화면도 안 뜬다.
+ *   즉 지금까지와 똑같이 동작한다 — 팀원이 각자 노트북에서 받아 그대로 실행할
+ *   수 있어야 하기 때문이다.
+ *
+ * sessionStorage 에 둔다: 탭을 닫으면 사라지고 다른 탭과 섞이지 않는다.
+ * 관제 화면을 켜둔 채 자리를 비웠을 때 위험이 오래 남지 않게 하려는 것이다. */
+const TOKEN_KEY = "shipyard_token";
+function getToken() {
+  try { return sessionStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
+}
+function setToken(t) {
+  try { if (t) sessionStorage.setItem(TOKEN_KEY, t); else sessionStorage.removeItem(TOKEN_KEY); } catch { /* 무시 */ }
+}
+/* 토큰이 있으면 주소에 붙인다. 없으면 원래 주소 그대로. */
+function withToken(url) {
+  const t = getToken();
+  if (!t) return url;
+  return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(t);
+}
 // 감지 순간 사진. 서버가 backend/snapshots/ 에 저장해두고 "/snapshots/<해시>.jpg"
 // 같은 경로만 알려주므로, 앞에 서버 주소를 붙여 완전한 URL 로 만든다.
 // (SERVER_HOST 하나만 바꾸면 영상·이벤트·사진이 함께 따라오게 하려는 것)
@@ -1545,6 +1567,57 @@ function ConnNotice({ tone, title, lines, btnLabel, onConfirm }) {
   );
 }
 
+/* 로그인 화면 — 서버가 암호를 걸었을 때만 뜬다.
+ *
+ * 계정이 아니라 팀이 공유하는 암호 하나다. 지금 막으려는 것은 "같은 망의 아무나
+ * 관제 화면에 들어오는 것" 이고, 그 목적에는 이걸로 충분하다. */
+function LoginGate({ onDone }) {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true); setErr(null);
+    try {
+      const r = await fetch(`http://${SERVER_HOST}/api/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: pw }),
+      });
+      if (r.status === 401) { setErr("암호가 맞지 않습니다."); setBusy(false); return; }
+      if (!r.ok) { setErr(`서버 오류 (${r.status})`); setBusy(false); return; }
+      const d = await r.json();
+      setToken(d.token || "");
+      onDone();
+    } catch (e2) {
+      setErr(`서버에 연결하지 못했습니다 — ${e2}`);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="login-wrap">
+      <form className="login" onSubmit={submit}>
+        <div className="login-title">SMART SHIPYARD TWIN</div>
+        <div className="login-sub">관제 화면에 들어가려면 암호가 필요합니다</div>
+        <input
+          className="login-input"
+          type="password"
+          value={pw}
+          onChange={(e) => setPw(e.target.value)}
+          placeholder="접근 암호"
+          autoFocus
+        />
+        {err && <div className="login-err">{err}</div>}
+        <button className="login-btn" type="submit" disabled={busy || !pw}>
+          {busy ? "확인 중…" : "들어가기"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
 /* 지난 기록 조회 — 날짜를 골라 그날의 위험 이벤트와 감지 순간 사진을 본다.
  *
  * 실시간 관제와 목적이 다르다. 여기는 "그때 무슨 일이 있었나" 를 되짚는 화면이라
@@ -1561,7 +1634,7 @@ function HistoryPanel({ onClose }) {
   const [zoom, setZoom] = useState(null);   // 사진 크게 보기
 
   useEffect(() => {
-    fetch(`http://${SERVER_HOST}/api/event-days`)
+    fetch(withToken(`http://${SERVER_HOST}/api/event-days`))
       .then((r) => r.json())
       .then((d) => {
         const list = d.days || [];
@@ -1575,7 +1648,7 @@ function HistoryPanel({ onClose }) {
   useEffect(() => {
     if (!date) return;
     setLoading(true); setError(null);
-    fetch(`http://${SERVER_HOST}/api/events?date=${date}`)
+    fetch(withToken(`http://${SERVER_HOST}/api/events?date=${date}`))
       .then((r) => r.json())
       .then((d) => { setEvents(d.events || []); setLoading(false); })
       .catch((e) => { setError(String(e)); setLoading(false); });
@@ -1772,7 +1845,33 @@ function CctvPopup({ block, event, group, auto, onClose, onAck, onClearPing }) {
 /* ---------------------------------------------------------------------------
  * 5. 메인 대시보드
  * ------------------------------------------------------------------------- */
+/* 서버가 암호를 걸었는지 확인하고, 필요하면 로그인 화면을 먼저 보여준다.
+ *
+ * ★ 서버가 암호를 안 걸었으면 이 관문은 아무것도 하지 않는다 —— 곧바로 대시보드가
+ *   뜬다. 팀원 노트북에서 받아 그대로 실행할 수 있어야 하기 때문이다.
+ * ★ 서버에 못 붙어도 통과시킨다. 그래야 서버가 꺼져 있을 때도 대시보드가 뜨고,
+ *   "서버와의 연결이 끊겼습니다" 팝업으로 상황을 알려줄 수 있다. 여기서 막으면
+ *   빈 화면만 남아 무슨 일인지 알 수 없다. */
 export default function ShipyardTwinDashboard() {
+  const [gate, setGate] = useState("checking");   // checking | login | open
+
+  const check = useCallback(() => {
+    fetch(`http://${SERVER_HOST}/api/auth-required`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (!d.auth_required) { setToken(""); setGate("open"); return; }
+        setGate(getToken() ? "open" : "login");
+      })
+      .catch(() => setGate("open"));   // 서버가 안 뜨면 화면은 띄운다
+  }, []);
+  useEffect(() => { check(); }, [check]);
+
+  if (gate === "checking") return <div className="login-wrap"><div className="login-sub">확인 중…</div></div>;
+  if (gate === "login") return <LoginGate onDone={() => setGate("open")} />;
+  return <DashboardInner />;
+}
+
+function DashboardInner() {
   const canvasRef = useRef(null);
   // 3D 씬을 못 띄운 이유. null 이면 정상.
   // ★ 이게 있어야 WebGL 실패가 대시보드 전체를 무너뜨리지 않는다 (아래 참고).
@@ -1866,7 +1965,7 @@ export default function ShipyardTwinDashboard() {
   const fetchInitData = useCallback(() => {
     if (!USE_REAL_BACKEND) return;
     const initDataUrl = `http://${SERVER_HOST}/api/init-data`;
-    fetch(initDataUrl)
+    fetch(withToken(initDataUrl))
       .then((res) => res.json())
       .then((data) => {
         const blocks = Array.isArray(data?.blocks) ? data.blocks : [];
@@ -2049,7 +2148,7 @@ export default function ShipyardTwinDashboard() {
 
     // === 진짜 백엔드 모드 ===
     console.log(`[이벤트 채널] 연결 시도: ${EVENT_WS_URL}`);
-    const off = connectRealEventSource(EVENT_WS_URL, {
+    const off = connectRealEventSource(withToken(EVENT_WS_URL), {
       onOpen: () => {
         console.log("[이벤트 채널] 연결 성공");
         setConnected(true);
@@ -2612,6 +2711,20 @@ const CSS = `
 .conn-dot { width:7px; height:7px; border-radius:50%; background:#ff3b47; }
 .conn.on .conn-dot { background:#36d399; box-shadow:0 0 8px #36d399; animation:blink 2s infinite; }
 .clock-badge { font-size:12px; color:#7d8aa3; font-variant-numeric:tabular-nums; }
+.login-wrap { position:fixed; inset:0; background:#0a0e17; display:flex;
+  align-items:center; justify-content:center; padding:24px; }
+.login { width:min(360px, 92vw); background:#0e1420; border:1px solid #1e2a3f;
+  border-radius:12px; padding:28px 26px; text-align:center; }
+.login-title { font-size:15px; font-weight:800; letter-spacing:1px; color:#e6edf6; }
+.login-sub { margin-top:8px; font-size:12px; color:#7d8aa3; line-height:1.6; }
+.login-input { margin-top:18px; width:100%; padding:10px 12px; font-size:14px;
+  background:#0c1118; color:#e6edf6; border:1px solid #2a3a52; border-radius:8px; }
+.login-err { margin-top:10px; font-size:12px; color:#ff3b47; }
+.login-btn { margin-top:14px; width:100%; padding:10px 0; font-size:13px; font-weight:600;
+  cursor:pointer; background:#16202f; color:#e6edf6; border:1px solid #2a3a52; border-radius:8px; }
+.login-btn:disabled { opacity:.5; cursor:default; }
+.login-btn:hover:not(:disabled) { background:#1c283a; }
+
 .hist-open-btn { font-size:12px; padding:5px 11px; cursor:pointer; border-radius:20px;
   background:#16202f; color:#aebbd2; border:1px solid #1e2a3f; }
 .hist-open-btn:hover { background:#1c283a; color:#e6edf6; }

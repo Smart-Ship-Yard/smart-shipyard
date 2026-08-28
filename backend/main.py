@@ -49,6 +49,7 @@ import asyncio
 # 파일 이름은 event_id 를 해시해서 만든다 (아래 [이벤트 스냅샷 구역] 참조).
 import base64
 import hashlib
+import secrets
 import json
 import os
 # python-dotenv 패키지: .env 파일에 적힌 키=값 쌍을 읽어서
@@ -56,7 +57,7 @@ import os
 from dotenv import load_dotenv
 
 # FastAPI 핵심 클래스와, 웹소켓 연결 객체 / 연결 끊김 예외를 가져옴
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 # 다른 도메인(프론트엔드)에서의 API 요청을 허용해주는 미들웨어
 from fastapi.middleware.cors import CORSMiddleware
@@ -249,6 +250,84 @@ SNAPSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapsho
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 app.mount("/snapshots", StaticFiles(directory=SNAPSHOT_DIR), name="snapshots")
+
+
+# =========================================================
+# [접근 암호 구역]
+# 관제 화면과 영상에 아무나 들어오지 못하게 막는다.
+# =========================================================
+#
+# ★ 안 걸면 지금과 똑같이 동작한다 (2026-08-29).
+#   .env 에 DASHBOARD_PASSWORD 가 없으면 인증을 아예 하지 않는다. 팀원이
+#   각자 노트북에서 받아 그대로 실행할 수 있어야 하고, 시연 직전에 암호 때문에
+#   화면이 안 뜨는 상황을 만들면 안 되기 때문이다.
+#   현장 적용 전에는 반드시 설정한다.
+#
+# ★ 계정이 아니라 공유 암호 하나다.
+#   누가 봤는지까지 남기려면 계정이 필요하지만, 지금 필요한 것은 "같은 망의
+#   아무나 들어오는 것" 을 막는 것이다. 그 목적에는 이걸로 충분하고,
+#   나중에 계정으로 넓힐 때도 이 통로(토큰 검사)를 그대로 쓴다.
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
+AUTH_ENABLED = bool(DASHBOARD_PASSWORD)
+
+# 발급한 토큰들. 프로세스 메모리에만 둔다 — 서버를 다시 켜면 다시 로그인해야
+# 한다. 시연 규모에서는 그게 오히려 안전하고, 저장소가 따로 필요 없다.
+_valid_tokens: set = set()
+
+
+def issue_token() -> str:
+    """추측할 수 없는 토큰을 하나 만들어 기억한다."""
+    t = secrets.token_urlsafe(32)
+    _valid_tokens.add(t)
+    return t
+
+
+def token_ok(token: Optional[str]) -> bool:
+    """암호를 안 걸었으면 항상 통과. 걸었으면 발급한 토큰만 통과."""
+    if not AUTH_ENABLED:
+        return True
+    return bool(token) and token in _valid_tokens
+
+
+@app.post("/api/login")
+async def login(body: dict):
+    """공유 암호를 확인하고 토큰을 준다.
+
+    ★ 암호 비교에 secrets.compare_digest 를 쓴다.
+      == 는 앞에서부터 비교하다 다르면 즉시 멈춰서, 응답 시간 차이로 암호를
+      한 글자씩 알아낼 수 있다(타이밍 공격). 같은 시간이 걸리게 비교한다.
+    """
+    if not AUTH_ENABLED:
+        return {"ok": True, "token": "", "auth_required": False}
+    given = str((body or {}).get("password", ""))
+    # ★ 반드시 바이트로 비교한다.
+    #   compare_digest 는 비ASCII 문자열을 받으면 TypeError 를 낸다. 문자열끼리
+    #   비교하면 한글 암호나 한글이 섞인 오타 입력에서 500 이 나간다(실측).
+    #   utf-8 로 인코딩하면 어떤 글자든 안전하고, 같은 시간 비교도 그대로 유지된다.
+    if not secrets.compare_digest(given.encode("utf-8"),
+                                  DASHBOARD_PASSWORD.encode("utf-8")):
+        print("🔒 [로그인] 암호 불일치")
+        raise HTTPException(status_code=401, detail="암호가 맞지 않습니다")
+    print("🔓 [로그인] 성공 — 토큰 발급")
+    return {"ok": True, "token": issue_token(), "auth_required": True}
+
+
+@app.get("/api/auth-required")
+async def auth_required():
+    """프론트가 로그인 화면을 띄울지 판단하는 용도."""
+    return {"auth_required": AUTH_ENABLED}
+
+
+@app.get("/api/mediamtx-auth")
+async def mediamtx_auth():
+    """mediamtx 인증 위임용. 지금은 자리만 잡아둔다.
+
+    mediamtx 의 authMethod: http + authHTTPAddress 가 이 주소로 물어보게 하면
+    영상까지 같은 암호로 묶인다. 다만 **브라우저가 mediamtx 에 직접 붙으므로**
+    토큰을 어떻게 실어 보낼지(쿼리스트링/쿠키)를 함께 정해야 한다.
+    그 설계가 끝나기 전에는 켜지 않는다 — server/streaming/README.md 참조.
+    """
+    return {"auth_required": AUTH_ENABLED, "wired": False}
 
 # =========================================================
 # [데이터베이스 셋업 구역]
@@ -753,13 +832,14 @@ jetson_connection: Optional[WebSocket] = None
 # =========================================================
 
 @app.get("/api/init-data")
-async def get_init_data():
+async def get_init_data(token: Optional[str] = None):
     """프론트엔드 대시보드가 처음 켜질 때 필요한 3D 맵 기본 정보를 준다.
 
     각 블록에는 현재 조립 단계(level)를 함께 담아준다.
     block_level 이벤트는 단계가 '바뀔 때만' 오기 때문에, 변화 이후에
     새로 열린 대시보드는 그 메시지를 놓친다 → 최신 상태는 이 REST로 복원.
     """
+    require_token(token)
     # 하드코딩된 블록 목록. 추후 DB나 설정 파일에서 읽도록 확장 예정.
     #
     # x, y 는 ship_pose 기록이 아직 없을 때만 쓰이는 자리표시값이다. 아래에서
@@ -811,8 +891,14 @@ async def get_init_data():
     }
 
 
+def require_token(token: Optional[str]):
+    """조회 API 공용 — 암호를 걸었으면 토큰 없이는 못 본다."""
+    if not token_ok(token):
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다")
+
+
 @app.get("/api/event-days")
-async def get_event_days():
+async def get_event_days(token: Optional[str] = None):
     """이벤트가 하루라도 있었던 날짜 목록 (최신순).
 
     프론트의 날짜 선택기가 "고를 수 있는 날" 만 보여주게 하기 위한 것이다.
@@ -821,6 +907,7 @@ async def get_event_days():
     timestamp 는 "2026-08-29T05:12:33+09:00" 같은 KST ISO 문자열이라
     앞 10글자가 곧 날짜다. 파싱 없이 자를 수 있다.
     """
+    require_token(token)
     try:
         days = await event_collection.aggregate([
             {"$match": {"event_type": {"$in": list(DANGER_TYPES)},
@@ -837,7 +924,8 @@ async def get_event_days():
 
 
 @app.get("/api/events")
-async def get_events(date: Optional[str] = None, limit: int = 200):
+async def get_events(date: Optional[str] = None, limit: int = 200,
+                     token: Optional[str] = None):
     """하루치 위험 이벤트를 시간순으로. 사진 URL 도 함께 준다.
 
     date 는 "YYYY-MM-DD" (KST 기준). 없으면 오늘.
@@ -846,6 +934,7 @@ async def get_events(date: Optional[str] = None, limit: int = 200):
       같은 것은 잡음이다. event_cleared 는 "언제 치워졌나" 를 붙이는 데 쓰려고
       함께 읽되, 목록에는 위험 이벤트만 남긴다.
     """
+    require_token(token)
     day = date or datetime.now(KST).date().isoformat()
     try:
         docs = await event_collection.find({
@@ -906,6 +995,15 @@ async def websocket_frontend(websocket: WebSocket):
     global jetson_connection
 
     # ConnectionManager에 등록 (accept + 목록 추가가 여기서 함께 처리됨).
+    # 🔒 암호를 걸었으면 토큰이 있어야 붙을 수 있다.
+    #   토큰은 쿼리스트링으로 받는다 — 브라우저 WebSocket API 가 헤더를 못 붙인다.
+    #   (같은 이유로 표준 관행이다. LAN 안 + wss 가 아닌 환경이라 완벽하진 않지만,
+    #    "같은 망의 아무나 들어오는 것" 을 막는다는 목적에는 맞는다)
+    if not token_ok(websocket.query_params.get("token")):
+        print("🔒 [프론트엔드] 토큰 없음/불일치 — 연결 거부")
+        await websocket.close(code=4401)
+        return
+
     await manager.connect(websocket)
     print(f"🖥️ [프론트엔드] 대시보드 연결됨 — {manager.status_line()}")
 
