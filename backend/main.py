@@ -52,6 +52,9 @@ import hashlib
 import secrets
 import json
 import os
+import urllib.error
+import urllib.parse
+import urllib.request
 # python-dotenv 패키지: .env 파일에 적힌 키=값 쌍을 읽어서
 # os.environ(환경변수)에 등록해주는 역할. 아래 load_dotenv() 호출과 짝을 이룸.
 from dotenv import load_dotenv
@@ -933,6 +936,159 @@ def require_token(token: Optional[str]):
     """조회 API 공용 — 암호를 걸었으면 토큰 없이는 못 본다."""
     if not token_ok(token):
         raise HTTPException(status_code=401, detail="로그인이 필요합니다")
+
+
+# =========================================================
+# [녹화 파일 구역]
+# mediamtx 가 쌓는 녹화를 확인하고 지운다.
+# =========================================================
+#
+# mediamtx 는 WorkingDirectory(~/mediamtx) 기준 ./recordings/<path>/ 에 쌓는다.
+# 다른 곳에 두려면 RECORDINGS_DIR 로 덮어쓴다.
+RECORDINGS_DIR = os.getenv(
+    "RECORDINGS_DIR", os.path.expanduser("~/mediamtx/recordings"))
+
+
+def _recording_files():
+    """녹화 파일 목록 (경로, 크기, 수정시각). 폴더가 없으면 빈 목록."""
+    out = []
+    for root, _dirs, files in os.walk(RECORDINGS_DIR):
+        for f in files:
+            if not f.lower().endswith((".mp4", ".ts")):
+                continue
+            fp = os.path.join(root, f)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            out.append((fp, st.st_size, st.st_mtime))
+    out.sort(key=lambda x: x[2])
+    return out
+
+
+# mediamtx 제어 API. 127.0.0.1 로만 열려 있어 이 서버에서만 부를 수 있다.
+MEDIAMTX_API = os.getenv("MEDIAMTX_API", "http://127.0.0.1:9997")
+MEDIAMTX_PLAYBACK = os.getenv("MEDIAMTX_PLAYBACK", "http://127.0.0.1:9996")
+
+
+def _http_json(method: str, url: str, json_body=None, timeout: float = 3.0):
+    """작은 HTTP 호출 하나. 표준 라이브러리만 쓴다.
+
+    ★ aiohttp/httpx 를 새로 넣지 않는다.
+      호출이 몇 개뿐이라 의존성을 늘릴 값이 없고, 늘리면 팀원 모두가 다시
+      설치해야 한다(requirements.txt 변경). urllib 로 충분하다.
+    """
+    data = json.dumps(json_body).encode() if json_body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Content-Type": "application/json"} if data else {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+        return json.loads(raw) if raw else {}
+
+
+async def _mtx(method: str, path: str, json_body=None):
+    """mediamtx API 호출. 실패하면 (None, 사유) 를 돌려준다.
+
+    mediamtx 가 안 떠 있는 것은 흔한 상황이라(영상 서버를 따로 껐거나 아직 안 켬)
+    예외로 터뜨리지 않고 프론트가 안내할 수 있게 사유를 넘긴다.
+
+    urllib 은 동기라 이벤트 루프를 막는다. 별도 스레드로 넘긴다.
+    """
+    try:
+        d = await asyncio.to_thread(_http_json, method, MEDIAMTX_API + path, json_body)
+        return d, None
+    except urllib.error.HTTPError as e:
+        return None, f"mediamtx 응답 {e.code}"
+    except Exception as e:
+        return None, type(e).__name__
+
+
+@app.get("/api/recording-state")
+async def recording_state(token: Optional[str] = None):
+    """지금 녹화 중인가."""
+    require_token(token)
+    data, err = await _mtx("GET", "/v3/config/pathdefaults/get")
+    if err:
+        return {"available": False, "reason": err, "recording": None}
+    return {"available": True, "recording": bool(data.get("record")),
+            "delete_after": data.get("recordDeleteAfter")}
+
+
+@app.post("/api/recording")
+async def recording_set(on: bool, token: Optional[str] = None):
+    """녹화를 켜거나 끈다."""
+    require_token(token)
+    _, err = await _mtx("PATCH", "/v3/config/pathdefaults/patch", {"record": on})
+    if err:
+        raise HTTPException(status_code=503, detail=f"미디어 서버에 연결하지 못했습니다 ({err})")
+    print(f"🎬 [녹화] {'시작' if on else '정지'}")
+    return {"ok": True, "recording": on}
+
+
+@app.get("/api/recording-segments")
+async def recording_segments(path: str = "ugv1", token: Optional[str] = None):
+    """녹화 조각 목록 (시작 시각 + 길이). 타임라인을 그리는 데 쓴다."""
+    require_token(token)
+    url = f"{MEDIAMTX_PLAYBACK}/list?path={urllib.parse.quote(path)}"
+    try:
+        return {"segments": await asyncio.to_thread(_http_json, "GET", url, None, 5.0)}
+    except urllib.error.HTTPError as e:
+        return {"segments": [], "reason": f"재생 API 응답 {e.code}"}
+    except Exception as e:
+        return {"segments": [], "reason": type(e).__name__}
+
+
+@app.get("/api/recordings")
+async def recordings_stats(token: Optional[str] = None):
+    """녹화가 얼마나 쌓였는지. 삭제 버튼에 숫자를 보여주려는 것이다."""
+    require_token(token)
+    files = _recording_files()
+    total = sum(f[1] for f in files)
+    return {
+        "dir": RECORDINGS_DIR,
+        "count": len(files),
+        "bytes": total,
+        "oldest": (datetime.fromtimestamp(files[0][2], KST).isoformat() if files else None),
+        "newest": (datetime.fromtimestamp(files[-1][2], KST).isoformat() if files else None),
+    }
+
+
+@app.post("/api/recordings/clear")
+async def recordings_clear(token: Optional[str] = None):
+    """녹화 파일을 지운다.
+
+    ★ 지금 쓰고 있는 조각(가장 최근 파일)은 남긴다.
+      mediamtx 가 열어둔 채로 쓰고 있는 파일을 지우면, 지워도 공간이 안 돌아오고
+      (열린 파일이라) 그 조각이 깨진 채 남는다. 다음 조각으로 넘어가면 알아서
+      보관 기간에 걸려 사라지므로 굳이 건드리지 않는다.
+
+    ★ 폴더는 지우지 않는다. 파일만 지운다.
+      mediamtx 가 폴더를 다시 만들긴 하지만, 지우는 순간 쓰기가 실패할 수 있다.
+    """
+    require_token(token)
+    files = _recording_files()
+    keep = files[-1][0] if files else None      # 지금 쓰는 중일 가능성이 높은 것
+
+    removed = 0
+    freed = 0
+    errors = []
+    for fp, size, _mt in files:
+        if fp == keep:
+            continue
+        try:
+            os.remove(fp)
+            removed += 1
+            freed += size
+        except OSError as e:
+            errors.append(f"{os.path.basename(fp)}: {e.strerror}")
+
+    print(f"🗑️ [녹화] {removed}개 삭제, {freed / 1024 / 1024:.0f}MB 확보"
+          + (f" · 실패 {len(errors)}개" if errors else "")
+          + (" · 사용 중인 조각 1개는 남김" if keep else ""))
+    return {"removed": removed, "freed_bytes": freed,
+            "kept": os.path.basename(keep) if keep else None,
+            "errors": errors[:5]}
 
 
 @app.get("/api/event-days")

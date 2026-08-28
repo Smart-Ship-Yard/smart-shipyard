@@ -1571,6 +1571,198 @@ function ConnNotice({ tone, title, lines, btnLabel, onConfirm }) {
   );
 }
 
+/* 녹화 화면 — 시작/정지, 용량·삭제, 그리고 타임라인으로 지난 영상 보기.
+ *
+ * 타임라인은 유튜브처럼 막대를 눌러 그 시점으로 뛴다. 시각을 글로 쳐 넣을 수도
+ * 있다 — 이벤트 로그의 시각을 그대로 옮겨 적는 것이 실제로 가장 흔한 쓰임이다. */
+function RecordingPanel({ onClose }) {
+  const [state, setState] = useState(null);       // {available, recording, delete_after}
+  const [usage, setUsage] = useState(null);       // {count, bytes, oldest, newest}
+  const [segs, setSegs] = useState([]);           // mediamtx 조각 목록
+  const [segErr, setSegErr] = useState(null);
+  const [playAt, setPlayAt] = useState(null);     // 재생 시작 시각 (ISO)
+  const [typed, setTyped] = useState("");         // 직접 입력한 시각
+  const [busy, setBusy] = useState(false);
+  const [dur, setDur] = useState(60);             // 한 번에 볼 길이(초)
+
+  const load = useCallback(() => {
+    fetch(withToken(`http://${SERVER_HOST}/api/recording-state`))
+      .then((r) => r.json()).then(setState).catch(() => setState({ available: false }));
+    fetch(withToken(`http://${SERVER_HOST}/api/recordings`))
+      .then((r) => r.json()).then(setUsage).catch(() => {});
+    fetch(withToken(`http://${SERVER_HOST}/api/recording-segments`))
+      .then((r) => r.json())
+      .then((d) => { setSegs(d.segments || []); setSegErr(d.reason || null); })
+      .catch((e) => setSegErr(String(e)));
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const toggle = async () => {
+    if (!state?.available) return;
+    setBusy(true);
+    try {
+      await fetch(withToken(`http://${SERVER_HOST}/api/recording?on=${!state.recording}`),
+                  { method: "POST" });
+      load();
+    } finally { setBusy(false); }
+  };
+
+  const clearAll = async () => {
+    const mb = usage ? (usage.bytes / 1024 / 1024).toFixed(0) : "?";
+    if (!window.confirm(
+      `녹화 영상을 삭제합니다. (지금 ${usage?.count ?? "?"}개 · ${mb} MB)\n\n` +
+      "· 서버 노트북에 저장된 영상 파일이 실제로 지워집니다\n" +
+      "· 되돌릴 수 없습니다\n" +
+      "· 지금 녹화 중인 조각 하나는 남습니다\n\n계속할까요?")) return;
+    setBusy(true);
+    try {
+      const r = await fetch(withToken(`http://${SERVER_HOST}/api/recordings/clear`),
+                            { method: "POST" });
+      const d = await r.json();
+      alert(`${d.removed}개 삭제 · ${(d.freed_bytes / 1024 / 1024).toFixed(0)} MB 확보`);
+      setPlayAt(null);
+      load();
+    } finally { setBusy(false); }
+  };
+
+  // 조각들을 하나의 시간축으로 펼친다. 막대의 어디를 눌렀는지로 시각을 구한다.
+  const t0 = segs.length ? new Date(segs[0].start).getTime() : 0;
+  const t1 = segs.length
+    ? Math.max(...segs.map((sg) => new Date(sg.start).getTime() + (sg.duration || 0) * 1000))
+    : 0;
+  const span = Math.max(1, t1 - t0);
+
+  const seekToRatio = (ratio) => {
+    if (!segs.length) return;
+    setPlayAt(new Date(t0 + span * ratio).toISOString());
+  };
+  const playTyped = () => {
+    // "2026-08-29 07:12:30" 또는 "07:12:30" 둘 다 받는다.
+    const v = typed.trim();
+    if (!v) return;
+    const base = segs.length ? new Date(segs[0].start) : new Date();
+    let d;
+    if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(v)) {
+      const [h, m, sec = "0"] = v.split(":");
+      d = new Date(base); d.setHours(+h, +m, +sec, 0);
+    } else {
+      d = new Date(v.replace(" ", "T"));
+    }
+    if (isNaN(d.getTime())) { alert("시각을 알아듣지 못했습니다.\n예: 07:12:30 또는 2026-08-29 07:12:30"); return; }
+    setPlayAt(d.toISOString());
+  };
+  const fmt = (iso) => { try { return new Date(iso).toLocaleString("ko-KR"); } catch { return iso; } };
+  const mb = usage ? (usage.bytes / 1024 / 1024).toFixed(0) : null;
+
+  return (
+    <div className="hist-backdrop" onClick={onClose}>
+      <div className="hist rec" onClick={(e) => e.stopPropagation()}>
+        <div className="hist-head">
+          <span>🎬 녹화</span>
+          <button type="button" className="hist-close" style={{ marginLeft: "auto" }} onClick={onClose}>닫기</button>
+        </div>
+
+        <div className="hist-body">
+          {/* ── 제어 ── */}
+          <div className="rec-ctl">
+            {state && !state.available ? (
+              <div className="hist-msg" style={{ padding: "12px 0" }}>
+                미디어 서버에 연결하지 못했습니다 {state.reason ? `(${state.reason})` : ""} —
+                mediamtx 가 떠 있는지 확인하세요.
+              </div>
+            ) : (
+              <>
+                <button type="button" className={`rec-btn ${state?.recording ? "on" : ""}`}
+                        onClick={toggle} disabled={busy || !state}>
+                  {state?.recording ? "⏹ 녹화 정지" : "⏺ 녹화 시작"}
+                </button>
+                <span className="rec-state">
+                  {state == null ? "확인 중…"
+                    : state.recording ? "녹화 중" : "정지됨"}
+                  {state?.delete_after && <> · 보관 {state.delete_after}</>}
+                </span>
+                <span className="rec-usage">
+                  {usage ? `${usage.count}개 · ${mb} MB` : "용량 확인 중…"}
+                </span>
+                <button type="button" className="rec-del" onClick={clearAll}
+                        disabled={busy || !usage?.count}>
+                  🗑 영상 삭제
+                </button>
+              </>
+            )}
+          </div>
+
+          {/* ── 타임라인 ── */}
+          <div className="rec-tl-head">
+            지난 영상 보기
+            {segs.length > 0 && <span className="rec-range">{fmt(segs[0].start)} ~ {fmt(new Date(t1).toISOString())}</span>}
+          </div>
+
+          {segs.length === 0 ? (
+            <div className="hist-msg" style={{ padding: "16px 0" }}>
+              {segErr ? `조각 목록을 못 읽었습니다 (${segErr})` : "녹화된 영상이 없습니다."}
+            </div>
+          ) : (
+            <>
+              <div
+                className="rec-tl"
+                onClick={(e) => {
+                  const r = e.currentTarget.getBoundingClientRect();
+                  seekToRatio(Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)));
+                }}
+                title="누른 지점부터 재생합니다"
+              >
+                {segs.map((sg, i) => {
+                  const st = new Date(sg.start).getTime();
+                  return (
+                    <div key={i} className="rec-seg" style={{
+                      left: `${((st - t0) / span) * 100}%`,
+                      width: `${Math.max(0.4, ((sg.duration || 0) * 1000 / span) * 100)}%`,
+                    }} />
+                  );
+                })}
+                {playAt && (
+                  <div className="rec-cursor" style={{
+                    left: `${Math.min(100, Math.max(0, ((new Date(playAt).getTime() - t0) / span) * 100))}%`,
+                  }} />
+                )}
+              </div>
+
+              <div className="rec-jump">
+                <input className="rec-time" value={typed} placeholder="07:12:30 또는 2026-08-29 07:12:30"
+                       onChange={(e) => setTyped(e.target.value)}
+                       onKeyDown={(e) => { if (e.key === "Enter") playTyped(); }} />
+                <button type="button" className="hist-close" onClick={playTyped}>이 시각으로</button>
+                <select className="hist-date" value={dur} onChange={(e) => setDur(+e.target.value)}>
+                  <option value={15}>15초</option>
+                  <option value={60}>1분</option>
+                  <option value={300}>5분</option>
+                </select>
+              </div>
+
+              {playAt && (
+                <div className="rec-player">
+                  <div className="rec-playing">▶ {fmt(playAt)} 부터 {dur}초</div>
+                  <video
+                    key={playAt + dur}
+                    className="rec-video"
+                    controls
+                    autoPlay
+                    src={`http://${SERVER_HOST.split(":")[0]}:9996/get?path=ugv1&start=${encodeURIComponent(playAt)}&duration=${dur}`}
+                  />
+                  <div className="rec-hint">
+                    영상이 안 나오면 재생 API 포트(9996)가 방화벽에 열려 있는지 확인하세요.
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* 로그인 화면 — 서버가 암호를 걸었을 때만 뜬다.
  *
  * 계정이 아니라 팀이 공유하는 암호 하나다. 지금 막으려는 것은 "같은 망의 아무나
@@ -1895,6 +2087,7 @@ function DashboardInner() {
   // 리렌더를 일으키지 않으므로, 화면에 그릴 값은 state 로 따로 둔다.
   const [robotConnected, setRobotConnected] = useState(null);
   const [showHistory, setShowHistory] = useState(false);  // 지난 기록 조회 화면
+  const [showRec, setShowRec] = useState(false);          // 녹화 화면
   // 이벤트 로그를 심각도로 거른다. null 이면 전체. 위험/경고 칸을 눌러 바꾼다.
   const [logFilter, setLogFilter] = useState(null);
   // 로봇이 실제로 일할 수 있는 상태인가 (jetson_ready).
@@ -2546,6 +2739,14 @@ function DashboardInner() {
           <button
             type="button"
             className="hist-open-btn"
+            onClick={() => setShowRec(true)}
+            title="녹화 시작/정지, 용량 확인·삭제, 지난 영상 보기"
+          >
+            🎬 녹화
+          </button>
+          <button
+            type="button"
+            className="hist-open-btn"
             onClick={() => setShowHistory(true)}
             title="날짜를 골라 지난 위험 이벤트와 감지 순간 사진을 봅니다"
           >
@@ -2745,6 +2946,7 @@ function DashboardInner() {
       )}
 
       {showHistory && <HistoryPanel onClose={() => setShowHistory(false)} />}
+      {showRec && <RecordingPanel onClose={() => setShowRec(false)} />}
 
       <CctvPopup
         block={activeBlock}
@@ -2867,6 +3069,44 @@ const CSS = `
   display:flex; align-items:center; justify-content:center; cursor:zoom-out; padding:24px; }
 .hist-zoom img { max-width:92vw; max-height:92vh; object-fit:contain;
   border:1px solid #1d2836; border-radius:8px; }
+
+/* 녹화 화면 */
+.hist.rec { width:min(820px, 96vw); }
+.rec-ctl { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  padding:12px 0 14px; border-bottom:1px solid #161f2e; }
+.rec-btn { font-size:13px; font-weight:700; padding:8px 16px; cursor:pointer;
+  background:#16202f; color:#e6edf6; border:1px solid #2a3a52; border-radius:8px; }
+.rec-btn.on { color:#ff3b47; border-color:#5a2830; }
+.rec-btn:disabled { opacity:.5; cursor:default; }
+.rec-state { font-size:12px; color:#7d8aa3; }
+.rec-usage { margin-left:auto; font-size:12px; color:#7d8aa3;
+  font-variant-numeric:tabular-nums; }
+.rec-del { font-size:12px; padding:6px 12px; cursor:pointer; background:#1c1216;
+  color:#ff8a92; border:1px solid #5a2830; border-radius:6px; }
+.rec-del:hover:not(:disabled) { background:#241419; color:#ffb3b8; }
+.rec-del:disabled { opacity:.4; cursor:default; }
+.rec-tl-head { display:flex; align-items:baseline; gap:10px; margin:14px 0 8px;
+  font-size:13px; font-weight:700; color:#e6edf6; }
+.rec-range { font-size:11px; font-weight:400; color:#7d8aa3;
+  font-variant-numeric:tabular-nums; }
+/* 조각들을 하나의 시간축에 깔고, 누른 지점으로 뛴다 */
+.rec-tl { position:relative; height:38px; cursor:pointer; overflow:hidden;
+  background:#0c1118; border:1px solid #1d2836; border-radius:6px; }
+.rec-seg { position:absolute; top:6px; bottom:6px; background:#2dd4bf; opacity:.55;
+  border-radius:2px; }
+.rec-tl:hover .rec-seg { opacity:.75; }
+.rec-cursor { position:absolute; top:0; bottom:0; width:2px; background:#ff3b47;
+  box-shadow:0 0 6px #ff3b47; }
+.rec-jump { display:flex; gap:8px; margin-top:10px; }
+.rec-time { flex:1 1 auto; min-width:0; padding:6px 10px; font-size:12px;
+  background:#0c1118; color:#e6edf6; border:1px solid #2a3a52; border-radius:6px;
+  font-variant-numeric:tabular-nums; }
+.rec-player { margin-top:14px; }
+.rec-playing { font-size:12px; color:#7d8aa3; margin-bottom:6px;
+  font-variant-numeric:tabular-nums; }
+.rec-video { width:100%; max-height:46vh; background:#000;
+  border:1px solid #1d2836; border-radius:8px; }
+.rec-hint { margin-top:6px; font-size:11px; color:#5f6b80; }
 
 .body { flex:1 1 auto; display:grid; grid-template-columns:280px 1fr 320px; gap:12px; padding:12px; min-height:0; }
 .left,.right { display:flex; flex-direction:column; gap:12px; min-height:0; }

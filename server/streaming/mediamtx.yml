@@ -32,6 +32,14 @@ paths:
 # 재생(playback) API. 녹화한 것을 시각으로 잘라 꺼내려면 필요하다.
 #   http://192.168.0.5:9996/get?path=ugv1&start=<ISO시각>&duration=15
 #   이벤트의 timestamp 로 그 순간 영상을 뽑는 용도다.
+# 제어 API. 대시보드의 녹화 시작/정지 버튼이 백엔드를 거쳐 이걸 부른다.
+#
+# ★ 127.0.0.1 로만 연다.
+#   이 API 는 설정을 바꿀 수 있어 밖에 노출하면 안 된다. 백엔드가 같은 노트북에
+#   있으므로 루프백이면 충분하고, 방화벽에 포트를 열 필요도 없다.
+api: true
+apiAddress: 127.0.0.1:9997
+
 playback: true
 
 pathDefaults:
@@ -41,9 +49,12 @@ pathDefaults:
   #   실측 1.2 Mbps (2026-08-29, 젯슨→서버 152 KB/s):
   #     시간당 약 540 MB · 하루 약 13 GB
   #
-  #   보관 48시간 = 약 26 GB. 이 노트북 여유가 93 GB 라 넉넉하다.
-  #   (7일로 잡으면 91 GB 라 디스크를 거의 다 먹는다 — 그래서 2일로 둔다.
-  #    어제 것까지 되짚어 볼 수 있으면 관제 용도로는 충분하다)
+  #   보관 2시간 = 약 1 GB. 아주 가볍다.
+  #   (48시간이면 25 GB 로 이 노트북에서도 감당은 되지만, 지금 필요한 것은
+  #    "방금 무슨 일이 있었나" 를 되짚는 것이라 2시간이면 충분하다.
+  #    더 길게 두려면 늘리되 df -h 로 여유를 먼저 본다)
+  #
+  #   실측 (2026-08-29, 1분간 측정): 8.7 MB/분 = 시간당 525 MB
   #
   #   녹화 파일은 저장소 밖(~/mediamtx/recordings/)에 쌓인다.
   #   systemd 유닛의 WorkingDirectory 가 ~/mediamtx 라 이 상대경로가 거기에 붙는다.
@@ -51,4 +62,4 @@ pathDefaults:
   recordPath: ./recordings/%path/%Y-%m-%d_%H-%M-%S-%f
   recordFormat: fmp4
   recordSegmentDuration: 1h
-  recordDeleteAfter: 48h
+  recordDeleteAfter: 2h
