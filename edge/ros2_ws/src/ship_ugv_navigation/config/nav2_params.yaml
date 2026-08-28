@@ -123,7 +123,20 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /odometry/local    # 실물·시뮬 공통 (ekf_local 출력)
-    bt_loop_duration: 10
+    # ★ 10 -> 50 (2026-08-28). Nav2 기본값 10ms(100 Hz)는 시뮬 기준이다.
+    #   젯슨에서는 이 속도를 못 지켰다 — 실측 16바퀴 도는 동안
+    #       Behavior Tree tick rate 100.00 was exceeded!   74회
+    #   전체 CPU 는 3.60/6 로 여유가 있었으므로 포화가 아니라, 이 노드만
+    #   제때 못 돈 것이다. YOLO·영상·EKF 와 코어를 나눠 쓰는 환경에서
+    #   100 Hz 는 과하다.
+    #
+    #   순찰은 초당 100번 판단할 일이 없다 — 웨이포인트 하나에 약 3초가
+    #   걸리므로 20 Hz(50ms)면 목표당 60번 틱이다. 충분하다.
+    #
+    #   ⚠️ 이 값은 **판단 주기이지 제어 주기가 아니다.** 실제 바퀴 명령은
+    #   controller_frequency(20 Hz)가 낸다. 여기를 낮춰도 주행이 거칠어지지
+    #   않는다. 반대로 여기만 높여도 제어가 부드러워지지 않는다.
+    bt_loop_duration: 50
     default_server_timeout: 20
 
     # ★ 행동트리(BT)는 Nav2 기본 대신 우리 것을 쓴다. space 가 골라준다.
