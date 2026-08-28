@@ -2087,10 +2087,11 @@ export default function ShipyardTwinDashboard() {
 
   if (gate === "checking") return <div className="login-wrap"><div className="login-sub">확인 중…</div></div>;
   if (gate === "login") return <LoginGate onDone={() => setGate("open")} />;
-  return <DashboardInner />;
+  // 암호를 안 건 서버에서는 로그아웃할 것이 없으므로 버튼도 안 보인다.
+  return <DashboardInner authed={!!getToken()} />;
 }
 
-function DashboardInner() {
+function DashboardInner({ authed }) {
   const canvasRef = useRef(null);
   // 3D 씬을 못 띄운 이유. null 이면 정상.
   // ★ 이게 있어야 WebGL 실패가 대시보드 전체를 무너뜨리지 않는다 (아래 참고).
@@ -2409,6 +2410,23 @@ function DashboardInner() {
     console.log(`[이벤트 채널] 연결 시도: ${EVENT_WS_URL}`);
     const off = connectRealEventSource(withToken(EVENT_WS_URL), {
       onOpen: () => {
+        // ★ 붙는 순간 화면의 위험을 비운다 (2026-08-29).
+        //   서버는 접속 직후 "지금 살아있는 위험" 을 통째로 다시 보낸다. 그런데
+        //   화면에 있던 옛 핑을 아무도 지우지 않아서, 서버가 꺼져 있는 동안
+        //   치워진 위험이 계속 남아 있었다. 그래서 새로고침을 해야만 화면이
+        //   진실과 맞았다.
+        //
+        //   비우고 복원으로 다시 채우면 **화면이 항상 서버와 같아진다.**
+        //   덕분에 재연결 팝업이 새로고침을 강요할 필요가 없다.
+        //   (복원은 곧바로 이어서 오므로 빈 화면이 보이는 시간은 찰나다)
+        if (sceneRef.current) sceneRef.current.clearAllPings();
+        dangerByIdRef.current = {};
+        setEvents([]);
+        setStats({ danger: 0, warn: 0, info: 0 });
+        setActiveBlock(null);
+        setActiveEvent(null);
+        setActiveGroup([]);
+        setWarnEvent(null);
         console.log("[이벤트 채널] 연결 성공");
         setConnected(true);
         // 연결이 끊긴 동안 놓쳤을 수 있는 갱신(배 위치/조립 단계)을 따라잡기 위해
@@ -2812,6 +2830,23 @@ function DashboardInner() {
             📚 지난 기록
           </button>
           <span className="clock-badge">{new Date().toLocaleDateString("ko-KR")}</span>
+          {authed && (
+            <button
+              type="button"
+              className="hist-open-btn"
+              onClick={() => {
+                // 로그아웃하면 토큰을 버린다. 다음 접속에는 암호를 다시 쳐야 한다.
+                // 누르지 않는 한 브라우저를 닫았다 켜도 그대로 들어가진다 —
+                // 매번 치는 번거로움과, 자리를 뜰 때 잠그는 것 사이의 타협이다.
+                if (!window.confirm("로그아웃할까요?\n다음 접속에는 암호를 다시 입력해야 합니다.")) return;
+                setToken("");
+                window.location.reload();
+              }}
+              title="토큰을 지웁니다. 다음 접속에 암호를 다시 입력합니다"
+            >
+              🔓 로그아웃
+            </button>
+          )}
         </div>
       </header>
 
