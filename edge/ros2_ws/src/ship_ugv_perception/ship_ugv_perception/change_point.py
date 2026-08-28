@@ -26,7 +26,7 @@ from rclpy.duration import Duration
 from rclpy.qos import (QoSProfile, QoSDurabilityPolicy,
                        QoSReliabilityPolicy)
 from std_msgs.msg import String
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import PointStamped, PoseWithCovarianceStamped
 from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs  # noqa: F401  (PointStamped 변환을 위해 필요한 등록)
 
@@ -277,6 +277,27 @@ class ChangePointDetector(Node):
         #   배 위치를 모르면 **거르지 않는다**(fail open). 위험을 놓치는 것보다
         #   유령을 통과시키는 편이 안전하다.
         self.declare_parameter('max_dist_from_ship_m', 1.2)
+
+        # ★ AMCL 이 붙기 전에는 이벤트를 등록하지 않는다 (2026-08-29).
+        #
+        #   change_point 는 로컬라이제이션 런치에 들어 있어 Nav2 보다 10~60초
+        #   먼저 뜬다. 그 창에는 AMCL 이 없어서 heading 을 보정하는 것이
+        #   아무것도 없다(IMU+UWB 상보필터만). 실측:
+        #
+        #       같은 불, 같은 자리
+        #         AMCL 없을 때  배기준 앞뒤 -0.493  ->  S5 선미
+        #         AMCL 있을 때  배기준 앞뒤 +0.484  ->  S1 선수
+        #
+        #   heading 이 49도만 틀어져도 뱃머리와 선미가 뒤집힌다. 그렇게 만든
+        #   좌표가 기억 파일에 저장되면 계속 남는다.
+        #
+        #   미루는 것이 안전한 이유: AMCL 이 없다는 것은 Nav2 가 없다는 뜻이고,
+        #   그러면 **로봇이 움직이지 않는다.** 순찰을 안 하는 동안 이벤트를
+        #   안 잡아도 놓치는 위험이 없다. 반대로 그때 잡으면 틀린 좌표가
+        #   기억에 박힌다.
+        #
+        #   텔레옵처럼 Nav2 없이 굴려야 하면 False 로 둘 것.
+        self.declare_parameter('require_amcl', True)
         # ★ 새 이벤트는 이만큼 연속으로 같은 자리에서 봐야 등록한다 (2026-08-27).
         #   단발 오측정 하나가 곧바로 로봇을 세우는 것을 막는다.
         self.declare_parameter('new_event_confirm_frames', 2)
@@ -324,6 +345,8 @@ class ChangePointDetector(Node):
         self.max_dist_from_ship = float(
             self.get_parameter('max_dist_from_ship_m').value)
         self._ship_center = None          # 모르면 거르지 않는다
+        self.require_amcl = bool(self.get_parameter('require_amcl').value)
+        self._amcl_ready = not self.require_amcl
         self.new_confirm = int(self.get_parameter('new_event_confirm_frames').value)
         self.new_window = float(self.get_parameter('new_event_confirm_window_s').value)
         self._pending = []   # 아직 확정 안 된 새 이벤트 후보
@@ -351,6 +374,10 @@ class ChangePointDetector(Node):
         self.create_subscription(
             String, self.get_parameter('inbound_topic').value,
             self._inbound_cb, 10)
+
+        if self.require_amcl:
+            self.create_subscription(
+                PoseWithCovarianceStamped, '/amcl_pose', self._amcl_cb, 10)
 
         # 배 중심 — latch 발행이라 나중에 떠도 마지막 값을 받는다
         self.create_subscription(
@@ -471,6 +498,16 @@ class ChangePointDetector(Node):
             os.replace(tmp, self.state_file)
         except Exception as e:
             self.get_logger().warn(f"이벤트 기억을 저장 못 했다(계속 진행): {e}")
+
+    # ------------------------------------------------------------------
+    def _amcl_cb(self, _msg):
+        """AMCL 이 한 번이라도 위치를 내면 heading 이 보정된 것으로 본다."""
+        if self._amcl_ready:
+            return
+        self._amcl_ready = True
+        self.get_logger().warn(
+            "✅ AMCL 확인 — 이제부터 이벤트를 등록한다 "
+            "(그 전에는 heading 보정이 없어 좌표를 믿을 수 없다)")
 
     # ------------------------------------------------------------------
     def _inbound_cb(self, msg):
@@ -718,6 +755,14 @@ class ChangePointDetector(Node):
         robot_y = transform.transform.translation.y
         rq = transform.transform.rotation
         robot_yaw = quat_to_yaw(rq.x, rq.y, rq.z, rq.w)
+
+        # --- ★ AMCL 전에는 좌표를 믿을 수 없다 (위 require_amcl 주석 참고) ---
+        if not self._amcl_ready:
+            self.get_logger().warn(
+                f"[{class_id}] AMCL 아직 없음 — 등록 보류 "
+                "(Nav2 를 켜면 heading 이 보정되고 그때부터 등록한다)",
+                throttle_duration_sec=10.0)
+            return
 
         # --- ★ 배에서 먼 검출은 버린다 (위 max_dist_from_ship_m 주석 참고) ---
         if self._ship_center is not None and self.max_dist_from_ship > 0:
