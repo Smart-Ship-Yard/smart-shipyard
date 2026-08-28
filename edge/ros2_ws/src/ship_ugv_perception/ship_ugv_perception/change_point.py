@@ -344,6 +344,14 @@ class ChangePointDetector(Node):
         self.create_subscription(
             String, self.get_parameter('detection_topic').value,
             self._detection_cb, 10)
+        # ★ 서버 -> 젯슨 중계 채널. reset_events 만 우리 관심사다 (2026-08-29).
+        #   프론트의 [초기화] 버튼이 여기까지 온다. 유령 핑이 생겼을 때
+        #   프로세스를 다 껐다 켜는 대신 기억만 비우려는 것이다.
+        self.declare_parameter('inbound_topic', '/server/inbound')
+        self.create_subscription(
+            String, self.get_parameter('inbound_topic').value,
+            self._inbound_cb, 10)
+
         # 배 중심 — latch 발행이라 나중에 떠도 마지막 값을 받는다
         self.create_subscription(
             String, '/ship_survey/pose', self._ship_pose_cb,
@@ -463,6 +471,37 @@ class ChangePointDetector(Node):
             os.replace(tmp, self.state_file)
         except Exception as e:
             self.get_logger().warn(f"이벤트 기억을 저장 못 했다(계속 진행): {e}")
+
+    # ------------------------------------------------------------------
+    def _inbound_cb(self, msg):
+        """서버에서 온 것을 그대로 받는다. reset_events 만 우리 관심사다.
+
+        ★ 왜 필요한가 (2026-08-29)
+
+        유령 핑이나 잘못된 위치의 이벤트가 생기면 지금은 로컬라이제이션을
+        껐다 켜야 했다. 그런데 기억 파일까지 지워야 진짜 깨끗해지고, 그 사이
+        순찰도 끊긴다. 관제사가 화면에서 한 번에 정리할 수 있어야 한다.
+
+        기억을 비우면 그 자리의 불을 **다시 새 이벤트로 보고하고 로봇도 다시
+        멈춘다.** 이는 안전한 방향의 실수다(놓치는 것이 아니라 한 번 더 알림).
+        그래서 이 명령이 잘못 와도 위험하지 않다.
+        """
+        try:
+            d = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(d, dict) or d.get('event_type') != 'reset_events':
+            return
+
+        n = len(self.reported_events)
+        ids = ', '.join(e['event_id'] for e in self.reported_events)
+        self.reported_events = []
+        self._pending = []
+        self._save_state()
+        self.get_logger().warn(
+            f"🧹 이벤트 기억 초기화 — {n}건 지움" + (f": {ids}" if ids else ""))
+        self.get_logger().warn(
+            "   이제부터 같은 자리의 위험도 새 이벤트로 보고하고 다시 멈춘다")
 
     # ------------------------------------------------------------------
     def _ship_pose_cb(self, msg):

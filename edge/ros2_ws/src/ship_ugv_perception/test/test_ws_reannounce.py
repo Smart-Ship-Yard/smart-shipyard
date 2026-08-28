@@ -106,4 +106,29 @@ if __name__ == '__main__':
     assert len(f._active_events) == before, 'event_id 없는 것을 거울에 넣었다'
     print('  event_id 없으면 거울에 안 넣음  OK')
 
+    # ★ 프론트 [초기화] 버튼 (2026-08-29)
+    #   유령 핑이 생겼을 때 프로세스를 껐다 켜는 대신 기억만 비운다.
+    #   change_point 목록과 여기 거울을 **둘 다** 비워야 한다 — 한쪽만
+    #   비우면 다음 재연결에 지워진 이벤트가 되살아난다.
+    f.on_danger('fire@1,1')
+    f.on_danger('fire@2,2')
+    with f._active_lock:
+        assert len(f._active_events) > 0
+
+    def reset(data):
+        if not isinstance(data, dict) or data.get('event_type') != 'reset_events':
+            return
+        with f._active_lock:
+            f._active_events.clear()
+
+    reset({'event_type': 'stream_boost'})          # 다른 명령은 무시
+    with f._active_lock:
+        assert len(f._active_events) > 0, '엉뚱한 명령에 거울을 비웠다'
+    reset({'event_type': 'reset_events'})
+    with f._active_lock:
+        assert len(f._active_events) == 0, '초기화가 안 됐다'
+    assert f.reannounce() == [], '초기화 뒤에도 재통보가 나간다'
+    print('  [초기화] -> 거울 비움, 재통보 없음  OK')
+    print('  다른 명령에는 반응 안 함  OK')
+
     print('\n통과')

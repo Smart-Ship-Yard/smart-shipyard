@@ -311,6 +311,21 @@ class WebSocketClient(Node):
             f"[스냅샷 큐] {d.get('class_id')} event_id={d.get('event_id')} "
             f"{len(d['image_b64'])/1024:.0f} KB")
 
+    def _reset_if_asked(self, data):
+        """프론트 [초기화] 버튼이 서버를 거쳐 오면 거울도 비운다.
+
+        change_point 는 자기 목록을 비우고, 여기서는 재통보용 거울을 비운다.
+        둘 다 안 비우면 다음 재연결에 지워진 이벤트가 되살아난다.
+        """
+        if not isinstance(data, dict):
+            return
+        if data.get('event_type') != 'reset_events':
+            return
+        with self._active_lock:
+            n = len(self._active_events)
+            self._active_events.clear()
+        self.get_logger().warn(f"🧹 재통보 거울 초기화 — {n}건 지움")
+
     def _map_point_cb(self, msg: String):
         """change_point_detector 가 위치 기준 중복 제거를 마친 위험 이벤트.
 
@@ -501,6 +516,10 @@ class WebSocketClient(Node):
 
             out_msg = String()
             out_msg.data = message
+            try:
+                self._reset_if_asked(json.loads(message))
+            except (ValueError, TypeError):
+                pass
             self.inbound_pub.publish(out_msg)
             self.get_logger().info(f"[수신] /server/inbound 로 중계: {message[:200]}")
 
