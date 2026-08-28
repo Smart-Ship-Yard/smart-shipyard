@@ -1788,7 +1788,12 @@ export default function ShipyardTwinDashboard() {
         //
         // ★ 팝업은 "상태가 바뀌었을 때"만 띄운다. 다만 대시보드를 여는 순간
         //   이미 끊겨 있으면 그것도 알려야 하므로, 첫 수신이어도 끊김이면 띄운다.
-        //   (첫 수신이 "연결됨" 이면 평상시라 조용히 넘어간다)
+        //   (첫 수신이 "연결됨" 이면 평상시라 조용히 넘어간다 — 이 규칙 덕분에
+        //    재연결 팝업의 새로고침이 무한 반복되지 않는다)
+        //
+        //   문구는 언제나 "재연결"로 둔다. 로봇이 정말 처음 켜지는 순간은 현장에
+        //   처음 들어온 그때뿐이고, 그 외에는 늘 이전 세션의 기억을 들고 다시
+        //   붙는 것이라 "재연결"이 사실에 맞다.
         if (type === "jetson_status") {
           const now = data.connected === true;
           const prev = robotConnectedRef.current;
@@ -2080,7 +2085,10 @@ export default function ShipyardTwinDashboard() {
       </div>
 
       {robotNotice !== null && (
-        <div className="robot-notice-backdrop" onClick={() => setRobotNotice(null)}>
+        <div
+          className="robot-notice-backdrop"
+          onClick={() => { if (robotNotice) window.location.reload(); else setRobotNotice(null); }}
+        >
           <div
             className={`robot-notice ${robotNotice ? "ok" : "lost"}`}
             onClick={(e) => e.stopPropagation()}
@@ -2093,18 +2101,25 @@ export default function ShipyardTwinDashboard() {
                 ? "실시간 순찰 정보 관제를 재개합니다."
                 : "로봇과 재연결될 때까지 실시간 순찰 정보 관제가 제한됩니다."}
             </p>
-            {!robotNotice && (
-              <p className="robot-notice-sub">
-                이미 감지된 위험 핑은 화면에 그대로 남아 있습니다.
-              </p>
-            )}
+            <p className="robot-notice-sub">
+              {robotNotice
+                ? "확인을 누르면 화면을 새로 불러와 로봇의 최신 정보를 반영합니다."
+                : "이미 감지된 위험 핑은 화면에 그대로 남아 있습니다."}
+            </p>
             <button
               type="button"
               className="robot-notice-btn"
-              onClick={() => setRobotNotice(null)}
+              onClick={() => {
+                // 재연결이면 확인과 동시에 새로고침한다. 확인만 누르고 최신
+                // 정보를 보려고 또 새로고침하는 수고를 없앤다. 새로고침 뒤 첫
+                // jetson_status 는 "연결됨" 이라 팝업이 다시 뜨지 않는다
+                // (수신 처리의 첫 수신 규칙) — 무한 반복이 생기지 않는다.
+                if (robotNotice) window.location.reload();
+                else setRobotNotice(null);
+              }}
               autoFocus
             >
-              확인
+              {robotNotice ? "확인 — 최신 정보 불러오기" : "확인"}
             </button>
           </div>
         </div>

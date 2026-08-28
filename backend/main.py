@@ -321,6 +321,37 @@ SERVER_STARTED_AT = datetime.now(KST)
 jetson_live_event_ids: set = set()
 
 
+async def _backfill_replay_event(doc: dict):
+    """재통보로만 알게 된 이벤트를 처음 한 번 기록한다.
+
+    이미 같은 event_id 의 위험 기록이 있으면 아무것도 하지 않는다 —
+    중복 저장은 감사 기록을 흐리고, 복원은 어차피 기존 문서로 된다.
+
+    저장할 때 replay 플래그를 지우지 않는다. "이 기록은 재통보로 알게 된
+    것" 이라는 사실을 남겨야 나중에 감사할 때 감지 시각을 오해하지 않는다.
+    """
+    eid = doc.get("event_id")
+    try:
+        exists = await event_collection.find_one(
+            {"event_id": eid, "event_type": {"$in": list(DANGER_TYPES)}},
+            {"_id": 1},
+        )
+        if exists:
+            return
+        doc["timestamp"] = datetime.now(KST).isoformat()
+        await event_collection.insert_one(doc)
+        print(f"💾 [재통보] 처음 보는 이벤트라 기록함: {eid}")
+    except Exception as e:
+        print(f"⚠️ [재통보] 기록 실패({type(e).__name__}): {eid}")
+
+
+def schedule_replay_backfill(doc: dict):
+    """DB 를 기다리지 않는다 — 젯슨 수신 루프가 멈추면 안 된다."""
+    task = asyncio.create_task(_backfill_replay_event(doc))
+    _save_tasks.add(task)
+    task.add_done_callback(_save_tasks.discard)
+
+
 async def broadcast_jetson_status():
     """로봇 연결 상태를 프론트 전체에 알린다. DB에 저장하지 않는다."""
     await manager.broadcast({
@@ -888,13 +919,19 @@ async def websocket_jetson(websocket: WebSocket):
             # BLOCK_LEVEL 단계 변화 + SHIP_POSE 배 위치)만 DB에 영구 저장한다.
             # (평상시 위치 핑 등 그 외 메시지는 저장하지 않고 브로드캐스트만 함)
             # 📣 젯슨 재연결 시 "아직 살아있다" 재통보 (replay:true).
-            #   저장하지 않는다 — 이미 있는 이벤트의 중복 기록이 되고, 실제로
-            #   그 시각에 감지된 것도 아니라 감사 기록을 흐린다.
-            #   대신 생존 목록에 넣어 복원 판정이 시각 바닥을 넘어 꺼내오게 한다.
+            #   이미 아는 이벤트면 저장하지 않는다 — 중복 기록이 되고, 실제로
+            #   그 시각에 감지된 것도 아니라 감사 기록을 흐린다. 대신 생존
+            #   목록에 넣어 복원 판정이 시각 바닥을 넘어 꺼내오게 한다.
             if data.get("replay") and event_type in DANGER_TYPES:
                 eid = data.get("event_id")
                 if eid:
                     jetson_live_event_ids.add(eid)
+                    # ★ 단, 처음 보는 이벤트면 저장해야 한다 (2026-08-29).
+                    #   서버가 꺼져 있는 동안 처음 감지된 불은 이 재통보가
+                    #   **유일한 전달 경로**다. 안 남기면 DB 에 기록이 아예 없어,
+                    #   생존 목록에 id 는 있는데 꺼내올 문서가 없다 —— 핑은 떴다가
+                    #   새로고침하면 사라진다.
+                    schedule_replay_backfill(data.copy())
                 await manager.broadcast(data)
                 continue
 
