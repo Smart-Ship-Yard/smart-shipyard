@@ -1055,8 +1055,12 @@ async def recordings_stats(token: Optional[str] = None):
 
 
 @app.post("/api/recordings/clear")
-async def recordings_clear(token: Optional[str] = None):
+async def recordings_clear(oldest: Optional[int] = None,
+                           token: Optional[str] = None):
     """녹화 파일을 지운다.
+
+    oldest 를 주면 **오래된 것부터 그 개수만** 지운다. 안 주면 전부.
+    조각이 대략 1분짜리라 개수가 곧 분이다 — "앞의 30분만 지우기" 처럼 쓴다.
 
     ★ 지금 쓰고 있는 조각(가장 최근 파일)은 남긴다.
       mediamtx 가 열어둔 채로 쓰고 있는 파일을 지우면, 지워도 공간이 안 돌아오고
@@ -1067,8 +1071,11 @@ async def recordings_clear(token: Optional[str] = None):
       mediamtx 가 폴더를 다시 만들긴 하지만, 지우는 순간 쓰기가 실패할 수 있다.
     """
     require_token(token)
-    files = _recording_files()
+    files = _recording_files()                  # 오래된 것부터 정렬돼 있다
     keep = files[-1][0] if files else None      # 지금 쓰는 중일 가능성이 높은 것
+
+    if oldest is not None and oldest > 0:
+        files = files[:oldest]
 
     removed = 0
     freed = 0

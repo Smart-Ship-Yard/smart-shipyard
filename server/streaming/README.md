@@ -47,15 +47,22 @@
 
 ## 설치 (이 노트북 = Ubuntu 22.04 / x86_64)
 
-바이너리는 55MB 라 저장소에 넣지 않는다. 홈에 풀어둔다:
-
 ```bash
-mkdir -p ~/mediamtx && cd ~/mediamtx
-curl -sL -o mediamtx.tar.gz \
-  https://github.com/bluenviron/mediamtx/releases/download/v1.20.1/mediamtx_v1.20.1_linux_amd64.tar.gz
-tar xzf mediamtx.tar.gz && rm mediamtx.tar.gz
-./mediamtx --version      # v1.20.1
+bash server/streaming/install.sh
 ```
+
+`~/mediamtx` 에 받는다. 이미 있으면 아무것도 하지 않는다.
+
+> ### 왜 저장소에 넣지 않나 — 그리고 다음은 도커다
+>
+> 바이너리가 55MB 이고, 리눅스/맥/윈도우가 각각 다른 파일이다. git 에 넣으면
+> clone 이 무거워지는데 정작 팀원마다 다른 것을 받아야 한다. 그래서
+> **"clone 하면 딸려 온다" 는 만들 수 없고**, 이 스크립트로 한 번 받는다.
+>
+> **나중에는 도커로 간다.** mediamtx·백엔드·mongo 를 compose 파일 하나로 띄우면
+> 이 스크립트도, 버전 고정도, "각자 노트북에 뭘 깔아야 하나" 도 사라진다.
+> 지금 도입하지 않는 이유는 시연이 가까워서다 — 실행 방법이 바뀌면 팀원 전부가
+> 다시 익혀야 하고, 그 위험을 시연 직전에 질 이유가 없다.
 
 설정은 이 폴더의 `mediamtx.yml` 을 쓴다 (git pull 하면 설정도 같이 따라온다).
 

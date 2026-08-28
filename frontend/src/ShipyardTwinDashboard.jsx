@@ -1584,6 +1584,7 @@ function RecordingPanel({ onClose }) {
   const [typed, setTyped] = useState("");         // 직접 입력한 시각
   const [busy, setBusy] = useState(false);
   const [dur, setDur] = useState(60);             // 한 번에 볼 길이(초)
+  const [delN, setDelN] = useState(10);           // 오래된 것부터 몇 개 지울지
 
   const load = useCallback(() => {
     fetch(withToken(`http://${SERVER_HOST}/api/recording-state`))
@@ -1607,16 +1608,24 @@ function RecordingPanel({ onClose }) {
     } finally { setBusy(false); }
   };
 
-  const clearAll = async () => {
+  // 조각은 대략 1분짜리라 **개수가 곧 분**이다. 그래서 개수로 고르게 했다 —
+  // 시각 범위를 지정하는 것보다 훨씬 단순하고, 실제로 하고 싶은 일
+  // ("앞쪽 오래된 것 좀 지우기") 에 바로 맞는다.
+  const clearSome = async (n) => {
+    const all = n == null;
+    const target = all ? (usage?.count ?? 0) : Math.min(n, usage?.count ?? 0);
     const mb = usage ? (usage.bytes / 1024 / 1024).toFixed(0) : "?";
     if (!window.confirm(
-      `녹화 영상을 삭제합니다. (지금 ${usage?.count ?? "?"}개 · ${mb} MB)\n\n` +
-      "· 서버 노트북에 저장된 영상 파일이 실제로 지워집니다\n" +
+      (all
+        ? `녹화 영상을 전부 삭제합니다. (지금 ${usage?.count ?? "?"}개 · ${mb} MB)`
+        : `오래된 것부터 ${target}개를 삭제합니다. (조각 하나가 약 1분이니 대략 ${target}분치)`)
+      + "\n\n· 서버 노트북에 저장된 영상 파일이 실제로 지워집니다\n" +
       "· 되돌릴 수 없습니다\n" +
       "· 지금 녹화 중인 조각 하나는 남습니다\n\n계속할까요?")) return;
     setBusy(true);
     try {
-      const r = await fetch(withToken(`http://${SERVER_HOST}/api/recordings/clear`),
+      const q = all ? "" : `?oldest=${n}`;
+      const r = await fetch(withToken(`http://${SERVER_HOST}/api/recordings/clear${q}`),
                             { method: "POST" });
       const d = await r.json();
       alert(`${d.removed}개 삭제 · ${(d.freed_bytes / 1024 / 1024).toFixed(0)} MB 확보`);
@@ -1684,10 +1693,24 @@ function RecordingPanel({ onClose }) {
                 <span className="rec-usage">
                   {usage ? `${usage.count}개 · ${mb} MB` : "용량 확인 중…"}
                 </span>
-                <button type="button" className="rec-del" onClick={clearAll}
-                        disabled={busy || !usage?.count}>
-                  🗑 영상 삭제
-                </button>
+                <span className="rec-delgrp">
+                  <span className="rec-dellabel">오래된 것부터</span>
+                  <input
+                    className="rec-delnum"
+                    type="number" min="1" max={usage?.count || 1} step="1"
+                    value={delN}
+                    onChange={(e) => setDelN(Math.max(1, Number(e.target.value) || 1))}
+                  />
+                  <span className="rec-dellabel">개(≈{delN}분)</span>
+                  <button type="button" className="rec-del" onClick={() => clearSome(delN)}
+                          disabled={busy || !usage?.count}>
+                    🗑 삭제
+                  </button>
+                  <button type="button" className="rec-del" onClick={() => clearSome(null)}
+                          disabled={busy || !usage?.count} title="녹화 영상을 전부 지웁니다">
+                    전부
+                  </button>
+                </span>
               </>
             )}
           </div>
@@ -2088,6 +2111,8 @@ function DashboardInner() {
   const [robotConnected, setRobotConnected] = useState(null);
   const [showHistory, setShowHistory] = useState(false);  // 지난 기록 조회 화면
   const [showRec, setShowRec] = useState(false);          // 녹화 화면
+  // 구획이 완성된 시각 (block_level 이 그 단계에 처음 도달한 때)
+  const [completedAt, setCompletedAt] = useState({});
   // 이벤트 로그를 심각도로 거른다. null 이면 전체. 위험/경고 칸을 눌러 바꾼다.
   const [logFilter, setLogFilter] = useState(null);
   // 로봇이 실제로 일할 수 있는 상태인가 (jetson_ready).
@@ -2153,8 +2178,21 @@ function DashboardInner() {
   // block_level 웹소켓 이벤트, /api/init-data 초기 로딩 둘 다 이 함수를 같이 쓴다.
   // ⚠️ 배가 한 척(B1)뿐이라 구획별이 아니라 "몇 번째 구획까지 끝났는지"로 계산한다 —
   // 젯슨이 보내는 block_id("B1")는 배 자체의 id지, BLOCKS의 S1~S5(구획)가 아니다.
-  const applyStageProgress = useCallback((stage) => {
+  const applyStageProgress = useCallback((stage, at) => {
     const clamped = Math.max(0, Math.min(BLOCKS.length, Number(stage) || 0));
+    // 완성된 시각을 함께 남긴다.
+    //   "언제 완성됐나" 는 관제사가 실제로 궁금해하는 것이고, 그걸 보려고
+    //   구획을 눌렀더니 CCTV 가 뜨는 것은 엉뚱하다. 그래서 목록에 그냥 적는다.
+    //   at 은 block_level 메시지의 timestamp — 없으면 받은 시각으로 대신한다.
+    const when = at || new Date().toISOString();
+    setCompletedAt((prev) => {
+      const next = { ...prev };
+      BLOCKS.forEach((b, i) => {
+        if (i < clamped) { if (!next[b.id]) next[b.id] = when; }
+        else delete next[b.id];      // 단계가 내려가면 완성 표시도 거둔다
+      });
+      return next;
+    });
     setProgress((prev) => {
       const next = { ...prev };
       BLOCKS.forEach((b, i) => {
@@ -2200,6 +2238,15 @@ function DashboardInner() {
   const handlePickBlock = useCallback((blockId) => {
     const block = BLOCKS.find((b) => b.id === blockId);
     const list = dangerListOf(blockId);
+    // ★ 위험이 없는 구획을 눌렀으면 아무것도 열지 않는다 (2026-08-29).
+    //   예전에는 빈 구획을 눌러도 CCTV 팝업이 떠서 "정상 — 활성 경보 없음" 만
+    //   보여줬다. 실시간 영상은 화면 아래에 늘 흐르고 있으므로 그 팝업은
+    //   보여줄 것이 없었고, 3D 를 돌리려다 잘못 눌러 뜨는 일이 잦았다.
+    //   강조 표시만 해두면 "여기는 아무 일 없다" 는 이미 전달된다.
+    if (!list.length) {
+      if (sceneRef.current) sceneRef.current.highlightBlock(blockId);
+      return;
+    }
     setActiveBlock(block);
     setAutoPopup(false);
     // 이 구획에 걸린 위험 이벤트를 **전부** 띄운다. 대표(확인 버튼·탐지 정보)는
@@ -2429,7 +2476,7 @@ function DashboardInner() {
         // S1~S5(구획)가 아니라 배 자체의 id라서 그대로 매칭하면 아무 데도 안 붙는다.
         // applyStageProgress가 "몇 번째 구획까지 완성"으로 알아서 변환해준다.
         if (type === "block_level") {
-          applyStageProgress(data.level);
+          applyStageProgress(data.level, data.timestamp);
           return;
         }
 
@@ -2458,6 +2505,15 @@ function DashboardInner() {
         //   이 메시지가 오면 핑·상태가 이미 다 도착한 뒤다. 수동 새로고침이 필요 없다.
         if (type === "jetson_ready") {
           setRobotReady(true);
+          // 앞선 알림들은 "아직 준비 중" 을 알리는 것이라, 준비가 끝나면 할 말이
+          // 없어진다. 확인을 안 눌렀어도 자동으로 내리고 준비 팝업으로 넘긴다.
+          //
+          // ★ 새로고침을 제안하는 팝업은 이것 하나뿐이다 (2026-08-29).
+          //   예전에는 서버 재연결 팝업도 새로고침을 걸어서, 로봇까지 켜면
+          //   확인을 두 번 눌러야 했고 새로고침 뒤에 서버 팝업이 다시 뜨기도 했다.
+          //   준비 완료가 곧 "이제 최신 정보가 다 왔다" 는 신호이므로 여기로 모은다.
+          setRobotNotice(null);
+          setServerNotice(null);
           if (!readyShownRef.current) {
             readyShownRef.current = true;   // 재연결 시 재발송되므로 한 번만
             setReadyNotice(true);
@@ -2493,6 +2549,9 @@ function DashboardInner() {
             // 이전 알림이 아직 떠 있어도 그냥 덮어쓴다 — 최신 상태가 항상 이긴다.
             // (끊김 팝업을 안 닫은 채로 재연결되면 자동으로 재연결 팝업으로 바뀐다)
             setRobotNotice(now);
+            // 로봇 소식이 왔다는 것은 서버가 붙어 있다는 뜻이다. 서버 팝업은
+            // 할 말이 끝났으므로 같이 내린다 — 안 그러면 확인을 두 번 눌러야 한다.
+            if (now) setServerNotice(null);
           }
           return;
         }
@@ -2778,10 +2837,18 @@ function DashboardInner() {
           <div className="panel grow">
             <div className="panel-h">선박 구획별 공정률</div>
             <div className="progress-list">
+              {/* 눌러도 아무 일이 없다 — 예전에는 CCTV 팝업이 떴는데,
+                  공정률을 보다가 영상이 뜨는 것은 엉뚱했다.
+                  대신 완성된 시각을 그 자리에 적는다. */}
               {sortedBlocks.map((b) => (
-                <button key={b.id} className="prog-row" onClick={() => handlePickBlock(b.id)}>
+                <div key={b.id} className="prog-row">
                   <div className="prog-name">
                     <span className="prog-id">{b.id}</span> {b.name}
+                    {completedAt[b.id] && (
+                      <span className="prog-when">
+                        {new Date(completedAt[b.id]).toLocaleTimeString("ko-KR", { hour12: false })} 완성
+                      </span>
+                    )}
                   </div>
                   <div className="prog-bar">
                     <div className="prog-fill" style={{
@@ -2790,7 +2857,7 @@ function DashboardInner() {
                     }} />
                   </div>
                   <div className="prog-pct">{(b.p * 100).toFixed(0)}%</div>
-                </button>
+                </div>
               ))}
             </div>
             <div className="legend">
@@ -2900,11 +2967,8 @@ function DashboardInner() {
                    "확인을 누르면 화면을 새로 불러와 로봇의 최신 정보를 반영합니다."]
                 : ["로봇과 재연결될 때까지 실시간 순찰 정보 관제가 제한됩니다.",
                    "이미 감지된 핑과 로봇의 마지막 위치는 화면에 그대로 남아 있습니다."]}
-              btnLabel={robotNotice ? "확인 — 최신 정보 불러오기" : "확인"}
-              onConfirm={() => {
-                if (robotNotice) window.location.reload();
-                else setRobotNotice(null);
-              }}
+              btnLabel="확인"
+              onConfirm={() => setRobotNotice(null)}
             />
           )}
           {readyNotice && (
@@ -2913,8 +2977,8 @@ function DashboardInner() {
               title="🤖 로봇 준비 완료"
               lines={["자율주행과 이벤트 감지가 모두 준비됐습니다.",
                       "실시간 순찰 정보 관제를 재개합니다. 최신 상태는 이미 반영돼 있습니다."]}
-              btnLabel="확인"
-              onConfirm={() => setReadyNotice(false)}
+              btnLabel="확인 — 최신 정보 불러오기"
+              onConfirm={() => window.location.reload()}
             />
           )}
           {serverNotice !== null && (
@@ -2926,20 +2990,15 @@ function DashboardInner() {
                   ? (robotConnected
                       // 서버도 로봇도 붙었다 — 완전히 정상으로 돌아온 경우
                       ? ["실시간 순찰 정보 관제를 재개합니다.",
-                         "확인을 누르면 화면을 새로 불러와 로봇의 최신 정보를 반영합니다."]
+                         "로봇 준비가 끝나면 다시 알려드립니다."]
                       // 서버만 붙었다 — 아직 관제가 안 된다는 것을 분명히 말한다
                       : ["다만 로봇이 아직 연결되지 않았습니다.",
                          "로봇이 연결된 후에 실시간 순찰 정보 관제가 가능합니다."])
                   : ["서버와 재연결될 때까지 실시간 순찰 정보 관제가 제한됩니다.",
                      "이미 감지된 핑과 로봇의 마지막 위치는 화면에 그대로 남아 있습니다."]
               }
-              btnLabel={serverNotice && robotConnected ? "확인 — 최신 정보 불러오기" : "확인"}
-              onConfirm={() => {
-                // 로봇까지 붙어 있을 때만 새로고침한다. 서버만 붙은 상태에서
-                // 새로 불러와봐야 가져올 최신 정보가 없다.
-                if (serverNotice && robotConnected) window.location.reload();
-                else setServerNotice(null);
-              }}
+              btnLabel="확인"
+              onConfirm={() => setServerNotice(null)}
             />
           )}
         </div>
@@ -3081,6 +3140,11 @@ const CSS = `
 .rec-state { font-size:12px; color:#7d8aa3; }
 .rec-usage { margin-left:auto; font-size:12px; color:#7d8aa3;
   font-variant-numeric:tabular-nums; }
+.rec-delgrp { display:flex; align-items:center; gap:6px; }
+.rec-dellabel { font-size:11px; color:#7d8aa3; white-space:nowrap; }
+.rec-delnum { width:56px; padding:5px 8px; font-size:12px; text-align:right;
+  background:#0c1118; color:#e6edf6; border:1px solid #2a3a52; border-radius:6px;
+  font-variant-numeric:tabular-nums; }
 .rec-del { font-size:12px; padding:6px 12px; cursor:pointer; background:#1c1216;
   color:#ff8a92; border:1px solid #5a2830; border-radius:6px; }
 .rec-del:hover:not(:disabled) { background:#241419; color:#ffb3b8; }
@@ -3133,6 +3197,7 @@ const CSS = `
 .prog-row { display:grid; grid-template-columns:1fr 70px 36px; align-items:center; gap:8px;
   background:none; border:none; padding:7px 6px; border-radius:8px; cursor:pointer; text-align:left;
   color:#e6edf6; transition:background .15s; }
+.prog-when { margin-left:8px; font-size:11px; color:#5f6b80; font-variant-numeric:tabular-nums; }
 .prog-row:hover { background:#121a28; }
 .prog-name { font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .prog-id { color:#2dd4bf; font-weight:700; font-size:11px; margin-right:4px; }
