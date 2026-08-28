@@ -194,6 +194,31 @@ const UGV_BASE_LINK_FROM_BACK_M = 0.069;
 const CALIBRATION_YAW_OFFSET_DEG = 0; // FALLBACK_SHIP_POSE.yaw 자체를 캘리브레이션된 값으로 바꿔서 이제 0으로 둠
 const CALIBRATION_YAW_OFFSET_RAD = CALIBRATION_YAW_OFFSET_DEG * Math.PI / 180;
 
+/* 핑 위치 보정 (배 기준, 미터). 0 이면 보정 없음 — 받은 좌표를 그대로 쓴다.
+ *
+ * ★ 왜 프론트에서 보정하나
+ *   배 폭이 14cm 인데 뎁스+TF 로 만든 객체 좌표의 오차는 십수 cm 급이다.
+ *   카메라를 바꾸든 젯슨 코드를 고치든 이 축척에서 정밀도를 맞추는 것은
+ *   비용 대비 효과가 없고, 대시보드는 "어느 구획 어느 쪽" 만 맞으면 된다.
+ *   그래서 **치우친 만큼만** 여기서 되돌린다.
+ *
+ * ★ 값을 추측으로 넣지 말 것
+ *   여기는 계통 편향(항상 같은 방향으로 밀리는 것)만 고칠 수 있다. 무작위
+ *   오차는 못 고친다. 그래서 반드시 한 번 재서 넣는다:
+ *
+ *     1) 불(또는 감지 대상)을 배 **정중앙** 에 놓는다
+ *     2) 로봇이 감지하게 하고, 브라우저 콘솔의 [핑 보정] 줄을 본다
+ *          [핑 보정] fire  원본 앞뒤=-0.02 좌우=-0.13  →  표시 앞뒤=-0.02 좌우=-0.13
+ *     3) 그 "원본" 값의 부호를 뒤집어 아래 두 상수에 넣는다
+ *          위 예라면 FORWARD_M = 0.02, BEAM_M = 0.13
+ *     4) 다시 감지시켜 "표시" 값이 0 근처로 오는지 확인한다
+ *
+ *   측정 기록 (2026-08-28, 보정 전): 화재 7건의 좌우 평균 -0.125 m,
+ *   7건 중 5건이 음수(배 기준 왼쪽)였다. 실제 위치를 모르는 상태의 값이라
+ *   그대로 상수에 넣지 않고 위 절차로 확정한다. */
+const PING_OFFSET_FORWARD_M = 0.0;  // + 가 뱃머리 쪽
+const PING_OFFSET_BEAM_M = 0.0;     // + 가 우현 쪽
+
 /* 서버 절대좌표(mapXY)를, "배를 기준으로 한" 상대 좌표(미터)로 바꾸는 공용 변환.
  * forward: 배 진행방향(+뱃머리 ~ -선미), beam: 좌우(+우현 ~ -좌현).
  * 이벤트 위치(구획 매핑)와 UGV 위치(3D 이동) 둘 다 이 함수를 함께 쓴다. */
@@ -209,7 +234,16 @@ function mapXYToShipLocalMeters(mapXY, shipPose) {
   const cos = Math.cos(-yaw), sin = Math.sin(-yaw);
   const forward = dx * cos - dy * sin;
   const beam = dx * sin + dy * cos;
-  return { forward, beam };
+
+  // 보정은 배 기준 좌표로 바꾼 **뒤에** 더한다. map 좌표에서 더하면 배가 돌아갔을 때
+  // 보정 방향까지 같이 돌아가버려서 "배의 왼쪽으로 12cm" 라는 의미가 깨진다.
+  return {
+    forward: forward + PING_OFFSET_FORWARD_M,
+    beam: beam + PING_OFFSET_BEAM_M,
+    // 보정 전 값. 캘리브레이션할 때 이 값을 봐야 한다 (아래 로그).
+    rawForward: forward,
+    rawBeam: beam,
+  };
 }
 
 function mapXYToBlockLocal(mapXY, shipPose) {
@@ -445,11 +479,13 @@ function connectRealEventSource(url, handlers) {
  *    React state로 매 프레임 리렌더하면 비싸므로, 3D는 ref/명령형으로 제어.
  * ------------------------------------------------------------------------- */
 class SceneManager {
-  constructor(canvas, { onPickBlock }) {
+  constructor(canvas, { onPickBlock, onPickPing }) {
     this.canvas = canvas;
     this.onPickBlock = onPickBlock;
+    this.onPickPing = onPickPing;   // 핑 하나를 콕 집어 눌렀을 때
     this.pings = []; // {mesh, ring, born, ttl, sev}
     this.blockMeshes = new Map();
+    this._selectedBlockId = null; // 지금 선택된 구획. 위험 표시와는 별개다.
     this._init();
   }
 
@@ -871,6 +907,10 @@ class SceneManager {
       new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.95 })
     );
     core.position.copy(pos);
+    // 클릭 판정에 쓸 정보를 메쉬에 심는다 (_handleClick 참고).
+    // 코어만 대상으로 삼는다 — 링/폴까지 넣으면 겹쳐서 엉뚱한 게 잡힌다.
+    core.userData.pingEventId = payload.eventId ?? null;
+    core.userData.pingBlockId = payload.blockId;
     this.scene.add(core);
 
     // 확산 링
@@ -901,13 +941,13 @@ class SceneManager {
       core, ring, pole, born: performance.now(), ttl,
       sev: meta.severity, blockId: payload.blockId, cls: payload.cls,
       eventId: payload.eventId ?? null, // 젯슨이 만든 고유 id — event_cleared 매칭용
+      isDanger,
       persistent,
     });
 
-    // DANGER면 해당 블록을 강조 (지워지기 전까지 계속 빨갛게 남아있음)
+    // DANGER면 해당 블록에 위험 표시 (지워지기 전까지 계속 빨갛게 남아있음)
     if (meta.severity === SEVERITY.DANGER) {
-      const rec = this.blockMeshes.get(payload.blockId);
-      if (rec) rec.mesh.material.emissive = new THREE.Color("#ff3b47");
+      this._setBlockDanger(payload.blockId, true);
     }
   }
 
@@ -920,9 +960,44 @@ class SceneManager {
 
   _resetBlockEmissiveIfClear(blockId) {
     const stillDanger = this.pings.some((p) => p.blockId === blockId && p.persistent);
-    if (!stillDanger) {
-      const rec = this.blockMeshes.get(blockId);
-      if (rec) rec.mesh.material.emissive = new THREE.Color("#000000");
+    if (!stillDanger) this._setBlockDanger(blockId, false);
+  }
+
+  // ★ 위험(빨강)과 선택(청록)을 분리한다 (2026-08-28).
+  //
+  //   예전에는 둘 다 material.emissive 하나만 건드렸고, highlightBlock 이
+  //   "선택 안 된 구획은 emissiveIntensity = 0" 으로 밀어버렸다. 그래서 위험
+  //   구획이 여러 곳이어도 **마지막에 선택된 하나만 보이고 나머지는 빨간색이
+  //   칠해진 채로 밝기 0 이라 안 보였다.** 재접속 복원처럼 이벤트가 연달아
+  //   들어오면 마지막 것만 남는 것처럼 보인 이유다.
+  //
+  //   이제 위험 여부를 메쉬가 userData 에 스스로 기억하고, 색칠은 _applyBlockLook
+  //   한 곳에서만 한다. 선택은 잠깐이고 위험은 지워질 때까지 유지되므로,
+  //   같은 구획이 둘 다면 **위험(빨강)이 이긴다** — 관제에서 놓치면 안 되는 쪽이다.
+  _setBlockDanger(blockId, on) {
+    const rec = this.blockMeshes.get(blockId);
+    if (!rec) return;
+    rec.mesh.userData.danger = on;
+    this._applyBlockLook(rec.mesh, blockId);
+  }
+
+  _applyBlockLook(mesh, id) {
+    const danger = !!mesh.userData.danger;
+    const selected = this._selectedBlockId === id;
+
+    // 선택된 구획만 살짝 띄운다 (위험이어도 위치는 선택 기준)
+    mesh.position.y = selected ? 0.25 : 0;
+
+    if (danger) {
+      mesh.material.emissive = new THREE.Color("#ff3b47");
+      // 선택까지 됐으면 더 밝게 — 위험한데 보고 있는 중이라는 뜻
+      mesh.material.emissiveIntensity = selected ? 0.9 : 0.6;
+    } else if (selected) {
+      mesh.material.emissive = new THREE.Color("#2dd4bf");
+      mesh.material.emissiveIntensity = 0.6;
+    } else {
+      mesh.material.emissive = new THREE.Color("#000000");
+      mesh.material.emissiveIntensity = 0.0;
     }
   }
 
@@ -992,11 +1067,23 @@ class SceneManager {
     this._orbitUpdate = update;
   }
 
+  // 핑을 먼저 본다. 핑이 배 위에 떠 있으면 그 뒤에 구획 메쉬가 겹쳐 있는데,
+  // 사람이 핑을 조준해서 눌렀다면 의도는 "이 핑" 이지 "이 구획" 이 아니다.
+  // 핑에 안 맞았을 때만 구획으로 넘어간다.
   _handleClick(e) {
     const rect = this.canvas.getBoundingClientRect();
     this.pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     this.pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.pointer, this.camera);
+
+    const pingCores = this.pings.filter((p) => p.persistent).map((p) => p.core);
+    const pingHit = this.raycaster.intersectObjects(pingCores, false)[0];
+    if (pingHit && this.onPickPing) {
+      this.onPickPing(pingHit.object.userData.pingEventId,
+                      pingHit.object.userData.pingBlockId);
+      return;
+    }
+
     const meshes = [...this.blockMeshes.values()].map((r) => r.mesh);
     const hits = this.raycaster.intersectObjects(meshes, false);
     if (hits.length && this.onPickBlock) {
@@ -1004,16 +1091,10 @@ class SceneManager {
     }
   }
 
+  // 선택 표시만 바꾼다. 위험 표시는 건드리지 않는다 (_applyBlockLook 참고).
   highlightBlock(blockId) {
-    this.blockMeshes.forEach((rec, id) => {
-      // 배 전체가 아니라 해당 구획 메쉬만 살짝 띄운다
-      rec.mesh.position.y = id === blockId ? 0.25 : 0;
-      rec.mesh.material.emissiveIntensity = id === blockId ? 0.6 : 0.0;
-
-      if (id === blockId) rec.mesh.material.emissive = new THREE.Color("#2dd4bf");
-      else if (rec.mesh.material.emissive.getHexString() !== "ff3b47")
-        rec.mesh.material.emissive = new THREE.Color("#000000");
-    });
+    this._selectedBlockId = blockId;
+    this.blockMeshes.forEach((rec, id) => this._applyBlockLook(rec.mesh, id));
   }
 
   _tick() {
@@ -1263,7 +1344,7 @@ function LivePanel({ ugvBlock, warnEvent, onExpand }) {
 
 /* 확대 팝업 — 위험(빨강) 자동 송출 + 클릭 시 표시 공용.
  * ESC 키로도 닫을 수 있게 한다 (X 버튼 클릭 없이 키보드로 종료). */
-function CctvPopup({ block, event, auto, onClose, onAck, onClearPing }) {
+function CctvPopup({ block, event, group, auto, onClose, onAck, onClearPing }) {
   const cvRef = useRef(null);
   const isDirect = USE_REAL_VIDEO;
   useCctvCanvas(cvRef, !!block && !isDirect, event, block ? block.name : "");
@@ -1283,6 +1364,9 @@ function CctvPopup({ block, event, auto, onClose, onAck, onClearPing }) {
 
   if (!block) return null;
   const meta = event ? CLASS_META[event.cls] : null;
+  // 사진이 실제로 있는 것만 나열한다. 아직 스냅샷이 안 온 이벤트는 칸을 만들지 않는다.
+  const shots = (group && group.length ? group : event ? [event] : [])
+    .filter((e) => e && e.imageUrl);
   // 화면에 계속 남아있는 핑(DANGER)이 있는 팝업일 때만 "핑 지우기" 버튼을 보여준다 —
   // WARN처럼 알아서 사라지는 핑이거나 애초에 활성 이벤트가 없으면 지울 게 없으니 표시 안 함.
   const canClearPing = !!(onClearPing && meta && meta.severity === SEVERITY.DANGER);
@@ -1301,20 +1385,38 @@ function CctvPopup({ block, event, auto, onClose, onAck, onClearPing }) {
         ) : (
           <canvas ref={cvRef} width={760} height={428} className="popup-canvas" />
         )}
-        {event?.imageUrl && (
-          <figure className="popup-snap">
-            <img
-              className="popup-snap-img"
-              src={event.imageUrl}
-              alt={`${meta ? meta.label : event.cls} 감지 순간`}
-              /* 서버에서 사진이 지워졌거나 아직 안 올라온 경우 깨진 아이콘 대신
-                 이 칸을 통째로 숨긴다 — 사진은 있으면 좋은 것이지 필수가 아니다. */
-              onError={(e) => { e.currentTarget.closest(".popup-snap").style.display = "none"; }}
-            />
-            <figcaption className="popup-snap-cap">
-              📸 감지 순간{event.locLabel ? ` — ${event.locLabel}` : ""}
-            </figcaption>
-          </figure>
+        {shots.length > 0 && (
+          <div className="popup-snaps">
+            {shots.length > 1 && (
+              <div className="popup-snaps-head">
+                📸 이 구역의 감지 순간 {shots.length}건
+              </div>
+            )}
+            <div className={`popup-snaps-grid ${shots.length > 1 ? "multi" : ""}`}>
+              {shots.map((ev) => {
+                const m = CLASS_META[ev.cls];
+                return (
+                  <figure className="popup-snap" key={ev.eventId || ev.id}>
+                    <img
+                      className="popup-snap-img"
+                      src={ev.imageUrl}
+                      alt={`${m ? m.label : ev.cls} 감지 순간`}
+                      /* 사진이 서버에서 지워졌으면 깨진 아이콘 대신 그 칸만 숨긴다 —
+                         사진은 있으면 좋은 것이지 필수가 아니다. */
+                      onError={(e) => { e.currentTarget.closest(".popup-snap").style.display = "none"; }}
+                    />
+                    <figcaption className="popup-snap-cap">
+                      {shots.length > 1 && m && (
+                        <span style={{ color: SEV_COLOR[m.severity] }}>{m.label} · </span>
+                      )}
+                      {ev.locLabel || ev.blockId}
+                      {shots.length === 1 ? " — 감지 순간" : ""}
+                    </figcaption>
+                  </figure>
+                );
+              })}
+            </div>
+          </div>
         )}
         <div className="popup-meta">
           <div><span className="k">구역</span><span className="v">{block.name} ({block.id})</span></div>
@@ -1366,6 +1468,9 @@ export default function ShipyardTwinDashboard() {
   const [events, setEvents] = useState([]);          // 이벤트 로그
   const [activeBlock, setActiveBlock] = useState(null);
   const [activeEvent, setActiveEvent] = useState(null);
+  // 팝업에 함께 보여줄 이벤트들. 구획을 누르면 그 구획의 위험 전부,
+  // 핑을 누르면 그 하나만 담긴다. activeEvent 는 그중 대표(확인 버튼용).
+  const [activeGroup, setActiveGroup] = useState([]);
   const [progress, setProgress] = useState(() =>
     Object.fromEntries(BLOCKS.map((b) => [b.id, Math.random() * 0.4])));
   const [stats, setStats] = useState({ danger: 0, warn: 0, info: 0 });
@@ -1393,7 +1498,17 @@ export default function ShipyardTwinDashboard() {
   // 자동 팝업이 아니라 사용자가 블록을 직접 클릭(Click & View)했을 때도,
   // 그 구획에 현재 위험 이벤트가 떠 있으면 확인 버튼이 보이게 하려고 따로 기억해둔다.
   // (state로 안 하고 ref로 하는 이유: handlePickBlock을 다시 만들지 않아도 되게 하려고 — 씬 재생성 방지)
-  const dangerByBlockRef = useRef({});
+  // 살아있는 위험 이벤트를 **event_id 기준으로 전부** 들고 있는다.
+  //
+  // ★ 예전에는 { [blockId]: 이벤트 } 였다 (2026-08-28 이전).
+  //   구획당 한 건만 남아서, 같은 구획에 불이 둘이면 나중 것이 앞 것을 지웠다.
+  //   그래서 S5 를 눌러도 스냅샷이 하나만 떴다. 핑은 3D 에 둘 다 떠 있는데
+  //   눌러서 볼 수 있는 건 하나뿐인 상태였다.
+  const dangerByIdRef = useRef({});
+
+  // 그 구획에 걸린 위험 이벤트들을 등록순으로. 팝업이 이걸로 사진을 나열한다.
+  const dangerListOf = useCallback((blockId) =>
+    Object.values(dangerByIdRef.current).filter((e) => e.blockId === blockId), []);
 
   // 조립 단계(1~5)를 "아래에서 N번째 구획까지 완성"으로 화면에 반영하는 공용 함수.
   // block_level 웹소켓 이벤트, /api/init-data 초기 로딩 둘 다 이 함수를 같이 쓴다.
@@ -1445,11 +1560,24 @@ export default function ShipyardTwinDashboard() {
 
   const handlePickBlock = useCallback((blockId) => {
     const block = BLOCKS.find((b) => b.id === blockId);
+    const list = dangerListOf(blockId);
     setActiveBlock(block);
     setAutoPopup(false);
-    // 이 구획에 아직 확인 안 한 위험 이벤트가 있으면 그걸 같이 띄운다 —
-    // 그래야 직접 클릭해서 봤을 때도(자동 팝업이 아니어도) 확인 버튼이 보인다.
-    setActiveEvent(dangerByBlockRef.current[blockId] || null);
+    // 이 구획에 걸린 위험 이벤트를 **전부** 띄운다. 대표(확인 버튼·탐지 정보)는
+    // 가장 최근 것으로 하고, 사진은 아래에 전부 나열한다.
+    setActiveEvent(list.length ? list[list.length - 1] : null);
+    setActiveGroup(list);
+    if (sceneRef.current) sceneRef.current.highlightBlock(blockId);
+  }, [dangerListOf]);
+
+  // 핑 하나를 콕 집어 눌렀을 때 — 그 이벤트만 보여준다.
+  // 구획 클릭과 달리 옆 핑까지 끌어오지 않는다. "이거 뭐야?" 에 대한 답이니까.
+  const handlePickPing = useCallback((eventId, blockId) => {
+    const one = eventId ? dangerByIdRef.current[eventId] : null;
+    setActiveBlock(BLOCKS.find((b) => b.id === blockId) || null);
+    setAutoPopup(false);
+    setActiveEvent(one);
+    setActiveGroup(one ? [one] : []);
     if (sceneRef.current) sceneRef.current.highlightBlock(blockId);
   }, []);
 
@@ -1470,7 +1598,8 @@ export default function ShipyardTwinDashboard() {
   useEffect(() => {
     let sm;
     try {
-      sm = new SceneManager(canvasRef.current, { onPickBlock: handlePickBlock });
+      sm = new SceneManager(canvasRef.current,
+        { onPickBlock: handlePickBlock, onPickPing: handlePickPing });
     } catch (err) {
       console.error("[3D] 씬 초기화 실패 — 3D 뷰만 끄고 나머지는 계속 동작합니다:", err);
       setSceneError(err);
@@ -1481,7 +1610,7 @@ export default function ShipyardTwinDashboard() {
     const ro = new ResizeObserver(() => sm.resize());
     ro.observe(canvasRef.current.parentElement);
     return () => { ro.disconnect(); sm.dispose(); sceneRef.current = null; };
-  }, [handlePickBlock]);
+  }, [handlePickBlock, handlePickPing]);
 
   // 이벤트 소스 연결 — 위험/경고 이벤트가 감지됐을 때 공통으로 하는 일
   // (3D Ping, 팝업/경고 표시, 로그 적재, 통계). 가짜 소스든 진짜 소스든
@@ -1494,19 +1623,23 @@ export default function ShipyardTwinDashboard() {
 
     if (meta.severity === SEVERITY.DANGER) {
       const block = BLOCKS.find((b) => b.id === payload.blockId);
-      // 이 구획의 "확인 대기중" 위험 이벤트로 기억해둠 — 나중에 사용자가 이 블록을
-      // 직접 클릭해서 봐도(자동 팝업을 놓쳤어도) 확인 버튼이 뜨게 하기 위함.
-      dangerByBlockRef.current = { ...dangerByBlockRef.current, [payload.blockId]: { ...payload, _meta: meta } };
+      // "확인 대기중" 위험 이벤트로 기억해둔다 — 나중에 사용자가 이 블록이나
+      // 핑을 직접 클릭해서 봐도(자동 팝업을 놓쳤어도) 사진과 확인 버튼이 뜨게 하기 위함.
+      // event_id 가 없는 구버전 메시지는 구획 이름으로 임시 키를 만들어 담는다
+      // (그래야 최소한 하나는 남는다 — 다만 같은 구획의 다음 무명 이벤트에 덮인다).
+      const key = payload.eventId || `noid:${payload.blockId}`;
+      dangerByIdRef.current = { ...dangerByIdRef.current, [key]: { ...payload, _meta: meta } };
 
       // ★ 재접속 복원분(replay)은 팝업을 띄우지 않는다 (2026-08-27).
       //   이미 관제사가 확인했을 수도 있고, 살아있는 이벤트가 여러 개면
       //   새로고침할 때마다 팝업이 연달아 떠서 화면을 덮는다.
       //   핑과 블록 강조는 그대로 그린다 — 위험이 아직 그 자리에 있다는
-      //   사실 자체는 보여줘야 하기 때문이다. 위의 dangerByBlockRef 기록도
+      //   사실 자체는 보여줘야 하기 때문이다. 위의 dangerByIdRef 기록도
       //   그대로 둔다. 그래야 재접속 후 그 블록을 클릭했을 때 확인 버튼이 뜬다.
       if (!payload.replay) {
         setActiveBlock(block);
         setActiveEvent({ ...payload, _meta: meta });
+        setActiveGroup([{ ...payload, _meta: meta }]);
         setAutoPopup(true);
         setUgvBlock(block);
       }
@@ -1600,13 +1733,12 @@ export default function ShipyardTwinDashboard() {
           }
           // "확인 대기중" 기록도 같은 event_id일 때만 같이 정리 — 그 사이에 같은 구획에서
           // 다른 새 위험이 또 감지됐다면(다른 event_id) 그건 그대로 남겨둬야 하니까.
-          if (data.block_id) {
-            const cur = dangerByBlockRef.current[data.block_id];
-            if (cur && (!data.event_id || cur.eventId === data.event_id)) {
-              const next = { ...dangerByBlockRef.current };
-              delete next[data.block_id];
-              dangerByBlockRef.current = next;
-            }
+          {
+            // event_id 로 그 한 건만 지운다. 같은 구획의 다른 위험은 그대로 남는다.
+            const next = { ...dangerByIdRef.current };
+            if (data.event_id) delete next[data.event_id];
+            else if (data.block_id) delete next[`noid:${data.block_id}`];
+            dangerByIdRef.current = next;
           }
           return;
         }
@@ -1631,16 +1763,15 @@ export default function ShipyardTwinDashboard() {
           setActiveEvent(attach); // 팝업이 이미 떠 있으면 그 자리에서 사진이 채워진다
           setWarnEvent(attach);
 
-          // 구획 클릭용 기록에도 붙인다 — 나중에 그 구획을 눌렀을 때 사진이 나와야 한다.
-          const withPhoto = { ...dangerByBlockRef.current };
-          let touched = false;
-          for (const [bid, e] of Object.entries(withPhoto)) {
-            if (e && e.eventId === eid) {
-              withPhoto[bid] = { ...e, imageUrl: url };
-              touched = true;
-            }
+          // 클릭용 기록에도 붙인다 — 나중에 핑/구획을 눌렀을 때 사진이 나와야 한다.
+          if (dangerByIdRef.current[eid]) {
+            dangerByIdRef.current = {
+              ...dangerByIdRef.current,
+              [eid]: { ...dangerByIdRef.current[eid], imageUrl: url },
+            };
           }
-          if (touched) dangerByBlockRef.current = withPhoto;
+          // 지금 열려 있는 팝업의 사진 목록에도 즉시 반영
+          setActiveGroup((prev) => prev.map(attach));
           return;
         }
 
@@ -1652,6 +1783,18 @@ export default function ShipyardTwinDashboard() {
         // 구획에 눌러 붙이면 "화재가 배에서 떨어져 있는데 배 위에 핑이 찍힌다"가 된다.
         const conv = mapXYToPingWorld(data.map_xy ?? null, shipPoseRef.current);
         const blockId = conv?.blockId ?? shipPoseRef.current?.block_id ?? BLOCKS[0].id;
+
+        // 📏 핑 위치 보정용 로그. 불을 배 정중앙에 놓고 이 줄의 "원본" 값을 읽어
+        //   PING_OFFSET_* 상수에 부호를 뒤집어 넣으면 된다 (상수 설명 참고).
+        const relDbg = mapXYToShipLocalMeters(data.map_xy ?? null, shipPoseRef.current);
+        if (relDbg) {
+          const f = (n) => (n >= 0 ? "+" : "") + n.toFixed(2);
+          console.log(
+            `[핑 보정] ${type}  원본 앞뒤=${f(relDbg.rawForward)} 좌우=${f(relDbg.rawBeam)}` +
+            `  →  표시 앞뒤=${f(relDbg.forward)} 좌우=${f(relDbg.beam)}` +
+            `  (현재 보정 앞뒤=${f(PING_OFFSET_FORWARD_M)} 좌우=${f(PING_OFFSET_BEAM_M)})`
+          );
+        }
 
         handleDetectionEvent({
           id: `evt_${Date.now()}_${Math.floor(Math.random() * 1e4)}`,
@@ -1706,6 +1849,7 @@ export default function ShipyardTwinDashboard() {
 
   const closePopup = () => {
     setActiveBlock(null); setActiveEvent(null); setAutoPopup(false);
+    setActiveGroup([]);
     if (sceneRef.current) sceneRef.current.highlightBlock(null);
   };
 
@@ -1728,9 +1872,12 @@ export default function ShipyardTwinDashboard() {
   // 용도. 젯슨의 event_cleared를 기다리지 않고 화면에서만 즉시 없앤다.
   const handleClearPing = () => {
     if (activeBlock) {
-      const next = { ...dangerByBlockRef.current };
-      delete next[activeBlock.id];
-      dangerByBlockRef.current = next;
+      // 그 구획에 걸린 위험 기록을 전부 뺀다 (clearBlockPing 도 구획 단위로 지운다).
+      const next = {};
+      for (const [k, e] of Object.entries(dangerByIdRef.current)) {
+        if (e.blockId !== activeBlock.id) next[k] = e;
+      }
+      dangerByIdRef.current = next;
       if (sceneRef.current) sceneRef.current.clearBlockPing(activeBlock.id);
     }
     closePopup();
@@ -1859,6 +2006,7 @@ export default function ShipyardTwinDashboard() {
       <CctvPopup
         block={activeBlock}
         event={activeEvent}
+        group={activeGroup}
         auto={autoPopup}
         onClose={closePopup}
         onAck={handleAck}
@@ -2026,10 +2174,17 @@ const CSS = `
 
 /* 감지 순간 스냅샷. 젯슨이 보낸 crop 이라 가로세로가 제각각이므로
    높이만 묶어두고 비율은 유지한다(object-fit:contain). */
-.popup-snap { margin:0; padding:12px 16px 0; }
+.popup-snaps { padding:12px 16px 0; }
+.popup-snaps-head { font-size:11px; color:#7d8aa3; margin-bottom:8px; letter-spacing:.02em; }
+/* 한 장이면 넓게, 여러 장이면 나란히. 사진 수가 늘어도 팝업이 안 길어지게 가로로 깐다. */
+.popup-snaps-grid { display:grid; gap:10px; }
+.popup-snaps-grid.multi { grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); }
+.popup-snap { margin:0; }
 .popup-snap-img { display:block; width:100%; max-height:190px; object-fit:contain;
   background:#0c1118; border:1px solid #1d2836; border-radius:6px; }
-.popup-snap-cap { margin-top:6px; font-size:11px; color:#7d8aa3; letter-spacing:.02em; }
+.popup-snaps-grid.multi .popup-snap-img { max-height:130px; }
+.popup-snap-cap { margin-top:6px; font-size:11px; color:#7d8aa3; letter-spacing:.02em;
+  text-align:center; }
 .popup-actions { padding:0 16px 16px; display:flex; flex-direction:column; gap:8px; }
 .popup-ack-btn {
   width:100%; padding:12px; border-radius:9px; border:1px solid #2dd4bf;
