@@ -874,6 +874,14 @@ class SceneManager {
 
   /* 요구사항 3: 서버 좌표 → 3D 매핑 + Red Alert Ping */
   spawnPing(payload) {
+    // 같은 event_id 를 두 번 받으면 핑이 두 개 겹쳐 그려진다.
+    // DANGER 핑은 event_cleared 로만 지워지므로 같은 id 를 다시 그릴 이유가 없다.
+    // (젯슨은 같은 event_id 를 "재확인" 의미로 다시 보낼 수 있고, 재접속 복원과
+    //  실시간 수신이 겹치는 순간에도 중복이 들어올 수 있다 — 둘 다 여기서 막는다)
+    if (payload.eventId && this.pings.some((p) => p.eventId === payload.eventId)) {
+      return;
+    }
+
     const meta = CLASS_META[payload.cls];
     if (!meta) return;
     const color = new THREE.Color(SEV_COLOR[meta.severity]);

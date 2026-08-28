@@ -280,7 +280,17 @@ DANGER_TYPES = {SHIP_DEFECT, NO_HELMET, FALLEN_PERSON, FIRE}
 #   이것은 clear 가 깨졌을 때 화면이 무너지지 않게 막아주는 안전장치이지,
 #   clear 를 대신하는 장치가 아니다. clear 가 안 되면 대시보드보다 로봇이 더
 #   문제다 — 같은 자리 불로 계속 멈추기 때문이다.
-SERVER_STARTED_AT = datetime.now(timezone.utc)
+#
+#   ⚠️ 반드시 KST 로 잡는다 (2026-08-28 버그 수정).
+#     아래 비교는 ISO 문자열의 사전순 비교인데, 문자열 비교는 시간대 표기를
+#     읽지 않는다. 이 값을 UTC 로 만들면 "22:23+09:00" >= "14:23+00:00" 이
+#     참이 되어 통과한다 — 실제로는 22:23 KST = 13:23 UTC 로 서버가 켜지기
+#     전인데도 그렇다. 즉 바닥이 9시간 뒤로 밀려, 서버 켜기 직전 9시간의
+#     이벤트가 전부 되살아났다. 대시보드에 유령 핑이 뜬 원인이 이것이다.
+#
+#     DB 의 timestamp 는 datetime.now(KST) 로 쓰므로 바닥도 같은 시간대여야
+#     문자열 비교가 곧 시간 비교가 된다.
+SERVER_STARTED_AT = datetime.now(KST)
 
 
 async def _active_danger_events(limit: int = 300):
@@ -294,6 +304,7 @@ async def _active_danger_events(limit: int = 300):
     최신 limit 건만 훑는다. 그보다 오래된 것이 아직 살아있을 가능성은 낮고,
     전체 스캔은 접속할 때마다 도는 경로라 비용을 묶어두는 편이 안전하다.
     """
+    # SERVER_STARTED_AT 도 KST 라 timestamp 와 표기가 같다 → 사전순 = 시간순.
     cutoff = SERVER_STARTED_AT.isoformat()
     docs = await event_collection.find({
         "event_type": {"$in": list(DANGER_TYPES) + [EVENT_CLEARED]},
