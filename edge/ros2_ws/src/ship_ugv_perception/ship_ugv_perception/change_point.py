@@ -23,6 +23,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
 from rclpy.duration import Duration
+from rclpy.qos import (QoSProfile, QoSDurabilityPolicy,
+                       QoSReliabilityPolicy)
 from std_msgs.msg import String
 from geometry_msgs.msg import PointStamped
 from tf2_ros import Buffer, TransformListener
@@ -256,6 +258,25 @@ class ChangePointDetector(Node):
         #   (자세한 이유는 clear_verdict docstring 참고)
         self.declare_parameter('min_departure_m', 0.8)   # 실제로 이만큼 멀어졌다 와야 함
         self.declare_parameter('min_unseen_s', 25.0)     # 이만큼 연속으로 안 보여야 함
+
+        # ★ 배 중심에서 이보다 먼 검출은 버린다 (2026-08-29 신설).
+        #
+        #   max_depth_m 은 **로봇~대상** 거리를 재므로 이걸 못 막는다.
+        #   실측: 유령 4건이 배 중심에서 1.6~2.0 m 였는데, 로봇이 순찰 원의
+        #   그쪽 지점에 있을 때 **로봇~유령 거리는 약 1 m** 였다. 즉 depth 는
+        #   정상 범위라 통과했다. 유령은 "멀리 있는 것" 이 아니라 "로봇 옆인데
+        #   배 반대편에 있는 것" 이다.
+        #
+        #   전체 통계: fire 등록 181건 중 49건(27%)이 배에서 1.2 m 초과였다.
+        #   그동안 프론트가 막아왔지만 젯슨은 그대로 서버에 보내고 로봇도
+        #   멈췄다. 1차 방어선을 여기 둔다.
+        #
+        #   ⚠️ 프론트의 MAX_EVENT_DIST_FROM_SHIP_M 과 **짝이다. 같이 바꿀 것.**
+        #   순찰 반지름을 키우거나 대상을 배에서 멀리 두면 둘 다 올려야 한다.
+        #
+        #   배 위치를 모르면 **거르지 않는다**(fail open). 위험을 놓치는 것보다
+        #   유령을 통과시키는 편이 안전하다.
+        self.declare_parameter('max_dist_from_ship_m', 1.2)
         # ★ 새 이벤트는 이만큼 연속으로 같은 자리에서 봐야 등록한다 (2026-08-27).
         #   단발 오측정 하나가 곧바로 로봇을 세우는 것을 막는다.
         self.declare_parameter('new_event_confirm_frames', 2)
@@ -300,6 +321,9 @@ class ChangePointDetector(Node):
         self.revisit_grace = self.get_parameter('revisit_grace_s').value
         self.min_departure = float(self.get_parameter('min_departure_m').value)
         self.min_unseen = float(self.get_parameter('min_unseen_s').value)
+        self.max_dist_from_ship = float(
+            self.get_parameter('max_dist_from_ship_m').value)
+        self._ship_center = None          # 모르면 거르지 않는다
         self.new_confirm = int(self.get_parameter('new_event_confirm_frames').value)
         self.new_window = float(self.get_parameter('new_event_confirm_window_s').value)
         self._pending = []   # 아직 확정 안 된 새 이벤트 후보
@@ -320,6 +344,13 @@ class ChangePointDetector(Node):
         self.create_subscription(
             String, self.get_parameter('detection_topic').value,
             self._detection_cb, 10)
+        # 배 중심 — latch 발행이라 나중에 떠도 마지막 값을 받는다
+        self.create_subscription(
+            String, '/ship_survey/pose', self._ship_pose_cb,
+            QoSProfile(depth=1,
+                       durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=QoSReliabilityPolicy.RELIABLE))
+
         self.pub = self.create_publisher(
             String, self.get_parameter('output_topic').value, 10)
         self.clear_pub = self.create_publisher(
@@ -416,6 +447,20 @@ class ChangePointDetector(Node):
             os.replace(tmp, self.state_file)
         except Exception as e:
             self.get_logger().warn(f"이벤트 기억을 저장 못 했다(계속 진행): {e}")
+
+    # ------------------------------------------------------------------
+    def _ship_pose_cb(self, msg):
+        """배 중심 좌표. 배에서 먼 검출을 거르는 데만 쓴다."""
+        try:
+            xy = json.loads(msg.data)['map_xy']
+            self._ship_center = (float(xy[0]), float(xy[1]))
+        except (ValueError, TypeError, KeyError, IndexError) as e:
+            self.get_logger().warn(f"ship_pose 파싱 실패(거르기 비활성): {e}")
+            return
+        self.get_logger().info(
+            f"배 중심 수신 ({self._ship_center[0]:.2f}, "
+            f"{self._ship_center[1]:.2f}) — 여기서 "
+            f"{self.max_dist_from_ship:.1f}m 초과 검출은 버린다")
 
     # ------------------------------------------------------------------
     def _find_matching_event(self, class_id, map_x, map_y):
@@ -618,6 +663,18 @@ class ChangePointDetector(Node):
         robot_y = transform.transform.translation.y
         rq = transform.transform.rotation
         robot_yaw = quat_to_yaw(rq.x, rq.y, rq.z, rq.w)
+
+        # --- ★ 배에서 먼 검출은 버린다 (위 max_dist_from_ship_m 주석 참고) ---
+        if self._ship_center is not None and self.max_dist_from_ship > 0:
+            d_ship = math.hypot(map_x - self._ship_center[0],
+                                map_y - self._ship_center[1])
+            if d_ship > self.max_dist_from_ship:
+                self.get_logger().info(
+                    f"[{class_id}] 배 중심에서 {d_ship:.2f}m — "
+                    f"{self.max_dist_from_ship:.1f}m 초과라 버림 "
+                    f"(map={map_x:.2f},{map_y:.2f})",
+                    throttle_duration_sec=5.0)
+                return
 
         # --- ★ 2차 필터: map 좌표 기준 중복 제거 ---
         now = self.get_clock().now()
