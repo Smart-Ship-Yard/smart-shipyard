@@ -644,7 +644,11 @@ class SceneManager {
    * 세로 분할을 16단으로 늘려 곡선을 매끄럽게 한다. */
   _buildHullSection(zStartN, zEndN, color) {
     const segs = 16;
-    const ringPts = 6; // 0:바닥중앙(용골) 1:좌빌지 2:좌현상단 3:갑판좌 4:갑판우 5:우현상단 ... (대칭 구성)
+    // ★ 좌우 방향 주의 — 뱃머리가 +z, 위가 +y 인 오른손 좌표계에서
+    //   관측자의 오른쪽은 f × u = ẑ × ŷ = -x̂ 다. 즉 **-x 가 우현, +x 가 좌현**.
+    //   (선체는 좌우 대칭이라 이 주석이 틀려도 그림은 같지만, 예전 주석이
+    //    반대로 적혀 있던 탓에 핑 위치 문구의 좌/우가 뒤집혀 있었다 — 2026-08-29)
+    const ringPts = 6; // 0:바닥중앙(용골) 1:우빌지 2:우현상단 3:갑판우 4:갑판좌 5:좌현상단 ... (대칭 구성)
     const positions = [];
     const indices = [];
     let prevBase = null;
@@ -659,14 +663,14 @@ class SceneManager {
       const keelY = 0.05;
       const bilgeY = topY * 0.22;
 
-      // 좌현 → 용골 → 우현 순으로 6점 링 (둥근 선저 + 곧은 현측)
+      // 우현(-x) → 용골 → 좌현(+x) 순으로 6점 링 (둥근 선저 + 곧은 현측)
       const ring = [
-        [-halfW * 0.92, topY,          z],  // 갑판 좌현
-        [-halfW,        bilgeY * 2.2,  z],  // 좌현 빌지(넓은 곳)
+        [-halfW * 0.92, topY,          z],  // 갑판 우현
+        [-halfW,        bilgeY * 2.2,  z],  // 우현 빌지(넓은 곳)
         [-halfW * 0.30, keelY,         z],  // 좌측 용골 접근
         [ halfW * 0.30, keelY,         z],  // 우측 용골 접근
-        [ halfW,        bilgeY * 2.2,  z],  // 우현 빌지
-        [ halfW * 0.92, topY,          z],  // 갑판 우현
+        [ halfW,        bilgeY * 2.2,  z],  // 좌현 빌지
+        [ halfW * 0.92, topY,          z],  // 갑판 좌현
       ];
       const base = positions.length / 3;
       ring.forEach((p) => positions.push(...p));
