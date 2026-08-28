@@ -403,17 +403,30 @@ class ChangePointDetector(Node):
                 if (now - last_seen) >= self.event_ttl:
                     dropped += 1
                     continue
+                # ★ 판정 진행상황은 되살리지 않는다 (2026-08-29 실측 사고).
+                #   종료 전 값을 그대로 되살리면 켜자마자 치워짐이 나간다:
+                #     now - last_seen  = 꺼져 있던 시간(수 분) >= min_unseen_s
+                #     max_departure    = 지난 세션에 쌓인 큰 값 >= min_departure_m
+                #     fov_seen         = 3초 이상이면 그대로 통과
+                #   -> 첫 _check_clear 에서 모든 조건이 참이 되어, 불이 눈앞에
+                #      있는데도 시동 몇 초 만에 "치워졌다" 를 보냈다.
+                #      min_unseen_s 도 min_departure_m 도 무력화된다.
+                #
+                #   되살릴 것은 "이 자리를 이미 보고했다" 는 사실뿐이다.
+                #   치워졌는지는 **이번 세션에 다시 확인해야 한다.**
+                #   last_seen 을 지금으로 두면 로봇이 한 바퀴 돌아 실제로
+                #   못 볼 때까지 기다린다 — 불이 진짜 없으면 그때 치워진다.
                 restored.append({
                     'class_id': ev['class_id'],
                     'event_id': ev['event_id'],
                     'x': float(ev['x']), 'y': float(ev['y']),
-                    'last_seen': last_seen,
+                    'last_seen': now,        # 판정 시계를 지금부터 다시
                     'seen_from': tuple(ev['seen_from']),
                     'seen_yaw': float(ev['seen_yaw']),
-                    'left_vantage': bool(ev['left_vantage']),
-                    'arrived_at': ev['arrived_at'],
-                    'fov_seen': float(ev.get('fov_seen', 0.0)),
-                    'max_departure': float(ev.get('max_departure', 0.0)),
+                    'left_vantage': False,   # 이번 세션에 다시 벗어나야 함
+                    'arrived_at': None,
+                    'fov_seen': 0.0,
+                    'max_departure': 0.0,    # 이번 세션에 다시 멀어졌다 와야 함
                 })
             except Exception:
                 dropped += 1
@@ -423,6 +436,9 @@ class ChangePointDetector(Node):
             self.get_logger().warn(
                 f"이전 세션 이벤트 {len(restored)}건 복원 — 이 자리들은 다시 "
                 f"멈추지 않는다: {ids}")
+            self.get_logger().warn(
+                "   치워졌는지는 이번 세션에 다시 확인한다 "
+                "(한 바퀴 돌며 못 보면 그때 치워짐 발행)")
         if dropped:
             self.get_logger().info(f"오래되거나 깨진 항목 {dropped}건은 버렸다")
 
