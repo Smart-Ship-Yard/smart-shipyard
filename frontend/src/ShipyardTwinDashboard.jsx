@@ -1747,26 +1747,51 @@ export default function ShipyardTwinDashboard() {
 
   // 서버 연결이 끊기거나 돌아오면 알린다.
   //
-  // ★ 서버가 끊기면 로봇 상태를 "모름"으로 되돌린다.
+  // ★ "아직 연결 시도 중" 과 "서버가 죽음" 을 구분해야 한다 (2026-08-29).
+  //   connected 는 useState(false) 로 시작한다. 이 false 는 "끊겼다" 가 아니라
+  //   "아직 붙기 전" 이다. 그런데 이것을 끊김으로 보면 페이지가 뜰 때마다
+  //   false -> true 전환이 일어나 **매번 "재연결되었습니다" 팝업이 떴다.**
+  //   확인을 누르면 새로고침되고 같은 일이 반복돼 팝업이 사라지지 않았다.
+  //
+  //   그래서 상태를 3단계로 든다: null(모름) / true / false.
+  //     · 모름 -> 연결됨      : 평상시 첫 연결. 아무 알림도 안 한다
+  //     · 모름 -> 유예 끝     : 그제서야 "끊김" 으로 확정하고 알린다
+  //     · 연결됨 -> 끊김      : 즉시 알린다
+  //     · 끊김 -> 연결됨      : 재연결 알린다
+  //
+  // ★ 서버가 끊기면 로봇 상태를 "모름" 으로 되돌린다.
   //   로봇 상태는 서버가 알려주는 것이라, 서버가 끊긴 뒤의 "로봇 연결됨" 은
-  //   지난 정보다. 확인할 길이 없는 것을 확인된 것처럼 두면 안 된다.
-  //   (상태만 바꾼다 — 로봇 팝업은 jetson_status 를 받을 때만 뜬다)
+  //   지난 정보다. (상태만 바꾼다 — 로봇 팝업은 jetson_status 를 받을 때만 뜬다)
   useEffect(() => {
-    const prev = serverConnectedRef.current;
-    serverConnectedRef.current = connected;
-
-    if (!connected) {
-      robotConnectedRef.current = null;
-      setRobotConnected(null);
-    }
-
-    // 첫 평가는 "변화"가 아니다. 다만 처음부터 끊겨 있으면 알려준다
-    // (로봇 알림과 같은 규칙 — 화면이 멀쩡해 보여서 모르고 지나치기 쉬우므로).
-    if (prev === null) {
-      if (!connected) setServerNotice(false);
+    if (connected) {
+      const wasDown = serverConnectedRef.current === false;
+      serverConnectedRef.current = true;
+      if (wasDown) setServerNotice(true);
       return;
     }
-    if (prev !== connected) setServerNotice(connected);
+
+    // 여기부터는 connected === false
+    robotConnectedRef.current = null;
+    setRobotConnected(null);
+
+    if (serverConnectedRef.current === true) {
+      // 붙어 있다가 끊겼다 — 확실하다. 바로 알린다.
+      serverConnectedRef.current = false;
+      setServerNotice(false);
+      return;
+    }
+    if (serverConnectedRef.current === false) return; // 이미 끊김으로 알린 상태
+
+    // 아직 한 번도 못 붙었다. 첫 연결이 늦는 것일 수 있으니 잠깐 기다렸다가
+    // 그래도 안 붙으면 그때 "끊김" 으로 확정한다 (서버가 꺼진 채로 대시보드를
+    // 여는 경우를 놓치지 않기 위함).
+    const t = setTimeout(() => {
+      if (serverConnectedRef.current === null) {
+        serverConnectedRef.current = false;
+        setServerNotice(false);
+      }
+    }, 4000);
+    return () => clearTimeout(t);
   }, [connected]);
 
   // 씬 초기화
