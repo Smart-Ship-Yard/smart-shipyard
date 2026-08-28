@@ -29,7 +29,26 @@ paths:
   # 로봇을 늘리면 ugv2, ugv3 이 설정 변경 없이 그대로 붙는다.
   all_others:
 
-# 녹화는 켜지 않는다.
-#   이전이 잘 됐는지 가려내기 어려워지고, H.264 640×360 기준 시간당 약 675MB
-#   (하루 약 16GB)라 recordDeleteAfter 를 반드시 함께 걸어야 한다.
-#   켤 때는 pathDefaults 에 record: true / recordDeleteAfter: 를 준다.
+# 재생(playback) API. 녹화한 것을 시각으로 잘라 꺼내려면 필요하다.
+#   http://192.168.0.5:9996/get?path=ugv1&start=<ISO시각>&duration=15
+#   이벤트의 timestamp 로 그 순간 영상을 뽑는 용도다.
+playback: true
+
+pathDefaults:
+  # ── 녹화 ──────────────────────────────────────────────────────────────
+  # ⚠️ recordDeleteAfter 없이 켜면 디스크가 찬다. 둘은 항상 같이 간다.
+  #
+  #   실측 1.2 Mbps (2026-08-29, 젯슨→서버 152 KB/s):
+  #     시간당 약 540 MB · 하루 약 13 GB
+  #
+  #   보관 48시간 = 약 26 GB. 이 노트북 여유가 93 GB 라 넉넉하다.
+  #   (7일로 잡으면 91 GB 라 디스크를 거의 다 먹는다 — 그래서 2일로 둔다.
+  #    어제 것까지 되짚어 볼 수 있으면 관제 용도로는 충분하다)
+  #
+  #   녹화 파일은 저장소 밖(~/mediamtx/recordings/)에 쌓인다.
+  #   systemd 유닛의 WorkingDirectory 가 ~/mediamtx 라 이 상대경로가 거기에 붙는다.
+  record: true
+  recordPath: ./recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordSegmentDuration: 1h
+  recordDeleteAfter: 48h

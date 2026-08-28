@@ -20,9 +20,12 @@ LAN=192.168.0.0/24
 ufw allow from "$LAN" to any port 8554 proto tcp comment 'mediamtx RTSP push (젯슨 -> 서버)'
 ufw allow from "$LAN" to any port 8889 proto tcp comment 'mediamtx WebRTC 시그널링/재생 페이지'
 ufw allow from "$LAN" to any port 8189 proto udp comment 'mediamtx WebRTC ICE 미디어 (빠뜨리면 검은 화면)'
+# 녹화 재생 API. 이벤트 시각으로 그 순간 영상을 뽑을 때 쓴다.
+# 녹화를 안 쓸 거면 이 줄은 없어도 된다.
+ufw allow from "$LAN" to any port 9996 proto tcp comment 'mediamtx 녹화 재생 API'
 
 echo
 echo "== 적용된 규칙 =="
-ufw status | grep -E '8554|8889|8189' || true
+ufw status | grep -E '8554|8889|8189|9996' || true
 echo
 echo "젯슨에서 확인:  nc -zv 192.168.0.5 8554   -> succeeded 가 나와야 함"
