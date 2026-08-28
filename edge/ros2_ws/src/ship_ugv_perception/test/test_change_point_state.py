@@ -17,8 +17,11 @@ from change_point import ChangePointDetector      # noqa: E402
 
 
 class FakeTime:
-    def __init__(self, ns):
+    # clock_type 을 흉내 내야 한다 — 복원 코드가 now.clock_type 을 읽어
+    # 되살린 Time 의 시계 종류를 맞추기 때문이다(2026-08-28 버그의 핵심).
+    def __init__(self, ns, clock_type='ROS_TIME'):
         self.nanoseconds = ns
+        self.clock_type = clock_type
 
     def __sub__(self, other):
         return FakeTime(self.nanoseconds - other.nanoseconds)
@@ -66,7 +69,8 @@ if __name__ == '__main__':
 
     # change_point.py 의 Time 을 테스트용으로 바꿔 끼운다 (rclpy 없이 돌리기 위해)
     import change_point
-    change_point.Time = lambda nanoseconds=0: FakeTime(nanoseconds)
+    change_point.Time = (lambda nanoseconds=0, clock_type='ROS_TIME':
+                         FakeTime(nanoseconds, clock_type))
 
     now = 1000 * S
     ttl = 600 * S
@@ -118,5 +122,35 @@ if __name__ == '__main__':
     e._restore_state()
     assert e.reported_events == [] and not e.logs
     print('  파일 없으면 조용히 빈 상태  OK')
+
+    # ★ 진짜 rclpy Time 으로도 확인한다 (2026-08-28).
+    #   위 FakeTime 은 clock_type 개념이 없어서, 실제로 터진 버그를 못 잡았다:
+    #       Time(nanoseconds=...) 의 기본은 SYSTEM_TIME
+    #       node.get_clock().now() 는 ROS_TIME
+    #       둘을 빼면 TypeError -> except 가 "깨진 항목" 으로 삼킴
+    #   그래서 기억 파일이 한 번도 복원되지 않았는데 테스트는 계속 통과했다.
+    #   **가짜로 대체한 바로 그 부분이 깨졌으면 테스트는 의미가 없다.**
+    try:
+        from rclpy.time import Time as RclTime
+        from rclpy.duration import Duration as RclDuration
+        from rclpy.clock import Clock, ClockType
+    except ImportError:
+        print('  (rclpy 없음 — 실제 Time 검증 건너뜀)')
+    else:
+        node_now = Clock(clock_type=ClockType.ROS_TIME).now()
+        # 복원이 하는 것과 똑같이 만든다
+        revived = RclTime(nanoseconds=node_now.nanoseconds - 60 * 10**9,
+                          clock_type=node_now.clock_type)
+        age = node_now - revived          # clock_type 이 다르면 여기서 TypeError
+        assert age.nanoseconds > 0
+        assert not (age >= RclDuration(seconds=600)), 'TTL 판정이 뒤집혔다'
+        print('  실제 rclpy Time 왕복 + TTL 비교  OK')
+
+        # clock_type 을 안 맞추면 정말로 터지는지 (회귀의 정확한 형태)
+        try:
+            _ = node_now - RclTime(nanoseconds=node_now.nanoseconds)
+            raise AssertionError('clock_type 이 달라도 뺄셈이 됐다 - 테스트가 무의미')
+        except TypeError:
+            print('  clock_type 안 맞추면 TypeError 나는 것 확인  OK')
 
     print('\n통과')

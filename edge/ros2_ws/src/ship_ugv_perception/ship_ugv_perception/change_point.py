@@ -296,7 +296,16 @@ class ChangePointDetector(Node):
         restored, dropped = [], 0
         for ev in saved:
             try:
-                last_seen = Time(nanoseconds=int(ev['last_seen_ns']))
+                # ★ clock_type 을 반드시 맞춘다 (2026-08-28 실측 버그).
+                #   Time(nanoseconds=...) 의 기본은 SYSTEM_TIME 인데 노드의
+                #   get_clock().now() 는 ROS_TIME 이다. 둘을 빼면
+                #       TypeError: Can't subtract times with different clock types
+                #   가 나고, 그걸 아래 except 가 "깨진 항목" 으로 삼켜서
+                #   **모든 이벤트가 조용히 버려졌다.** 기억 파일이 한 번도
+                #   복원된 적이 없었고, 재시작할 때마다 같은 불이 새 이벤트로
+                #   다시 등록돼 프론트에 핑이 겹쳐 쌓였다.
+                last_seen = Time(nanoseconds=int(ev['last_seen_ns']),
+                                 clock_type=now.clock_type)
                 if (now - last_seen) >= self.event_ttl:
                     dropped += 1
                     continue
