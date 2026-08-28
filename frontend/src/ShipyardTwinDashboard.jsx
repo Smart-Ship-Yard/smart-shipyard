@@ -1126,6 +1126,27 @@ class SceneManager {
       this.ugv.rotation.y = Math.cos(this.ugvT) >= 0 ? 0 : Math.PI;
     }
 
+    // 위험 구획 점멸.
+    //
+    // ★ 왜 필요한가 (2026-08-28)
+    //   재접속 복원으로 되살아난 위험은 팝업을 띄우지 않는다(그래야 새로고침할
+    //   때마다 팝업이 연달아 뜨지 않는다). 그러면 화면에 눈길을 끄는 것이 없어
+    //   "빨간 구획이 있다"는 사실을 놓치기 쉽다. 숨쉬듯 밝기가 오르내리면
+    //   가만히 빨간 것보다 훨씬 빨리 눈에 들어온다.
+    //
+    //   박자는 핑(_tick 아래 blink)과 같은 0.012 를 쓰고, 구획별 시각이 아니라
+    //   전역 시각 t 로 계산한다 — 위험 구획이 여러 곳일 때 따로 놀지 않고 함께
+    //   숨쉬어야 어수선해 보이지 않는다.
+    //
+    //   밝기만 흔든다. 색(빨강)과 위치(선택 시 살짝 띄움)는 _applyBlockLook 이
+    //   정한 그대로 둔다.
+    const dangerBlink = Math.sin(t * 0.012) * 0.5 + 0.5; // 0~1
+    this.blockMeshes.forEach((rec, id) => {
+      if (!rec.mesh.userData.danger) return; // 위험이 아니면 _applyBlockLook 값 그대로
+      const base = this._selectedBlockId === id ? 0.9 : 0.6;
+      rec.mesh.material.emissiveIntensity = base * (0.35 + dangerBlink * 0.65);
+    });
+
     // Ping 애니메이션 + 만료 처리
     this.pings = this.pings.filter((p) => {
       const age = t - p.born;
