@@ -292,6 +292,24 @@ DANGER_TYPES = {SHIP_DEFECT, NO_HELMET, FALLEN_PERSON, FIRE}
 #     문자열 비교가 곧 시간 비교가 된다.
 SERVER_STARTED_AT = datetime.now(KST)
 
+# 젯슨이 "이건 아직 살아있다"고 알려준 이벤트 id 들.
+#
+# ★ 왜 필요한가 (2026-08-29)
+#   젯슨은 서버에 (재)연결할 때 지금 살아있는 위험을 replay:true 로 다시 보낸다.
+#   그 메시지는 **DB에 저장하지 않는다** — 이미 있는 이벤트의 중복 기록이고,
+#   실제로 그 시각에 감지된 것도 아니라 감사 기록을 흐린다.
+#
+#   그런데 저장을 안 하면 구멍이 하나 생긴다. 서버를 재시작한 뒤라면 그 이벤트의
+#   원래 DB 기록은 SERVER_STARTED_AT 아래에 있어 복원 대상이 아니다. 그래서
+#   젯슨 재통보로 핑은 떴는데 **브라우저를 새로고침하면 사라진다.**
+#
+#   그래서 저장하는 대신 "젯슨이 살아있다고 한 것" 을 여기 기억해두고, 복원할 때
+#   시각 바닥과 무관하게 함께 꺼내온다. DB 는 그대로 두고 판정만 넓히는 것이다.
+#
+#   젯슨이 이 판정의 주인이다 — 로봇이 그 자리를 다시 보고 확인하므로 며칠 전
+#   기록보다 훨씬 믿을 만하다. 젯슨 연결이 새로 열리면 통째로 비우고 다시 채운다.
+jetson_live_event_ids: set = set()
+
 
 async def _active_danger_events(limit: int = 300):
     """지금도 살아있는 위험 이벤트를 오래된 순으로 돌려준다.
@@ -308,9 +326,13 @@ async def _active_danger_events(limit: int = 300):
     cutoff = SERVER_STARTED_AT.isoformat()
     docs = await event_collection.find({
         "event_type": {"$in": list(DANGER_TYPES) + [EVENT_CLEARED]},
-        # timestamp 는 서버가 저장할 때 붙이는 ISO 문자열이라 사전순 비교가
-        # 곧 시간순 비교다. 필드가 없는 구버전 문서는 여기서 함께 걸러진다.
-        "timestamp": {"$gte": cutoff},
+        "$or": [
+            # timestamp 는 서버가 저장할 때 붙이는 ISO 문자열이라 사전순 비교가
+            # 곧 시간순 비교다. 필드가 없는 구버전 문서는 여기서 함께 걸러진다.
+            {"timestamp": {"$gte": cutoff}},
+            # 서버가 켜지기 전 기록이어도, 젯슨이 아직 살아있다고 한 것은 꺼낸다.
+            {"event_id": {"$in": list(jetson_live_event_ids)}},
+        ],
     }).sort("_id", -1).to_list(length=limit)
     docs.reverse()                      # 오래된 것부터 훑어야 등록/해제 순서가 맞다
 
@@ -807,6 +829,9 @@ async def websocket_jetson(websocket: WebSocket):
     # 서버→젯슨 방향(webrtc_signal·event_ack 전달)에 쓸 수 있도록 연결을 기억해 둠.
     # 재접속 등으로 새 연결이 오면 마지막 연결이 이전 것을 덮어씀.
     jetson_connection = websocket
+    # 새 연결은 곧바로 "살아있는 위험" 묶음을 재통보한다. 옛 목록을 비워두고
+    # 그것으로 다시 채워야 젯슨이 이미 잊은 이벤트가 남지 않는다.
+    jetson_live_event_ids.clear()
     print("🚗 [젯슨 RC카] 연결됨 — 현재 접속 중")
 
     try:
@@ -832,6 +857,17 @@ async def websocket_jetson(websocket: WebSocket):
             # 🚨 [DB 저장 로직] 팀이 합의한 저장 대상(위험 이벤트 4종 +
             # BLOCK_LEVEL 단계 변화 + SHIP_POSE 배 위치)만 DB에 영구 저장한다.
             # (평상시 위치 핑 등 그 외 메시지는 저장하지 않고 브로드캐스트만 함)
+            # 📣 젯슨 재연결 시 "아직 살아있다" 재통보 (replay:true).
+            #   저장하지 않는다 — 이미 있는 이벤트의 중복 기록이 되고, 실제로
+            #   그 시각에 감지된 것도 아니라 감사 기록을 흐린다.
+            #   대신 생존 목록에 넣어 복원 판정이 시각 바닥을 넘어 꺼내오게 한다.
+            if data.get("replay") and event_type in DANGER_TYPES:
+                eid = data.get("event_id")
+                if eid:
+                    jetson_live_event_ids.add(eid)
+                await manager.broadcast(data)
+                continue
+
             if event_type in LOGGED_EVENT_TYPES:
                 # 서버 수신 시각을 timestamp 필드로 추가 (감사/증빙 자료 용도).
                 # 한국 표준시 + 오프셋 명시(+09:00 포함 ISO 8601)로 기록 —
@@ -849,6 +885,11 @@ async def websocket_jetson(websocket: WebSocket):
                 #   broadcast() 에도 쓰이는데, 저장이 백그라운드로 도는 동안
                 #   원본이 바뀌면 엉뚱한 값이 저장될 수 있다.
                 schedule_save(data.copy())
+
+            # 치워졌다고 하면 생존 목록에서도 뺀다 — 안 그러면 시각 바닥을
+            # 넘어 계속 꺼내오는 유령이 된다.
+            if event_type == EVENT_CLEARED and data.get("event_id"):
+                jetson_live_event_ids.discard(data["event_id"])
 
             # DB 저장 여부와 관계없이, 프론트엔드에는 지연 없이 즉시 브로드캐스트.
             await manager.broadcast(data)
