@@ -45,11 +45,11 @@ DT = 0.5   # clear_check_hz 2.0
 
 
 def cv(dist, yawd=0.0, last_seen=0.0, now=100.0, left=True, arrived=None,
-       in_fov=True, fov=99.0):
+       in_fov=True, fov=99.0, maxdep=99.0, mindep=0.8, unseen=25.0):
     """기본은 '카메라가 계속 보고 있었다'(fov 충분). 그래야 예전 케이스가
     그대로 성립하고, FOV 관련 케이스만 따로 값을 준다."""
     return clear_verdict(dist, yawd, last_seen, now, RV, YT, G, left, arrived,
-                         in_fov, fov, DT)
+                         in_fov, fov, DT, maxdep, mindep, unseen)
 
 
 IN, OUT = 0.1, 1.0        # 구역 안 / 밖 거리
@@ -109,7 +109,7 @@ if __name__ == '__main__':
     watched_since = ev['arrived_at']          # ★ 덮어쓰기 전에 붙잡아 둔다
     verdict, ev['left_vantage'], ev['arrived_at'], _ = clear_verdict(
         OUT, 0.0, 50.0, 100.0 + G + 1, RV, YT, G,
-        ev['left_vantage'], ev['arrived_at'], True, 99.0, DT)
+        ev['left_vantage'], ev['arrived_at'], True, 99.0, DT, 99.0, 0.8, 0.0)
     assert verdict == 'clear'
     assert ev['arrived_at'] is None, 'clear 뒤엔 arrived_at 이 None 이어야 한다'
     # 예전 코드가 하던 계산 — 이게 죽음의 원인이었다
@@ -142,6 +142,31 @@ if __name__ == '__main__':
     _v, _, _, fov = cv(dist=IN, left=True, arrived=100.0, in_fov=True, fov=1.0)
     assert abs(fov - 1.5) < 1e-9, f'FOV 시간이 안 쌓인다: {fov}'
     print('  카메라가 향한 동안만 FOV 시간이 쌓임  OK')
+
+    # ★ 사고 재현 ⑧(2026-08-29 실측): 등록 6초 만에 치워짐 판정이 났다.
+    #   불을 등록하면 로봇이 멈추는데, 그 정지 지점이 seen_from 에서 약
+    #   0.35m 라 revisit_radius 경계를 들락날락한다. 들어올 때마다
+    #   arrived_at 이 새로 찍히고, last_seen(=등록 시각)은 항상 그보다
+    #   앞서므로 조건이 성립해버렸다. 한 바퀴가 50초인데 6초 만이었다.
+    #   -> 등록 이후 실제로 멀어진 최대 거리를 요구한다.
+    v, _, _, _f = cv(dist=OUT, last_seen=50.0, now=100.0 + G + 1,
+                     left=True, arrived=100.0, maxdep=0.36)
+    check('정지 중 경계 진동만 함 -> 판정 안 함', v, 'wait')
+
+    v, _, _, _f = cv(dist=OUT, last_seen=50.0, now=100.0 + G + 1,
+                     left=True, arrived=100.0, maxdep=2.0)
+    check('한 바퀴 돌아 2m 멀어졌다 옴 -> 확정', v, 'clear')
+
+    # ★ 사고 재현 ⑨: 18.5초 안 보였다고 치웠는데 8초 뒤 같은 자리(4cm)에서
+    #   다시 잡혔다. 배에 가려 있었을 뿐이다. 정상 치워짐은 39~52초 걸리므로
+    #   25초 문턱은 정상을 막지 않는다.
+    v, _, _, _f = cv(dist=OUT, last_seen=100.0, now=100.0 + 18.5,
+                     left=True, arrived=100.0 - 1, maxdep=2.0)
+    check('18.5초만 안 보임 -> 가림일 수 있어 판정 안 함', v, 'wait')
+
+    v, _, _, _f = cv(dist=OUT, last_seen=100.0, now=100.0 + 40,
+                     left=True, arrived=100.0 + 1, maxdep=2.0)
+    check('40초 안 보임 -> 확정', v, 'clear')
 
     # angle_diff 는 -pi~pi 로 감싼다
     assert abs(angle_diff(math.radians(350), math.radians(10)) - math.radians(20)) < 1e-9

@@ -36,7 +36,8 @@ def angle_diff(a, b):
 
 def clear_verdict(dist_to_vantage_m, yaw_diff_rad, last_seen_s, now_s,
                   revisit_radius_m, revisit_yaw_tol_rad, revisit_grace_s,
-                  left_vantage, arrived_at_s, event_in_fov, fov_seen_s, dt_s):
+                  left_vantage, arrived_at_s, event_in_fov, fov_seen_s, dt_s,
+                  max_departure_m=None, min_departure_m=0.0, min_unseen_s=0.0):
     """치워졌는지 판정. 반환 (verdict, left_vantage, arrived_at_s, fov_seen_s).
 
     ★ 2026-08-27 실측 사고: "구역 안에 머문 시간" 으로 세면 안 된다.
@@ -51,15 +52,48 @@ def clear_verdict(dist_to_vantage_m, yaw_diff_rad, last_seen_s, now_s,
       그래서 **카메라가 실제로 그 이벤트 방향을 향한 시간(fov_seen_s)** 만
       센다. 등 돌리고 서 있는 시간은 0초로 친다. in_camera_fov() 는 예전에
       이 목적으로 만들어 놓고도 **아무 데서도 부르지 않는 죽은 코드**였다.
+
+    ★ 2026-08-29 실측 사고: 등록 6초 만에 치워짐 판정이 났다.
+
+      한 바퀴가 50초인데 6초 만에 "그 자리를 떠났다 돌아왔다" 가 성립했다.
+      실제로 일어난 일:
+
+          불 등록 -> event_gate 가 로봇을 세움
+            -> 로봇이 seen_from 에서 약 0.35 m 지점에 멈춤
+            -> revisit_radius(0.35) 경계를 들락날락
+            -> 들어올 때마다 arrived_at 이 새로 찍힘
+            -> last_seen(=등록 시각) < arrived_at 은 항상 참
+            -> 각도는 맞으니 FOV 시간이 3초 차서 확정
+
+      left_vantage 가 "0.35 m 만 벗어나면 떠난 것" 으로 판정하는 것이
+      문제였다. 정지하며 경계를 넘나드는 것을 한 바퀴로 착각한다.
+
+      또 다른 사례는 가림이었다 — 18.5초 안 보였다고 치웠는데 8초 뒤
+      같은 자리(4 cm)에서 다시 잡혔다.
+
+      -> 두 조건을 더한다:
+         ① min_departure_m  등록 이후 seen_from 에서 이만큼은 실제로
+            멀어진 적이 있어야 한다. 정지 중 경계 진동으로는 못 채운다
+            (한 바퀴 돌면 2 m 벌어진다).
+         ② min_unseen_s     이만큼 연속으로 안 보여야 한다. 오판 사례가
+            18.5초였고 정상 치워짐은 39~52초라 25초면 정상은 안 막는다.
     """
     tick = dt_s if event_in_fov else 0.0
+
+    # ★ 조건 두 개 추가 (2026-08-29 실측 사고). 아래 docstring 참고.
+    #   ① 진짜로 멀리 갔다 와야 한다   ② 충분히 오래 안 보여야 한다
+    went_far = (max_departure_m is not None
+                and max_departure_m >= min_departure_m)
+    unseen_long = (now_s - last_seen_s) >= min_unseen_s
 
     if dist_to_vantage_m > revisit_radius_m:
         # 구역 밖 — 이번 방문이 끝난 시점이다. 여기서만 판정한다.
         if (left_vantage
                 and arrived_at_s is not None
                 and fov_seen_s >= revisit_grace_s
-                and last_seen_s < arrived_at_s):
+                and last_seen_s < arrived_at_s
+                and went_far
+                and unseen_long):
             return 'clear', True, None, 0.0
         return 'wait', True, None, 0.0
     if not left_vantage:
@@ -195,6 +229,10 @@ class ChangePointDetector(Node):
         self.declare_parameter('revisit_radius_m', 0.35)    # 이만큼 가까우면 "그 자리로 돌아왔다"
         self.declare_parameter('revisit_yaw_tol_deg', 45.0) # 헤딩도 비슷해야 카메라가 같은 곳을 본다
         self.declare_parameter('revisit_grace_s', 3.0)      # 그 자리에서 이만큼 안 보이면 확정
+        # ★ 2026-08-29 — 등록 6초 만에 오판하던 것을 막는다
+        #   (자세한 이유는 clear_verdict docstring 참고)
+        self.declare_parameter('min_departure_m', 0.8)   # 실제로 이만큼 멀어졌다 와야 함
+        self.declare_parameter('min_unseen_s', 25.0)     # 이만큼 연속으로 안 보여야 함
         # ★ 새 이벤트는 이만큼 연속으로 같은 자리에서 봐야 등록한다 (2026-08-27).
         #   단발 오측정 하나가 곧바로 로봇을 세우는 것을 막는다.
         self.declare_parameter('new_event_confirm_frames', 2)
@@ -237,6 +275,8 @@ class ChangePointDetector(Node):
         self.revisit_yaw_tol = math.radians(
             self.get_parameter('revisit_yaw_tol_deg').value)
         self.revisit_grace = self.get_parameter('revisit_grace_s').value
+        self.min_departure = float(self.get_parameter('min_departure_m').value)
+        self.min_unseen = float(self.get_parameter('min_unseen_s').value)
         self.new_confirm = int(self.get_parameter('new_event_confirm_frames').value)
         self.new_window = float(self.get_parameter('new_event_confirm_window_s').value)
         self._pending = []   # 아직 확정 안 된 새 이벤트 후보
@@ -319,6 +359,7 @@ class ChangePointDetector(Node):
                     'left_vantage': bool(ev['left_vantage']),
                     'arrived_at': ev['arrived_at'],
                     'fov_seen': float(ev.get('fov_seen', 0.0)),
+                    'max_departure': float(ev.get('max_departure', 0.0)),
                 })
             except Exception:
                 dropped += 1
@@ -341,6 +382,7 @@ class ChangePointDetector(Node):
                 'seen_from': list(e['seen_from']), 'seen_yaw': e['seen_yaw'],
                 'left_vantage': e['left_vantage'], 'arrived_at': e['arrived_at'],
                 'fov_seen': e.get('fov_seen', 0.0),
+                'max_departure': e.get('max_departure', 0.0),
             } for e in self.reported_events]
             os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
             # 원자적 교체 — 쓰는 도중에 죽어도 파일이 깨지지 않는다.
@@ -418,13 +460,19 @@ class ChangePointDetector(Node):
             fov_before = ev['fov_seen']
             in_fov = in_camera_fov(robot_yaw, self.cam_yaw, self.hfov,
                                    rx, ry, ev['x'], ev['y'])
+            dist_v = math.hypot(rx - ev['seen_from'][0], ry - ev['seen_from'][1])
+            # 등록 이후 실제로 얼마나 멀어졌었는지 기억한다 (되돌아오지 않음)
+            if dist_v > ev.get('max_departure', 0.0):
+                ev['max_departure'] = dist_v
             verdict, ev['left_vantage'], ev['arrived_at'], ev['fov_seen'] = clear_verdict(
-                math.hypot(rx - ev['seen_from'][0], ry - ev['seen_from'][1]),
+                dist_v,
                 angle_diff(robot_yaw, ev['seen_yaw']),
                 ev['last_seen'].nanoseconds / 1e9, now_s,
                 self.revisit_radius, self.revisit_yaw_tol, self.revisit_grace,
                 ev['left_vantage'], ev['arrived_at'],
-                in_fov, ev['fov_seen'], self._clear_dt)
+                in_fov, ev['fov_seen'], self._clear_dt,
+                ev.get('max_departure', 0.0), self.min_departure,
+                self.min_unseen)
 
             if verdict != 'clear':
                 survivors.append(ev)
@@ -444,7 +492,10 @@ class ChangePointDetector(Node):
             self.get_logger().info(
                 f"  근거: 카메라가 그쪽을 본 시간 {fov_before:.1f}초"
                 f"(>={self.revisit_grace}초 필요), 구역 체류 {watched}, "
-                f"마지막 검출은 도착보다 {now_s - ev['last_seen'].nanoseconds/1e9:.1f}초 전")
+                f"마지막 검출은 {now_s - ev['last_seen'].nanoseconds/1e9:.1f}초 전"
+                f"(>={self.min_unseen:.0f}초 필요), "
+                f"최대 이탈거리 {ev.get('max_departure', 0.0):.2f}m"
+                f"(>={self.min_departure:.1f}m 필요)")
             self.get_logger().info(
                 f"[{ev['class_id']}] 치워짐 확인 — event_id={ev['event_id']} "
                 f"(처음 본 자리로 돌아와 {watched} 지켜봤는데 안 보임)")
@@ -612,6 +663,7 @@ class ChangePointDetector(Node):
             'left_vantage': False,             # 그 자리를 한 번 벗어났는지
             'arrived_at': None,                # 이번에 그 자리에 도착한 시각
             'fov_seen': 0.0,                   # 이번 방문에서 카메라가 실제로 그쪽을 본 시간
+            'max_departure': 0.0,              # 등록 이후 seen_from 에서 벌어진 최대 거리
         })
 
         position_uncertainty_m = self._estimate_position_uncertainty()
