@@ -524,39 +524,71 @@ function connectEventSource(onEvent) {
  *    공정률을 바꿀지 등)는 이 함수 밖에서 판단한다 — 서버 스펙이 바뀌어도
  *    이 연결 함수 자체는 손댈 필요가 없게 하기 위함.
  * ------------------------------------------------------------------------- */
-function connectRealEventSource(url, handlers) {
-  let ws;
-  try {
-    ws = new WebSocket(url);
-  } catch (e) {
-    console.error("WebSocket 연결 생성 실패:", e);
-    handlers.onClose?.();
-    return () => {};
-  }
+function connectRealEventSource(url, handlers, { retryMs = 2000 } = {}) {
+  // ★ 끊기면 스스로 다시 붙는다 (2026-08-29 추가).
+  //   예전에는 소켓을 한 번만 열었다. 그래서 백엔드를 다시 켜도 대시보드는
+  //   영영 다시 붙지 않았고, 사람이 새로고침해야 데이터가 들어왔다.
+  //   "서버와 재연결되었습니다" 팝업이 안 뜨던 것도 이 때문이다 —— 재연결
+  //   자체가 일어나지 않았다.
+  //
+  //   간격은 고정 2초다. 지수 백오프를 쓰지 않는 이유는, 같은 공유기 안의
+  //   서버라 몇 초 안에 돌아오는 것이 보통이고, 백오프가 길어지면 시연 중에
+  //   "서버는 켰는데 화면이 한참 안 돌아오는" 상황이 되기 때문이다.
+  let ws = null;
+  let timer = null;
+  let closed = false;   // 사용자가 화면을 떠난 경우 — 더 이상 재시도하지 않는다
 
-  ws.onopen = () => handlers.onOpen?.();
-  ws.onclose = () => handlers.onClose?.();
-  ws.onerror = (e) => {
-    console.error("WebSocket 오류 (서버가 꺼져있거나 IP/포트가 다를 수 있음):", e);
-    handlers.onError?.(e);
+  const schedule = () => {
+    if (closed || timer) return;
+    timer = setTimeout(() => { timer = null; open(); }, retryMs);
   };
-  ws.onmessage = (msg) => {
-    let data;
+
+  const open = () => {
+    if (closed) return;
     try {
-      data = JSON.parse(msg.data);
+      ws = new WebSocket(url);
     } catch (e) {
-      console.warn("이벤트 파싱 실패, 무시:", msg.data);
+      console.error("WebSocket 연결 생성 실패:", e);
+      handlers.onClose?.();
+      schedule();
       return;
     }
-    handlers.onMessage?.(data);
+
+    ws.onopen = () => handlers.onOpen?.();
+    ws.onclose = () => {
+      handlers.onClose?.();
+      schedule();          // 끊기면 곧바로 다음 시도를 예약
+    };
+    ws.onerror = (e) => {
+      console.error("WebSocket 오류 (서버가 꺼져있거나 IP/포트가 다를 수 있음):", e);
+      handlers.onError?.(e);
+      // onerror 뒤에는 onclose 가 따라오므로 여기서 schedule 하지 않는다
+      // (하면 재시도가 두 배로 쌓인다)
+    };
+    ws.onmessage = (msg) => {
+      let data;
+      try {
+        data = JSON.parse(msg.data);
+      } catch (e) {
+        console.warn("이벤트 파싱 실패, 무시:", msg.data);
+        return;
+      }
+      handlers.onMessage?.(data);
+    };
   };
+
+  open();
 
   // 반환값은 그대로 "닫는 함수"라 기존 호출부(off())를 안 건드려도 되지만,
   // 함수도 객체라 속성을 붙일 수 있어서 off.send(obj)로 같은 소켓에 메시지도
   // 보낼 수 있게 해준다 (event_ack 등 — 새 연결 필요 없음).
-  const close = () => ws.close();
+  const close = () => {
+    closed = true;
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (ws) ws.close();
+  };
   close.send = (obj) => {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(obj));
     } else {
       console.warn("[이벤트 채널] 소켓이 열려있지 않아 전송 실패:", obj);
