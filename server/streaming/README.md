@@ -1,0 +1,131 @@
+# 중앙 미디어 서버 (mediamtx)
+
+서버 노트북(**192.168.0.5**, 공유기에서 고정 IP)에서 도는 영상 중계 서버.
+**백엔드(FastAPI)와는 완전히 별개 프로세스다.**
+
+```
+젯슨 ──H.264 1개, RTSP push──▶ mediamtx(여기) ──WebRTC──▶ 브라우저 N명
+        rtsp://192.168.0.5:8554/ugv1        http://192.168.0.5:8889/ugv1
+```
+
+2026-08-28 에 mediamtx 를 젯슨에서 이리로 옮겼다. 프로토콜도 부품도 그대로고
+**위치만 바뀌었다.** 옮긴 이유와 배경은 [`docs/interface.md`](../../docs/interface.md) ⑤ 참조.
+
+| | 옮기기 전 | 지금 |
+|---|---|---|
+| 시청자 2명 → 젯슨 부하 | 스트림 2개를 젯슨이 뿌림 | 젯슨은 항상 1개 |
+| 다른 망에서 접속 | 불가 | 서버만 열면 됨 |
+| 젯슨 CPU | 0.43 코어 | 0.42 코어 |
+
+---
+
+## 설치 (이 노트북 = Ubuntu 22.04 / x86_64)
+
+바이너리는 55MB 라 저장소에 넣지 않는다. 홈에 풀어둔다:
+
+```bash
+mkdir -p ~/mediamtx && cd ~/mediamtx
+curl -sL -o mediamtx.tar.gz \
+  https://github.com/bluenviron/mediamtx/releases/download/v1.20.1/mediamtx_v1.20.1_linux_amd64.tar.gz
+tar xzf mediamtx.tar.gz && rm mediamtx.tar.gz
+./mediamtx --version      # v1.20.1
+```
+
+설정은 이 폴더의 `mediamtx.yml` 을 쓴다 (git pull 하면 설정도 같이 따라온다).
+
+> 젯슨의 `edge/streaming/mediamtx.yml` 은 38KB 짜리 배포판 원본인데 실제로 바꾼
+> 값이 하나도 없었다. 그대로 복사하면 "우리가 무엇을 정했는지"가 주석 더미에
+> 파묻히므로, 여기서는 정한 것만 남기고 나머지는 기본값에 맡겼다.
+> 동작은 같다. 기본값 전체는 `~/mediamtx/mediamtx.yml` 에 있다.
+
+## 방화벽 — 여기서 제일 많이 막힌다
+
+```bash
+sudo bash server/streaming/setup-firewall.sh
+```
+
+| 포트 | 방향 | 쓰임 |
+|---|---|---|
+| 8554/tcp | 젯슨 → 서버 | RTSP push |
+| 8889/tcp | 브라우저 → 서버 | WebRTC 시그널링 + 재생 페이지 |
+| **8189/udp** | 브라우저 ↔ 서버 | **WebRTC ICE 미디어** |
+
+> ### ⚠️ 8189/udp 를 빠뜨리면 검은 화면이 된다
+>
+> 8889 만 열면 **재생 페이지는 정상적으로 뜨는데 영상이 영원히 안 나온다.**
+> WebRTC 는 시그널링만 8889(HTTP)로 하고, 실제 영상은 ICE 로 뚫은 UDP 로 흐르기
+> 때문이다. 에러 메시지도 없어서 젯슨 송출 문제로 착각하기 쉽다.
+>
+> 젯슨 쪽 인계 문서에는 8554/8889 두 개만 적혀 있었다. 세 개다.
+
+`setup-firewall.sh` 는 인터넷 전체가 아니라 **같은 공유기 안(192.168.0.0/24)만**
+허용한다. 지금은 인증이 없으므로 이 제한이 유일한 방어선이다 (아래 참조).
+
+확인:
+
+```bash
+# 젯슨에서
+nc -zv 192.168.0.5 8554      # succeeded 가 나와야 함
+```
+
+## 상시 실행 (systemd)
+
+```bash
+sudo cp server/streaming/mediamtx.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now mediamtx
+
+systemctl status mediamtx
+journalctl -u mediamtx -f        # 젯슨이 붙으면 여기 로그가 뜬다
+```
+
+수동 실행 (디버깅용):
+
+```bash
+~/mediamtx/mediamtx ~/smart-shipyard/server/streaming/mediamtx.yml
+```
+
+## 검증 순서
+
+순서를 지켜야 어디서 막혔는지 가려낼 수 있다.
+
+1. **서버에서 mediamtx 를 띄운다** → `journalctl -u mediamtx -f` 를 켜둔다
+2. **방화벽을 연다** → 젯슨에서 `nc -zv 192.168.0.5 8554` 가 succeeded
+3. **젯슨이 송출 목적지를 바꾸고 재시작** (젯슨 담당)
+   ```bash
+   sudo systemctl edit --full video-streamer   # Environment= 주석 풀고 서버 IP
+   sudo systemctl disable --now mediamtx        # 젯슨 mediamtx 내림
+   ```
+   → 서버 로그에 `[RTSP] [session ...] created by 192.168.0.6` 가 떠야 한다
+4. **브라우저로 `http://192.168.0.5:8889/ugv1` 을 직접 연다**
+   → **여기서 영상이 나와야 한다.** 안 나오면 방화벽(특히 8189/udp)이나 젯슨 송출 문제다.
+   대시보드를 열어보는 것은 그다음이다 — 한 번에 열면 원인이 둘로 갈린다
+5. **대시보드**를 열어 영상 패널 확인
+6. **탭 두세 개로 동시에** 열고 젯슨 CPU 를 본다
+   → 시청자가 늘어도 젯슨 CPU 가 안 오르는 것이 이번 작업의 목적이다
+
+## 되돌리기
+
+1. 프론트 `DIRECT_CAMERA_URL` 을 `http://192.168.0.6:8889/ugv1` 로 되돌린다
+2. 젯슨에서 `Environment=RTSP_URL=...` 줄을 다시 주석 처리
+3. 젯슨에서 `sudo systemctl enable --now mediamtx`
+
+## 하지 말 것
+
+- **녹화를 같이 켜지 말 것.** 이전이 잘 됐는지 못 가린다. 나중에 따로.
+  (H.264 640×360 기준 하루 약 16GB — 켤 때 `recordDeleteAfter` 필수)
+- **mediamtx 에만 비밀번호를 걸지 말 것.** 백엔드에 인증이 없어서 프론트 소스에
+  그 비밀번호가 그대로 박힌다. 백엔드 로그인이 생기면 그때
+  `authMethod: http` + `authHTTPAddress` 로 백엔드에 물어보게 묶는다.
+- **백엔드(FastAPI)로 영상을 중계하지 말 것.** MJPEG 이 되어 대역폭이 3~5배가
+  되고 혼잡 제어를 잃는다.
+
+## ⚠️ 인증이 없다
+
+지금은 **같은 망의 누구나 보고, 누구나 송출할 수 있다.** 방화벽의
+`192.168.0.0/24` 제한이 유일한 방어선이다. 현장 적용 전 반드시 막을 것.
+
+## 참고 — 포트가 백엔드와 겹쳐 보이는 것
+
+`ss -lntup` 을 보면 mediamtx 가 **UDP 8000** 을 잡고 있다. 백엔드는 **TCP 8000**
+이라 서로 다른 소켓이고 충돌하지 않는다. 놀라지 말 것.
