@@ -7,16 +7,20 @@ main.py — 스마트 조선소 FastAPI 백엔드 서버
               프론트엔드(React+Three.js 대시보드)로 즉시 브로드캐스트
             - 위험 이벤트 4종 + block_level + ship_pose는 MongoDB에 영구 로그 저장
             - WebRTC 시그널링(webrtc_signal) 쪽지를 프론트↔젯슨 양방향 중계
-              (영상은 WebRTC P2P 직결로 변경 — 2026-07-10 팀 결정)
-            - 실시간 영상(JPEG 바이너리) 중계 채널은 P2P 실패 시 폴백용으로 유지
-            - 프론트의 stream_boost(영상 화질 전환) 명령을 젯슨으로 전달
+            - 감지 순간 스냅샷을 파일로 저장하고 /snapshots 로 서빙
             - REST API로 대시보드 초기 로딩 데이터 및 과거 이벤트 이력 제공
 
-웹소켓 채널 4개 (통신 스펙 v1.2 = docs/interface.md 참조):
-    /ws/jetson           젯슨 JSON 채널 (이벤트 수신 + stream_boost 송신)
-    /ws/frontend         프론트 JSON 채널 (이벤트 브로드캐스트 + stream_boost 수신)
-    /ws/jetson-stream    젯슨 영상 채널 (JPEG 바이너리 수신)
-    /ws/frontend-stream  프론트 영상 채널 (JPEG 바이너리 브로드캐스트)
+웹소켓 채널 2개 (통신 스펙 = docs/interface.md 참조):
+    /ws/jetson           젯슨 JSON 채널 (이벤트 수신 + 서버→젯슨 쪽지 송신)
+    /ws/frontend         프론트 JSON 채널 (이벤트 브로드캐스트 + 쪽지 수신)
+
+★ 영상은 이 FastAPI 프로세스를 거치지 않는다.
+  젯슨이 H.264 로 한 번만 인코딩해 rtsp://192.168.0.5:8554/ugv1 로 밀어올리면,
+  같은 노트북에서 도는 **별개 프로세스 mediamtx** 가 받아 브라우저들에게 WebRTC 로
+  뿌린다. 이 서버는 영상 바이트를 아예 만지지 않는다.
+  설치·방화벽은 server/streaming/README.md, 배경은 docs/interface.md ⑤ 참조.
+
+  ※ mediamtx 가 UDP 8000 을 잡는다. 이 서버는 TCP 8000 이라 충돌하지 않는다.
 
 작성자     : 이정기 (Backend & Streaming Engineer)
 작성일     : 2026-07-06
@@ -41,6 +45,10 @@ main.py — 스마트 조선소 FastAPI 백엔드 서버
 """
 
 import asyncio
+# 젯슨이 보내는 스냅샷은 base64 문자열이라 원래 바이트로 되돌려야 하고,
+# 파일 이름은 event_id 를 해시해서 만든다 (아래 [이벤트 스냅샷 구역] 참조).
+import base64
+import hashlib
 import json
 import os
 # python-dotenv 패키지: .env 파일에 적힌 키=값 쌍을 읽어서
@@ -52,6 +60,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 # 다른 도메인(프론트엔드)에서의 API 요청을 허용해주는 미들웨어
 from fastapi.middleware.cors import CORSMiddleware
+
+# 저장해둔 스냅샷 사진을 그냥 URL 로 꺼내 쓸 수 있게 해주는 정적 파일 서빙
+from fastapi.staticfiles import StaticFiles
 
 # MongoDB를 비동기(async)로 다루기 위한 motor 라이브러리의 클라이언트
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -85,16 +96,15 @@ SHIP_POSE = "ship_pose"          # 배 위치 측량 결과 (block_id, map_xy, y
 # (이 메시지 자체의 event_type 은 "event_cleared" 고정이라 종류를 따로 실어야 함).
 EVENT_CLEARED = "event_cleared"
 
-# 프론트→서버→젯슨 방향 명령 (DB 저장 대상 아님).
-# 프론트가 영상 팝업을 열/닫을 때 젯슨의 영상 화질을 전환시키는 명령.
+# 감지 순간의 사진 (젯슨→서버, 2026-08-28).
+# 위험 이벤트 3종(fire/fallen_person/no_helmet)을 보낸 **직후 별도 메시지**로
+# 오며, 그 이벤트와 event_id 가 정확히 같다. 필드: block_id, event_id, cls,
+# image_b64(검출 박스 + 사방 40px 여백을 자른 JPEG, 보통 10~40KB).
+# 중복 제거를 통과한 새 이벤트에만 오므로 같은 자리 불로 계속 오지 않는다.
 #
-# 🅿️ 현재 미사용 · 예비 스펙 (2026-08-07 확인)
-#   영상이 WebRTC P2P 직결로 바뀌면서 화질 전환을 젯슨↔프론트가 직접
-#   처리하게 되어 이 명령을 아무도 보내지 않는다. 그럼에도 남겨두는 이유는
-#   나중에 화질 제어를 서버 경유로 되돌리거나 유사한 명령이 필요해질 때
-#   그대로 쓸 수 있고, 유지 비용이 이 상수와 아래 action 검증 3줄뿐이기 때문이다.
-#   지우려면 interface.md ⑥번 항목과 프론트 쪽 잔여 코드도 함께 확인할 것.
-STREAM_BOOST = "stream_boost"    # action: "start"(부스트) / "stop"(원복)
+# ⚠️ LOGGED_EVENT_TYPES 에 넣지 말 것 — 아래 [이벤트 스냅샷 구역]에 이유가 있다.
+EVENT_SNAPSHOT = "event_snapshot"
+
 
 # WebRTC 시그널링 쪽지 (영상 P2P 직결용, 양방향, DB 저장 대상 아님).
 # payload 안의 내용(SDP/ICE)은 WebRTC 라이브러리가 자동 생성한 것 —
@@ -117,7 +127,7 @@ EVENT_ACK = "event_ack"
 
 # 프론트→서버→젯슨 방향으로 '그대로 전달'하는 메시지 종류 모음.
 # (젯슨→프론트 방향은 기존 브로드캐스트가 모든 메시지를 전달하므로 목록 불필요)
-JETSON_BOUND_TYPES = {STREAM_BOOST, WEBRTC_SIGNAL, EVENT_ACK}
+JETSON_BOUND_TYPES = {WEBRTC_SIGNAL, EVENT_ACK}
 
 # 이벤트 timestamp 기록용 한국 표준시.
 # 시간대 정보 없는(naive) 시각은 환경마다 해석이 달라지므로 +09:00을 명시한다.
@@ -127,6 +137,8 @@ KST = timezone(timedelta(hours=9))
 # block_level/ship_pose는 '바뀔 때만' 오는 희소 이벤트라 저장량 부담이 없고,
 # 최신 값을 init-data 상태 복원에 쓰므로 저장 대상에 포함.
 LOGGED_EVENT_TYPES = {SHIP_DEFECT, NO_HELMET, FALLEN_PERSON, FIRE, BLOCK_LEVEL, SHIP_POSE, EVENT_CLEARED}
+# ※ EVENT_SNAPSHOT 이 여기 없는 것은 빠뜨린 게 아니라 의도된 것이다.
+#   사진은 파일로 저장하고 문서에는 URL 만 붙인다 ([이벤트 스냅샷 구역] 참조).
 
 # =========================================================
 # [서버 수명 주기 구역]
@@ -197,6 +209,23 @@ app.add_middleware(
 )
 
 # =========================================================
+# [스냅샷 정적 서빙 구역]
+# 저장해둔 감지 사진을 브라우저가 그냥 주소로 꺼내 볼 수 있게 한다.
+#   http://192.168.0.5:8000/snapshots/<해시>.jpg
+# =========================================================
+
+# 서버를 어느 폴더에서 띄우든 항상 backend/snapshots 를 가리키게 절대경로로 잡는다.
+# (상대경로 "snapshots" 로 두면 uvicorn 을 다른 폴더에서 실행했을 때 엉뚱한 곳에 쌓인다)
+SNAPSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapshots")
+
+# ★ 이 한 줄이 없으면 바로 아래 StaticFiles 가 폴더를 못 찾고 **서버가 시작조차 못 한다.**
+#   .gitignore 가 사진만 막고 .gitkeep 으로 폴더는 남기지만, 누가 폴더를 지우거나
+#   새 환경에서 처음 띄우는 경우까지 여기서 막아준다.
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+
+app.mount("/snapshots", StaticFiles(directory=SNAPSHOT_DIR), name="snapshots")
+
+# =========================================================
 # [데이터베이스 셋업 구역]
 # MongoDB Atlas와 통신하는 선을 연결하는 곳.
 # =========================================================
@@ -230,6 +259,60 @@ db = client.shipyard_db
 
 # 그 안의 'events' 컬렉션(=서류함)을 선택. 여기에 4종 이벤트 로그가 쌓임.
 event_collection = db.events
+
+
+# 위험 이벤트 4종 — 대시보드 재접속 시 되살릴 대상.
+DANGER_TYPES = {SHIP_DEFECT, NO_HELMET, FALLEN_PERSON, FIRE}
+
+# 이 서버 프로세스가 켜진 시각. 복원은 이 시각 이후에 들어온 것만 한다.
+#
+# ★ 왜 필요한가 (2026-08-27)
+#   "살아있다"의 판정은 event_cleared 가 오는지에 전적으로 기대고 있는데,
+#   그 신호가 한 번이라도 안 오면 그 이벤트는 **영원히 살아있는 것으로 남는다.**
+#   실제로 이 제한을 넣기 전 DB 에는 복원 대상이 56건 있었고, 그중 46건이 하루
+#   이상 된 것이었다. 옛 좌표의 불을 로봇이 다시 지나갈 일이 없으니
+#   event_cleared 가 올 수 없고, 젯슨 쪽 clear 로직을 고쳐도 이미 쌓인 것은
+#   그대로 남는다.
+#
+#   서버를 다시 켰다는 것은 "여기서부터 새로 본다"는 뜻이므로 그 시각을
+#   바닥으로 깐다. 이전 세션의 찌꺼기가 올라올 여지가 아예 없어진다.
+#
+#   이것은 clear 가 깨졌을 때 화면이 무너지지 않게 막아주는 안전장치이지,
+#   clear 를 대신하는 장치가 아니다. clear 가 안 되면 대시보드보다 로봇이 더
+#   문제다 — 같은 자리 불로 계속 멈추기 때문이다.
+SERVER_STARTED_AT = datetime.now(timezone.utc)
+
+
+async def _active_danger_events(limit: int = 300):
+    """지금도 살아있는 위험 이벤트를 오래된 순으로 돌려준다.
+
+    '살아있다' = 등록된 뒤 같은 event_id 로 event_cleared 가 오지 않았다는 뜻.
+    젯슨의 change_point_detector 가 "로봇이 그 자리를 다시 지나갔는데 안 보인다"
+    를 확인해야만 event_cleared 를 보내므로, 이 판정은 젯슨의 판단을 그대로
+    따르는 것이다. 서버가 따로 시간 만료 같은 규칙을 두지 않는 이유다.
+
+    최신 limit 건만 훑는다. 그보다 오래된 것이 아직 살아있을 가능성은 낮고,
+    전체 스캔은 접속할 때마다 도는 경로라 비용을 묶어두는 편이 안전하다.
+    """
+    cutoff = SERVER_STARTED_AT.isoformat()
+    docs = await event_collection.find({
+        "event_type": {"$in": list(DANGER_TYPES) + [EVENT_CLEARED]},
+        # timestamp 는 서버가 저장할 때 붙이는 ISO 문자열이라 사전순 비교가
+        # 곧 시간순 비교다. 필드가 없는 구버전 문서는 여기서 함께 걸러진다.
+        "timestamp": {"$gte": cutoff},
+    }).sort("_id", -1).to_list(length=limit)
+    docs.reverse()                      # 오래된 것부터 훑어야 등록/해제 순서가 맞다
+
+    alive = {}
+    for d in docs:
+        eid = d.get("event_id")
+        if not eid:
+            continue                    # event_id 없는 구버전 문서는 짝을 못 지어 건너뛴다
+        if d["event_type"] == EVENT_CLEARED:
+            alive.pop(eid, None)
+        else:
+            alive[eid] = d
+    return list(alive.values())
 
 
 # =========================================================
@@ -334,6 +417,130 @@ async def retry_failed_saves():
 
 
 # =========================================================
+# [이벤트 스냅샷 구역 — 감지 순간의 사진]
+# =========================================================
+#
+# 젯슨은 위험 이벤트를 보낸 **직후**, 같은 event_id 로 그 순간의 crop 사진을
+# event_snapshot 메시지에 base64 로 실어 보낸다.
+# (설계 근거: docs/이벤트_스냅샷_및_위치표기_요청.md)
+#
+# ★ base64 를 DB 에 넣지도, 프론트로 흘리지도 않는다.
+#
+#   - DB 에 넣으면: 문서가 통째로 커진다. 게다가 재접속 복원은 문서를 그대로
+#     다시 보내는 구조라, 대시보드를 새로고침할 때마다 살아있는 이벤트의 사진이
+#     **전부 다시 흐른다.** base64 는 원본 바이트보다 33% 크기까지 하다.
+#   - 프론트로 릴레이하면: 같은 이유. URL 이면 브라우저가 캐시해 두 번째부터는
+#     안 받지만, 메시지에 박힌 base64 는 매번 새로 받는다.
+#
+#   그래서 서버는 사진을 **파일로 떨어뜨리고 URL 만** 남긴다. 실시간 표시는
+#   URL 만 담은 가벼운 메시지로, 재접속 복원은 이벤트 문서에 붙인 image_url 로.
+#
+# ⚠️ 사진에는 작업자 얼굴이 찍힐 수 있다. .gitignore 가 backend/snapshots/* 를
+#    막고 있으니 절대 풀지 말 것.
+
+# DB 갱신 재시도 간격(초). 왜 재시도가 필요한지는 _attach_snapshot_url 참조.
+SNAPSHOT_ATTACH_RETRY_S = (0.5, 1.5, 3.0)
+
+
+def _snapshot_name(event_id: str) -> str:
+    """event_id 를 파일 이름으로 쓸 수 있는 형태로 바꾼다.
+
+    event_id 는 'fire@0.63,-0.23' 처럼 @ 와 쉼표, 마이너스가 섞여 있어 그대로
+    파일 이름에 쓰면 OS 와 URL 양쪽에서 말썽이 난다. 해시로 고정 길이 이름을
+    만들면 그 문제가 사라지고, 같은 event_id 는 항상 같은 이름이 나오므로
+    재전송이 와도 그냥 덮어쓰기가 된다(사진이 중복으로 쌓이지 않는다).
+    """
+    return hashlib.sha1(event_id.encode("utf-8")).hexdigest()[:16] + ".jpg"
+
+
+def _write_snapshot_file(path: str, blob: bytes):
+    """별도 스레드에서 돌 파일 쓰기 (아래 asyncio.to_thread 로 호출)."""
+    with open(path, "wb") as f:
+        f.write(blob)
+
+
+async def _attach_snapshot_url(event_id: str, url: str):
+    """짝이 되는 위험 이벤트 문서에 사진 URL 을 붙인다.
+
+    ★ 새 문서를 만들지 않는다. 이미 저장된 그 이벤트에 필드 하나를 더하는 것이다.
+      새로 만들면 복원 때 같은 위험이 두 번 뜬다.
+
+    ★ 경쟁 상태를 견뎌야 한다.
+      위험 이벤트 저장은 schedule_save 가 백그라운드로 돌리는데 젯슨은 그
+      직후에 스냅샷을 보낸다. 그래서 이 갱신이 정작 저장보다 **먼저** 도착할
+      수 있다. 짧게 몇 번 다시 시도하면 대부분 해결된다.
+
+      끝내 못 붙어도 실시간 표시는 이미 끝난 상태고(브로드캐스트는 별개),
+      재접속 복원에서만 그 한 건의 사진이 빠진다.
+    """
+    for delay in SNAPSHOT_ATTACH_RETRY_S:
+        try:
+            doc = await event_collection.find_one_and_update(
+                {"event_id": event_id, "event_type": {"$in": list(DANGER_TYPES)}},
+                {"$set": {"image_url": url}},
+                # 같은 자리에서 치웠다가 다시 발생한 경우 문서가 여럿일 수 있다.
+                # 최신 것에 붙여야 지금 살아있는 이벤트의 사진이 된다.
+                sort=[("_id", -1)],
+            )
+            if doc is not None:
+                return
+        except Exception as e:
+            print(f"⚠️ [스냅샷] DB 갱신 실패({type(e).__name__}): {event_id}")
+            return
+        await asyncio.sleep(delay)
+
+    print(f"⚠️ [스냅샷] 짝이 되는 위험 이벤트를 못 찾음: {event_id} "
+          f"(사진은 저장됨 · 실시간 표시 정상 · 재접속 복원에서만 빠짐)")
+
+
+async def handle_event_snapshot(data: dict) -> Optional[dict]:
+    """스냅샷을 파일로 저장하고, 프론트에 보낼 가벼운 메시지를 돌려준다.
+
+    돌려주는 메시지에는 base64 가 없고 image_url 만 있다.
+    저장하지 못하면 None — 그때는 아무것도 브로드캐스트하지 않는다.
+    """
+    event_id = data.get("event_id")
+    image_b64 = data.get("image_b64")
+    if not event_id or not image_b64:
+        print(f"⚠️ [스냅샷] event_id 나 image_b64 가 없어 무시: {list(data)}")
+        return None
+
+    try:
+        blob = base64.b64decode(image_b64)
+    except Exception as e:
+        print(f"⚠️ [스냅샷] base64 해독 실패({type(e).__name__}): {event_id}")
+        return None
+
+    name = _snapshot_name(event_id)
+    path = os.path.join(SNAPSHOT_DIR, name)
+    try:
+        # 수십 KB 라 금방 끝나지만 디스크 쓰기는 이벤트 루프를 멈춘다.
+        # 별도 스레드로 넘겨 그동안 젯슨의 다음 메시지 수신이 밀리지 않게 한다.
+        await asyncio.to_thread(_write_snapshot_file, path, blob)
+    except Exception as e:
+        print(f"⚠️ [스냅샷] 파일 저장 실패({type(e).__name__}): {path}")
+        return None
+
+    url = f"/snapshots/{name}"
+    print(f"📸 [스냅샷] {data.get('cls') or '?'} @ {data.get('block_id') or '?'} "
+          f"→ {url} ({len(blob) / 1024:.0f}KB)")
+
+    # DB 갱신은 기다리지 않는다 — 사진은 이미 디스크에 있고, 실시간 표시는
+    # 호출한 쪽이 곧바로 브로드캐스트한다. (schedule_save 와 같은 이유)
+    task = asyncio.create_task(_attach_snapshot_url(event_id, url))
+    _save_tasks.add(task)
+    task.add_done_callback(_save_tasks.discard)
+
+    return {
+        "event_type": EVENT_SNAPSHOT,
+        "block_id": data.get("block_id"),
+        "event_id": event_id,
+        "cls": data.get("cls"),
+        "image_url": url,
+    }
+
+
+# =========================================================
 # [웹소켓 연결 관리자 구역]
 # 프론트엔드의 접속 상태를 기억하고 관리한다.
 # =========================================================
@@ -395,27 +602,9 @@ class ConnectionManager:
         for dead in dead_connections:
             self.disconnect(dead)
 
-    async def broadcast_bytes(self, data: bytes):
-        """
-        바이너리 데이터(영상 JPEG 프레임)를 접속 중인 모든 연결로 전송한다.
-        broadcast()와 동일한 패턴이며 전송 방식만 send_bytes로 다름.
-        """
-        dead_connections = []
-        for connection in self.active_connections:
-            try:
-                await connection.send_bytes(data)
-            except Exception:
-                dead_connections.append(connection)
-        for dead in dead_connections:
-            self.disconnect(dead)
+manager = ConnectionManager()   # /ws/frontend (이벤트 JSON)
 
-
-# 이벤트(JSON) 채널과 영상(바이너리) 채널의 프론트엔드 연결을 각각 따로 관리.
-# 채널을 분리하는 이유: 영상 프레임이 몰릴 때 이벤트 JSON 전달이 밀리지 않게 하기 위함.
-manager = ConnectionManager()         # /ws/frontend        (이벤트 JSON)
-stream_manager = ConnectionManager()  # /ws/frontend-stream (영상 바이너리)
-
-# 현재 접속 중인 젯슨의 JSON 채널 웹소켓 (서버→젯슨 stream_boost 전달용).
+# 현재 접속 중인 젯슨의 JSON 채널 웹소켓 (서버→젯슨 쪽지 전달용).
 # 젯슨은 1대뿐이므로 목록이 아닌 단일 참조로 관리. 미접속 시 None.
 jetson_connection: Optional[WebSocket] = None
 
@@ -516,9 +705,41 @@ async def websocket_frontend(websocket: WebSocket):
     await manager.connect(websocket)
     print(f"🖥️ [프론트엔드] 대시보드 연결됨 — {manager.status_line()}")
 
+    # ★ 재접속 복원 (2026-08-27).
+    #   프론트는 WebSocket 으로 받은 것만 그리므로, 새로고침하면 화면의 위험
+    #   핑이 전부 사라진다. 불이 그 자리에 그대로 있어도 안 뜬다.
+    #
+    #   젯슨이 다시 보내게 만들면 안 된다. change_point_detector 가 이미 보고한
+    #   이벤트를 재발행하지 않는 것은 같은 자리 불로 로봇이 반복 정지하지 않게
+    #   하는 핵심 로직이다. 복원은 DB 를 들고 있는 서버가 해야 한다.
+    #
+    #   broadcast 가 아니라 **방금 접속한 소켓에만** 보낸다. broadcast 하면
+    #   이미 보고 있던 다른 대시보드에 같은 핑이 하나 더 생긴다.
+    try:
+        # 배 위치를 **먼저** 보낸다. 프론트가 map_xy -> 구획 좌표로 바꿀 때
+        # ship_pose 가 필요한데, 없으면 전부 첫 구획으로 떨어져 핑이 엉뚱한
+        # 자리에 찍힌다 (mapXYToPingWorld).
+        pose = await event_collection.find_one(
+            {"event_type": SHIP_POSE}, sort=[("_id", -1)])
+        if pose:
+            pose.pop("_id", None)       # ObjectId 는 send_json 에서 직렬화 안 된다
+            await websocket.send_json(pose)
+
+        restored = await _active_danger_events()
+        for doc in restored:
+            doc.pop("_id", None)
+            doc["replay"] = True        # 프론트가 팝업을 안 띄우게 하는 표시
+            await websocket.send_json(doc)
+        if restored:
+            print(f"🖥️ [프론트엔드] 살아있는 위험 이벤트 {len(restored)}건 복원 전송")
+    except Exception as e:
+        # 복원이 실패해도 연결은 살린다. 핑이 안 뜨는 것은 불편이지만,
+        # 여기서 예외가 새어나가면 대시보드가 아예 붙지 못한다.
+        print(f"⚠️ [프론트엔드] 재접속 복원 실패(무시하고 계속): {e}")
+
     try:
         # 연결이 살아있는 동안 무한 대기하며 메시지를 수신.
-        # 프론트→서버 방향 메시지: stream_boost(화질 명령), webrtc_signal(시그널링).
+        # 프론트→서버 방향 메시지: webrtc_signal(시그널링), event_ack(이벤트 확인).
         while True:
             raw = await websocket.receive_text()
 
@@ -531,15 +752,11 @@ async def websocket_frontend(websocket: WebSocket):
 
             event_type = data.get("event_type")
 
-            # 프론트→젯슨 전달 대상: stream_boost(화질 명령), webrtc_signal(시그널링).
-            # 서버는 내용을 판단하지 않고 젯슨에게 그대로 배달만 한다.
+            # 프론트→젯슨 전달 대상: webrtc_signal(시그널링), event_ack(이벤트 확인).
+            # 서버는 내용을 판단하지 않고 젯슨에게 그대로 배달만 한다 —
+            # webrtc_signal 의 payload 는 WebRTC 라이브러리가 만든 것이고
+            # event_ack 는 젯슨의 Nav2 가 해석할 것이라, 서버가 검사할 게 없다.
             if event_type in JETSON_BOUND_TYPES:
-                # stream_boost만 action 값을 검증. webrtc_signal의 payload는
-                # WebRTC 라이브러리가 만든 것이라 서버가 검사할 필요가 없다.
-                if event_type == STREAM_BOOST and data.get("action") not in ("start", "stop"):
-                    print(f"⚠️ [프론트엔드] stream_boost의 action 값이 이상함: {data}")
-                    continue
-
                 if jetson_connection is None:
                     print(f"⚠️ [중계] {event_type} 전달 실패: 젯슨 미접속 상태")
                     continue
@@ -576,7 +793,7 @@ async def websocket_jetson(websocket: WebSocket):
     # (젯슨은 1대뿐이라 브로드캐스트 대상 목록에 넣을 필요가 없음).
     await websocket.accept()
 
-    # 서버→젯슨 방향(stream_boost 전달)에 쓸 수 있도록 연결을 기억해 둠.
+    # 서버→젯슨 방향(webrtc_signal·event_ack 전달)에 쓸 수 있도록 연결을 기억해 둠.
     # 재접속 등으로 새 연결이 오면 마지막 연결이 이전 것을 덮어씀.
     jetson_connection = websocket
     print("🚗 [젯슨 RC카] 연결됨 — 현재 접속 중")
@@ -589,6 +806,17 @@ async def websocket_jetson(websocket: WebSocket):
 
             # 수신한 메시지의 event_type 값을 확인.
             event_type = data.get("event_type")
+
+            # 📸 [스냅샷] 감지 순간의 사진. 다른 메시지와 처리 방식이 아예 다르다.
+            #   DB 에 통째로 저장하지 않고 파일로 떨군 뒤, base64 를 뺀 가벼운
+            #   메시지만 프론트로 보낸다. 자세한 이유는 [이벤트 스냅샷 구역] 참조.
+            #   continue 로 아래 저장/브로드캐스트 경로를 타지 않게 한다 —
+            #   그냥 흘려보내면 base64 가 프론트까지 그대로 간다.
+            if event_type == EVENT_SNAPSHOT:
+                light = await handle_event_snapshot(data)
+                if light is not None:
+                    await manager.broadcast(light)
+                continue
 
             # 🚨 [DB 저장 로직] 팀이 합의한 저장 대상(위험 이벤트 4종 +
             # BLOCK_LEVEL 단계 변화 + SHIP_POSE 배 위치)만 DB에 영구 저장한다.
@@ -627,43 +855,3 @@ async def websocket_jetson(websocket: WebSocket):
         else:
             print("🚗 [젯슨 RC카] 옛 연결 정리됨 (재접속) — 현재 접속 중")
 
-
-# =========================================================
-# 3. 영상 스트림 중계 구역 (젯슨 → 서버 → 프론트엔드, 바이너리)
-# 젯슨이 보내는 JPEG 프레임을 디코딩 없이 그대로 프론트로 흘려보낸다.
-# 이벤트 JSON 채널과 분리해서 영상 때문에 이벤트 전달이 밀리지 않게 함.
-# =========================================================
-
-@app.websocket("/ws/jetson-stream")
-async def websocket_jetson_stream(websocket: WebSocket):
-    """젯슨이 실시간 영상 JPEG 프레임(바이너리)을 보내는 전용 채널."""
-    await websocket.accept()
-    print("🎥 [젯슨 영상] 스트림 채널 연결됨!")
-
-    try:
-        while True:
-            # JPEG 한 장 = 바이너리 메시지 한 개.
-            frame = await websocket.receive_bytes()
-
-            # 서버는 프레임을 열어보지 않고(디코딩 없음) 바이트 그대로 중계.
-            await stream_manager.broadcast_bytes(frame)
-
-    except WebSocketDisconnect:
-        print("🎥 [젯슨 영상] 스트림 채널 끊어짐.")
-
-
-@app.websocket("/ws/frontend-stream")
-async def websocket_frontend_stream(websocket: WebSocket):
-    """프론트엔드가 실시간 영상을 받기 위해 연결하는 채널 (수신 전용)."""
-    await stream_manager.connect(websocket)
-    print("🖥️ [프론트엔드 영상] 스트림 시청 시작!")
-
-    try:
-        # 이 채널은 서버→프론트 단방향. 아래 수신 대기는 데이터를 쓰기 위함이
-        # 아니라 연결 유지와 끊김(WebSocketDisconnect) 감지를 위한 것.
-        while True:
-            await websocket.receive_text()
-
-    except WebSocketDisconnect:
-        stream_manager.disconnect(websocket)
-        print("🖥️ [프론트엔드 영상] 스트림 시청 종료.")

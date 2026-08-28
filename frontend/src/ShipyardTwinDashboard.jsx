@@ -24,18 +24,30 @@ const USE_REAL_BACKEND = true;   // false로 두면 예전처럼 2.2초마다 �
 const USE_REAL_VIDEO = true;     // false로 두면 예전처럼 Canvas 가짜 CCTV
 const SERVER_HOST = "192.168.0.5:8000"; // ← 백엔드 서버 IP:포트로 교체 (예: 192.168.0.42:8000)
 const EVENT_WS_URL = `ws://${SERVER_HOST}/ws/frontend`;
+// 감지 순간 사진. 서버가 backend/snapshots/ 에 저장해두고 "/snapshots/<해시>.jpg"
+// 같은 경로만 알려주므로, 앞에 서버 주소를 붙여 완전한 URL 로 만든다.
+// (SERVER_HOST 하나만 바꾸면 영상·이벤트·사진이 함께 따라오게 하려는 것)
+const SNAPSHOT_BASE_URL = `http://${SERVER_HOST}`;
 
-/* 영상은 두 가지 방식 중 고를 수 있다.
- *   "direct" — 백엔드를 아예 거치지 않고, 브라우저가 카메라 컴퓨터에 바로 접속
- *              (MJPEG HTTP 스트림, <img> 태그 하나로 끝남 — 제일 단순)
- *   "relay"  — 백엔드가 중계 (/ws/jetson-stream → /ws/frontend-stream, JPEG 바이너리)
- * 예전에 SSH로 테스트하셨던 "백엔드 안 거치고 바로 오는" 방식은 direct 쪽이다. */
-const VIDEO_MODE = "direct"; // "direct" | "relay" | (USE_REAL_VIDEO=false면 어차피 mock)
-// 젯슨에 이미 떠 있는 mediamtx가 카메라 영상을 WebRTC로 서빙해준다
-// (video_streamer.py가 ffmpeg로 mediamtx에 rtsp://127.0.0.1:8554/ugv1 로 송출 →
-//  mediamtx가 그걸 WebRTC 재생 페이지로도 자동 변환해줌). 그 페이지를 그대로 iframe으로 끼운다.
-const DIRECT_CAMERA_URL = "http://192.168.0.6:8889/ugv1"; // ← 젯슨 IP로 교체 (포트 8889 = mediamtx WebRTC)
-const VIDEO_WS_URL = `ws://${SERVER_HOST}/ws/frontend-stream`; // relay 모드일 때만 사용
+/* 영상은 백엔드(FastAPI)를 거치지 않지만, 중앙 미디어 서버는 거친다.
+ * 젯슨이 H.264 로 한 번만 인코딩해 서버의 mediamtx 로 밀어올리고(RTSP push),
+ * 브라우저는 그 mediamtx 에 WebRTC 로 붙는다.
+ *
+ *   젯슨 ──H.264 1개, RTSP push──▶ mediamtx(서버) ──WebRTC──▶ 브라우저 N명
+ *
+ * ★ P2P 가 아니다. mediamtx 가 미디어 서버이고 브라우저가 거기 접속하는
+ *   client-server 구조다. WebRTC 를 쓸 뿐 양쪽이 대등하지 않다.
+ *
+ * ★ 예전에 있던 "백엔드가 JPEG 를 중계하는" 모드는 2026-08-28 삭제했다.
+ *   젯슨이 그 창구로 프레임을 보낸 적이 한 번도 없어서 실제로는 동작하지 않는
+ *   폴백이었고, 남겨두면 "쓸 수 있는 선택지"로 오해를 산다.
+ *   왜 백엔드로 나르지 않는지는 docs/interface.md ⑤ 참조. */
+// 서버 노트북(고정 IP)에 떠 있는 mediamtx 의 WebRTC 재생 페이지.
+// 젯슨의 video_streamer.py 가 ffmpeg 로 rtsp://192.168.0.5:8554/ugv1 에 밀어올리면,
+// mediamtx 가 그걸 WebRTC 재생 페이지로 자동 변환해준다. 그 페이지를 iframe 으로 끼운다.
+// 2026-08-28 젯슨(192.168.0.6)에서 서버(192.168.0.5)로 옮겼다 — 시청자가 늘어도
+// 젯슨이 부담을 지지 않게 하기 위함. 젯슨은 몇 명이 보든 스트림 하나만 올린다.
+const DIRECT_CAMERA_URL = "http://192.168.0.5:8889/ugv1"; // 포트 8889 = mediamtx WebRTC
 
 /* ---------------------------------------------------------------------------
  * 0. 도메인 상수 — 백엔드와 사전 합의한 인터페이스(좌표계 / 이벤트 스키마)
@@ -82,6 +94,14 @@ const SECTION_RANGE = {
   S2: [0.62, 0.82],
   S1: [0.82, 1.00],
 };
+
+/* 위치 문구에서 "앞쪽/뒤쪽"을 붙일 양 끝 구획. 이름을 직접 적지 않고
+ * SECTION_RANGE 에서 끌어내므로, 나중에 구획을 늘리거나 이름을 바꿔도 따라온다.
+ * (t=0 이 선미, t=1 이 선수) */
+const SECTION_IDS_STERN_TO_BOW = Object.keys(SECTION_RANGE)
+  .sort((a, b) => SECTION_RANGE[a][0] - SECTION_RANGE[b][0]);
+const STERN_BLOCK_ID = SECTION_IDS_STERN_TO_BOW[0];
+const BOW_BLOCK_ID = SECTION_IDS_STERN_TO_BOW[SECTION_IDS_STERN_TO_BOW.length - 1];
 
 /* 공정 단계 → 색상 (회색→노랑→초록): 계획서 시나리오3 */
 const PROGRESS_COLOR = {
@@ -209,6 +229,38 @@ function mapXYToBlockLocal(mapXY, shipPose) {
   const localX = Math.max(0, Math.min(1, rel.beam / SHIP_REAL_BEAM_M + 0.5));
 
   return { blockId, local: { x: localX, y: 0.6, z: localZ } };
+}
+
+/* 핑 위치를 사람이 읽는 한 줄로. 예: "S3 왼편", "S1 앞쪽 왼편".
+ *
+ * 관제사에게 "S3 89%"보다 "S3 왼편 89%"가 훨씬 쓸모 있다 — 배로 뛰어갈 때
+ * 어느 쪽으로 돌아야 하는지가 바로 나오기 때문이다.
+ *
+ * 규칙 (docs/이벤트_스냅샷_및_위치표기_요청.md 1장):
+ *   배 앞뒤 범위 안  →  "<구획> <왼편|오른편>"          예) S3 왼편
+ *   앞뒤 끝을 넘어감  →  "<구획> <앞쪽|뒤쪽> <왼편|오른편>" 예) S1 앞쪽 왼편
+ *
+ * ★ "중앙"은 두지 않는다. 배 폭이 14cm뿐이라 중앙이라고 해봐야 왼쪽 7cm 안이고,
+ *   관제사 입장에서는 어느 쪽으로 갈지 정해주는 편이 낫다. 그래서 애매하면
+ *   가까운 쪽으로 붙여 왼편/오른편 둘 중 하나만 나온다.
+ *
+ * 좌우는 배 자신의 기준(좌현/우현)이다. mapXYToShipLocalMeters 가 이미 배 yaw로
+ * 회전시켜 놓은 좌표를 쓰므로, 카메라를 어디서 보든 문구가 바뀌지 않는다.
+ *
+ * 배 위치(ship_pose)를 아직 못 받았으면 변환할 수 없다 — 그때는 구획 id만 돌려준다.
+ */
+function describePingLocation(mapXY, shipPose, fallbackBlockId) {
+  const rel = mapXYToShipLocalMeters(mapXY, shipPose);
+  if (!rel) return fallbackBlockId || null;
+
+  const side = rel.beam >= 0 ? "오른편" : "왼편";
+  const halfLength = SHIP_REAL_LENGTH_M / 2;
+
+  if (rel.forward > halfLength) return `${BOW_BLOCK_ID} 앞쪽 ${side}`;
+  if (rel.forward < -halfLength) return `${STERN_BLOCK_ID} 뒤쪽 ${side}`;
+
+  const blockId = mapXYToBlockLocal(mapXY, shipPose)?.blockId || fallbackBlockId;
+  return blockId ? `${blockId} ${side}` : side;
 }
 
 /* UGV는 배 위가 아니라 배 옆(바깥)을 돌아다니므로 0~1로 자르지 않고,
@@ -1130,103 +1182,28 @@ function drawCctvFrame(ctx, cv, { event, label, f }) {
   ctx.fillText(new Date().toLocaleTimeString("ko-KR"), cv.width - 96 * scale, 18 * scale);
 }
 
-/* 진짜 영상 위에 얹는 오버레이(bbox 라벨 + HUD). mock용 drawCctvFrame과는
- * 별개 함수 — 실제 영상 픽셀은 그대로 두고 그 위에만 덧그린다.
- * 서버가 픽셀 bbox 좌표를 아직 안 주므로 지금은 하단에 라벨만 표시한다. */
-function drawRealOverlay(ctx, cv, { event, label }) {
-  const scale = cv.width / 520;
-  const meta = event ? CLASS_META[event.cls] : null;
-  if (meta) {
-    const col = SEV_COLOR[meta.severity];
-    ctx.fillStyle = col; ctx.globalAlpha = 0.85;
-    ctx.fillRect(10 * scale, cv.height - 34 * scale, 220 * scale, 24 * scale);
-    ctx.fillStyle = "#0a0e17"; ctx.globalAlpha = 1;
-    ctx.font = `bold ${12 * scale}px monospace`;
-    ctx.fillText(`${event.cls} ${(event.conf * 100).toFixed(0)}%`, 16 * scale, cv.height - 17 * scale);
-  }
-  ctx.globalAlpha = 1;
-  ctx.fillStyle = "#2dd4bf"; ctx.font = `${11 * scale}px monospace`;
-  ctx.fillText(`● LIVE  UGV-CAM  ${label}`, 10 * scale, 18 * scale);
-  ctx.fillText(new Date().toLocaleTimeString("ko-KR"), cv.width - 96 * scale, 18 * scale);
-}
-
-/* 영상 채널에 아직 프레임이 한 장도 안 온 상태(연결 전/서버 꺼짐)에 보여줄 화면 */
-function drawWaitingScreen(ctx, cv, label) {
-  ctx.fillStyle = "#0b0f16";
-  ctx.fillRect(0, 0, cv.width, cv.height);
-  ctx.fillStyle = "#7d8aa3";
-  ctx.font = "13px monospace";
-  ctx.textAlign = "center";
-  ctx.fillText(`영상 연결 대기중… (${label})`, cv.width / 2, cv.height / 2 - 8);
-  ctx.fillText(VIDEO_WS_URL, cv.width / 2, cv.height / 2 + 14);
-  ctx.textAlign = "left";
-}
-
-/* 캔버스 애니메이션 루프 공유 훅.
- * USE_REAL_VIDEO=false면 기존처럼 Canvas 가짜 화면(drawCctvFrame),
- * true면 /ws/frontend-stream에서 진짜 JPEG 프레임을 받아 그린다. */
+/* mock 캔버스 애니메이션 루프.
+ * USE_REAL_VIDEO=false 일 때만 돈다 — 젯슨 없이 대시보드만 띄워보는 개발용이다.
+ * 진짜 영상은 이 훅을 쓰지 않고 아래 LiveVideoDirect 가 <iframe> 으로 그린다. */
 function useCctvCanvas(cvRef, active, event, label) {
   useEffect(() => {
     if (!active || !cvRef.current) return;
     const cv = cvRef.current;
     const ctx = cv.getContext("2d");
-
-    // Canvas 루프는 mock 모드이거나, 진짜 영상이어도 "relay"(서버 중계) 모드일 때만 쓴다.
-    // "direct" 모드는 이 훅을 아예 쓰지 않고 <img> 태그로 따로 그린다 (아래 LiveVideoDirect).
-    if (!USE_REAL_VIDEO || VIDEO_MODE !== "relay") {
-      let raf, f = 0;
-      const loop = () => { f++; drawCctvFrame(ctx, cv, { event, label, f }); raf = requestAnimationFrame(loop); };
-      loop();
-      return () => cancelAnimationFrame(raf);
-    }
-
-    // === 진짜 영상 모드 ===
-    let ws;
-    try {
-      ws = new WebSocket(VIDEO_WS_URL);
-    } catch (e) {
-      console.error("영상 채널 연결 실패:", e);
-      drawWaitingScreen(ctx, cv, label);
-      return;
-    }
-    ws.binaryType = "blob";
-    let bitmap = null;
-    let raf;
-
-    ws.onmessage = async (ev) => {
-      try {
-        const bmp = await createImageBitmap(ev.data);
-        if (bitmap) bitmap.close();
-        bitmap = bmp;
-      } catch (e) {
-        // 프레임 한 장이 깨져도 무시하고 다음 프레임을 기다린다
-      }
-    };
-    ws.onerror = (e) => console.error("영상 채널 오류 (서버/IP 확인):", e);
-
-    const draw = () => {
-      if (bitmap) {
-        ctx.drawImage(bitmap, 0, 0, cv.width, cv.height);
-        drawRealOverlay(ctx, cv, { event, label });
-      } else {
-        drawWaitingScreen(ctx, cv, label);
-      }
-      raf = requestAnimationFrame(draw);
-    };
-    draw();
-
-    return () => {
-      cancelAnimationFrame(raf);
-      ws.close();
-      if (bitmap) bitmap.close();
-    };
+    let raf, f = 0;
+    const loop = () => { f++; drawCctvFrame(ctx, cv, { event, label, f }); raf = requestAnimationFrame(loop); };
+    loop();
+    return () => cancelAnimationFrame(raf);
   }, [cvRef, active, event, label]);
 }
 
-/* "direct" 모드 전용 — 백엔드를 아예 안 거치고, 카메라 컴퓨터가 내보내는
- * MJPEG HTTP 스트림을 <img> 태그로 그냥 띄운다. 브라우저가 알아서 프레임을
- * 계속 갱신해주므로 별도 JS 루프가 필요 없다 (제일 단순한 방식).
- * 스트림 서버가 꺼져 있으면 onError가 걸려 "연결 안 됨" 문구로 바뀐다. */
+/* 젯슨 직결 영상 — 백엔드를 거치지 않는다.
+ * 서버의 mediamtx 가 만들어주는 WebRTC 재생 페이지를 <iframe> 으로 그대로 끼운다.
+ * 재생·디코딩·재연결을 브라우저가 알아서 하므로 별도 JS 루프가 필요 없다.
+ *
+ * ★ P2P 가 아니다. 젯슨이 스트리밍 서버 역할을 겸하고, 브라우저가 백엔드를
+ *   우회해 거기 직접 붙는 것이다. WebRTC 를 쓸 뿐 양쪽이 대등한 P2P 는 아니다.
+ * 스트림 서버가 꺼져 있으면 iframe 이 비므로 ⟳ 재연결 버튼으로 다시 붙인다. */
 function LiveVideoDirect({ event, label, className }) {
   const [key, setKey] = useState(0); // iframe을 강제로 새로 불러오게 하는 트릭 (수동 재연결용)
   const meta = event ? CLASS_META[event.cls] : null;
@@ -1266,7 +1243,7 @@ function LiveVideoDirect({ event, label, className }) {
 function LivePanel({ ugvBlock, warnEvent, onExpand }) {
   const cvRef = useRef(null);
   const label = ugvBlock ? ugvBlock.name : "야드 순찰";
-  const isDirect = USE_REAL_VIDEO && VIDEO_MODE === "direct";
+  const isDirect = USE_REAL_VIDEO;
   useCctvCanvas(cvRef, !isDirect, warnEvent, label);
   const warning = !!warnEvent;
   return (
@@ -1288,7 +1265,7 @@ function LivePanel({ ugvBlock, warnEvent, onExpand }) {
  * ESC 키로도 닫을 수 있게 한다 (X 버튼 클릭 없이 키보드로 종료). */
 function CctvPopup({ block, event, auto, onClose, onAck, onClearPing }) {
   const cvRef = useRef(null);
-  const isDirect = USE_REAL_VIDEO && VIDEO_MODE === "direct";
+  const isDirect = USE_REAL_VIDEO;
   useCctvCanvas(cvRef, !!block && !isDirect, event, block ? block.name : "");
 
   useEffect(() => {
@@ -1324,8 +1301,26 @@ function CctvPopup({ block, event, auto, onClose, onAck, onClearPing }) {
         ) : (
           <canvas ref={cvRef} width={760} height={428} className="popup-canvas" />
         )}
+        {event?.imageUrl && (
+          <figure className="popup-snap">
+            <img
+              className="popup-snap-img"
+              src={event.imageUrl}
+              alt={`${meta ? meta.label : event.cls} 감지 순간`}
+              /* 서버에서 사진이 지워졌거나 아직 안 올라온 경우 깨진 아이콘 대신
+                 이 칸을 통째로 숨긴다 — 사진은 있으면 좋은 것이지 필수가 아니다. */
+              onError={(e) => { e.currentTarget.closest(".popup-snap").style.display = "none"; }}
+            />
+            <figcaption className="popup-snap-cap">
+              📸 감지 순간{event.locLabel ? ` — ${event.locLabel}` : ""}
+            </figcaption>
+          </figure>
+        )}
         <div className="popup-meta">
           <div><span className="k">구역</span><span className="v">{block.name} ({block.id})</span></div>
+          {event?.locLabel && (
+            <div><span className="k">위치</span><span className="v">{event.locLabel}</span></div>
+          )}
           {meta ? (
             <>
               <div><span className="k">탐지</span>
@@ -1478,10 +1473,19 @@ export default function ShipyardTwinDashboard() {
       // 이 구획의 "확인 대기중" 위험 이벤트로 기억해둠 — 나중에 사용자가 이 블록을
       // 직접 클릭해서 봐도(자동 팝업을 놓쳤어도) 확인 버튼이 뜨게 하기 위함.
       dangerByBlockRef.current = { ...dangerByBlockRef.current, [payload.blockId]: { ...payload, _meta: meta } };
-      setActiveBlock(block);
-      setActiveEvent({ ...payload, _meta: meta });
-      setAutoPopup(true);
-      setUgvBlock(block);
+
+      // ★ 재접속 복원분(replay)은 팝업을 띄우지 않는다 (2026-08-27).
+      //   이미 관제사가 확인했을 수도 있고, 살아있는 이벤트가 여러 개면
+      //   새로고침할 때마다 팝업이 연달아 떠서 화면을 덮는다.
+      //   핑과 블록 강조는 그대로 그린다 — 위험이 아직 그 자리에 있다는
+      //   사실 자체는 보여줘야 하기 때문이다. 위의 dangerByBlockRef 기록도
+      //   그대로 둔다. 그래야 재접속 후 그 블록을 클릭했을 때 확인 버튼이 뜬다.
+      if (!payload.replay) {
+        setActiveBlock(block);
+        setActiveEvent({ ...payload, _meta: meta });
+        setAutoPopup(true);
+        setUgvBlock(block);
+      }
       if (sceneRef.current) sceneRef.current.highlightBlock(payload.blockId);
     } else if (meta.severity === SEVERITY.WARN) {
       const block = BLOCKS.find((b) => b.id === payload.blockId);
@@ -1583,9 +1587,42 @@ export default function ShipyardTwinDashboard() {
           return;
         }
 
+        // ⑤ 감지 순간 사진 — 위험 이벤트 **바로 뒤에** 같은 event_id 로 따라온다.
+        // {"event_type":"event_snapshot","block_id":"B1","event_id":"fire@0.63,-0.23",
+        //  "cls":"fire","image_url":"/snapshots/f5edf801....jpg"}
+        //
+        // ★ 사진 자체(base64)는 여기까지 오지 않는다. 서버가 파일로 떨궈두고
+        //   주소만 알려주므로, 브라우저가 그 주소를 캐시해 두 번째부터는 안 받는다.
+        //   그래서 이 메시지는 아주 가볍고, 새 이벤트를 만들지 않는다 —
+        //   이미 올라가 있는 그 이벤트를 찾아 사진만 덧붙이는 것이다.
+        if (type === "event_snapshot") {
+          const eid = data.event_id ?? null;
+          const url = data.image_url ? SNAPSHOT_BASE_URL + data.image_url : null;
+          if (!eid || !url) return;
+
+          // 짝이 안 맞으면 원본을 그대로 돌려준다 → React가 헛 렌더하지 않는다.
+          const attach = (e) => (e && e.eventId === eid ? { ...e, imageUrl: url } : e);
+
+          setEvents((prev) => prev.map(attach));
+          setActiveEvent(attach); // 팝업이 이미 떠 있으면 그 자리에서 사진이 채워진다
+          setWarnEvent(attach);
+
+          // 구획 클릭용 기록에도 붙인다 — 나중에 그 구획을 눌렀을 때 사진이 나와야 한다.
+          const withPhoto = { ...dangerByBlockRef.current };
+          let touched = false;
+          for (const [bid, e] of Object.entries(withPhoto)) {
+            if (e && e.eventId === eid) {
+              withPhoto[bid] = { ...e, imageUrl: url };
+              touched = true;
+            }
+          }
+          if (touched) dangerByBlockRef.current = withPhoto;
+          return;
+        }
+
         // ② 위험 이벤트(fallen_person/fire/no_helmet/ship_defect)
         const meta = CLASS_META[type];
-        if (!meta) return; // stream_boost 등 프론트가 보내는 종류가 되돌아오면 무시
+        if (!meta) return; // event_ack 등 프론트가 보낸 종류가 되돌아오면 무시
 
         // 배 위(구획 안)인지 배 밖(작업장)인지 먼저 판단 — 배 밖인 화재를 억지로
         // 구획에 눌러 붙이면 "화재가 배에서 떨어져 있는데 배 위에 핑이 찍힌다"가 된다.
@@ -1605,6 +1642,16 @@ export default function ShipyardTwinDashboard() {
           worldZ: conv && conv.onShip === false ? conv.worldZ : null,
           conf: data.confidence ?? 0,
           eventId: data.event_id ?? null, // 젯슨이 만든 고유 id — 나중에 event_cleared로 이 핑만 콕 집어 지울 때 씀
+          // 사람이 읽는 위치 문구("S3 왼편"). 지금 배 위치를 알고 있을 때 미리
+          // 계산해 붙여둔다 — 나중에 배가 다시 측량돼 좌표계가 조금 달라져도
+          // 그때 찍힌 위치 그대로 남아 로그의 기록성이 유지된다.
+          locLabel: describePingLocation(data.map_xy ?? null, shipPoseRef.current, blockId),
+          // 감지 순간 사진. 실시간에는 아직 없고(사진은 곧 이어서 별도 메시지로 온다),
+          // 재접속 복원으로 온 이벤트에는 서버가 image_url 을 붙여서 보내준다.
+          imageUrl: data.image_url ? SNAPSHOT_BASE_URL + data.image_url : null,
+          // 서버가 재접속 복원으로 다시 보내준 것인지. 새로 감지된 것이 아니므로
+          // 핑은 그리되 팝업은 띄우지 않는다 (handleDetectionEvent 참고).
+          replay: data.replay === true,
         });
       },
     });
@@ -1758,7 +1805,9 @@ export default function ShipyardTwinDashboard() {
                 <button key={e.id} className={`log-row sev-${e._meta.severity}`} onClick={() => openBlockView(e)}>
                   <span className="log-dot" style={{ background: SEV_COLOR[e._meta.severity] }} />
                   <span className="log-cls">{e._meta.label}</span>
-                  <span className="log-block">{e.blockId}</span>
+                  {/* "S3"보다 "S3 왼편"이 관제사에게 쓸모 있다. 배 위치를 아직
+                      못 받아 문구를 못 만든 경우에만 구획 id로 되돌아간다. */}
+                  <span className="log-block">{e.locLabel || e.blockId}</span>
                   <span className="log-conf">{(e.conf * 100).toFixed(0)}%</span>
                   <span className="log-time">{new Date(e.ts).toLocaleTimeString("ko-KR", { hour12: false })}</span>
                 </button>
@@ -1907,7 +1956,7 @@ const CSS = `
 .log-row.sev-info { border-left-color:#36d399; }
 .log-dot { width:8px; height:8px; border-radius:50%; }
 .log-cls { font-size:12px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.log-block { font-size:11px; color:#2dd4bf; font-weight:700; }
+.log-block { font-size:11px; color:#2dd4bf; font-weight:700; white-space:nowrap; }
 .log-conf { font-size:11px; color:#7d8aa3; font-variant-numeric:tabular-nums; }
 .log-time { font-size:10px; color:#5a6580; font-variant-numeric:tabular-nums; }
 
@@ -1925,6 +1974,13 @@ const CSS = `
 .popup-meta > div { display:flex; justify-content:space-between; font-size:12px; border-bottom:1px solid #161f2e; padding-bottom:7px; }
 .popup-meta .k { color:#7d8aa3; }
 .popup-meta .v { color:#e6edf6; font-weight:600; }
+
+/* 감지 순간 스냅샷. 젯슨이 보낸 crop 이라 가로세로가 제각각이므로
+   높이만 묶어두고 비율은 유지한다(object-fit:contain). */
+.popup-snap { margin:0; padding:12px 16px 0; }
+.popup-snap-img { display:block; width:100%; max-height:190px; object-fit:contain;
+  background:#0c1118; border:1px solid #1d2836; border-radius:6px; }
+.popup-snap-cap { margin-top:6px; font-size:11px; color:#7d8aa3; letter-spacing:.02em; }
 .popup-actions { padding:0 16px 16px; display:flex; flex-direction:column; gap:8px; }
 .popup-ack-btn {
   width:100%; padding:12px; border-radius:9px; border:1px solid #2dd4bf;
