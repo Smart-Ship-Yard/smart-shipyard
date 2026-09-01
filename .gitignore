@@ -65,3 +65,15 @@ edge/ros2_ws/src/ship_ugv_perception/weights/*.bak-*
 #   StaticFiles(directory="snapshots") 가 폴더를 못 찾아 서버가 죽는다.
 backend/snapshots/*
 !backend/snapshots/.gitkeep
+
+# graphify install 이 "CLAUDE.md 가 없는 폴더"에서 실행되면 거기에 9줄짜리 안내
+# 파일을 자동 생성한다 (예: backend/CLAUDE.md). 루트 CLAUDE.md 의 graphify 절과
+# 내용이 같아 중복이므로 커밋하지 않는다. 루트 것은 팀 공유 파일이라 유지한다.
+CLAUDE.md
+!/CLAUDE.md
+
+# mediamtx 가 MoQ용으로 자동 생성하는 자체 서명 인증서.
+# 실행한 폴더에 만들어지는데, systemd 유닛은 WorkingDirectory 를 ~/mediamtx 로
+# 잡아두어 여기 생기지 않는다. 수동 실행 시 대비해 막아둔다.
+auto.crt
+auto.key
