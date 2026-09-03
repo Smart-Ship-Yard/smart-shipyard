@@ -40,6 +40,7 @@ timestamp는 서버가 붙이므로 생략.
 """
 
 import json
+from collections import Counter, deque
 import math
 import queue
 import re
@@ -50,7 +51,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
-from std_msgs.msg import String, Int32
+from std_msgs.msg import String, Int32, Bool
 from nav_msgs.msg import Odometry
 
 try:
@@ -99,11 +100,15 @@ class WebSocketClient(Node):
         self.declare_parameter('fail_log_interval_s', 15.0)
         self.declare_parameter('block_id', 'B1')
         self.declare_parameter('block_level_stability_s', 3.0)
+        # ★ 다수결 투표로 바꿨다 (2026-08-27). 아래 _handle_block_level 참고.
+        self.declare_parameter('block_level_vote_ratio', 0.6)
+        self.declare_parameter('block_level_min_samples', 6)
 
         # ★ 2026-08-21: 카메라 오프셋·TF 파라미터를 지웠다. map_xy 변환은
         #   change_point_detector 가 전담하고, 이 노드는 그 결과만 받는다.
         self.declare_parameter('map_point_topic', '/event_detection/map_point')
         self.declare_parameter('cleared_topic', '/event_detection/cleared')
+        self.declare_parameter('snapshot_topic', '/event_detection/snapshot')
 
         # ★ 수신 루프 관련
         self.declare_parameter('inbound_topic', '/server/inbound')
@@ -143,8 +148,11 @@ class WebSocketClient(Node):
         self._ekf_lock = threading.Lock()
         self._ping_count = 0
 
-        self._level_candidate = None
-        self._level_candidate_since = None
+        self._level_window = deque()      # (시각, level) — 최근 창
+        self._level_vote_ratio = float(
+            self.get_parameter('block_level_vote_ratio').value)
+        self._level_min_samples = int(
+            self.get_parameter('block_level_min_samples').value)
         self._level_confirmed = None
         self._level_lock = threading.Lock()
 
@@ -155,6 +163,44 @@ class WebSocketClient(Node):
         #   block_level 은 이미 재연결마다 다시 보내고 있었다. 같이 맞춘다.
         #   (참조 대입 하나라 CPython 에서는 락 없이도 원자적이다)
         self._last_ship_pose = None
+
+        # ★ 위치 핑은 큐에 넣지 않는다 (2026-08-29).
+        #   서버가 꺼져 있는 동안에도 0.5초마다 만들어지므로 큐에 넣으면
+        #   1시간 끊김 = 7,200건이 쌓였다가 재연결 순간 한꺼번에 쏟아진다.
+        #   서버와 프론트가 과거 좌표를 순서대로 재생하게 된다.
+        #   **위치는 최신 하나만 의미가 있으므로** 슬롯 하나로 덮어쓴다.
+        #   (이벤트는 하나도 버리면 안 되므로 큐를 그대로 쓴다)
+        self._pending_position = None
+
+        # ★ 지금 현장에 살아있는 위험 이벤트 거울 (2026-08-29).
+        #   서버가 재시작하면 프론트가 빈 화면으로 시작하는데, 로봇은
+        #   change_point 가 이미 기억하고 있어 **재발행을 하지 않는다.**
+        #   그래서 불이 눈앞에 있는데 화면에는 아무것도 없는 상태가
+        #   **무기한** 이어진다 (event_ttl 은 재검출마다 갱신되므로 만료되지
+        #   않는다). 재연결할 때 다시 알려서 화면을 진실과 맞춘다.
+        #   조립 단계·배 위치가 이미 쓰는 방식과 같다.
+        #
+        #   change_point 는 건드리지 않는다 — 로봇이 멈추는 판단
+        #   (/map_point -> event_gate)에는 영향이 없어야 하기 때문이다.
+        self._active_events = {}          # event_id -> payload
+        self._active_lock = threading.Lock()
+        # ★ 이번 연결에서 서버에 이미 알린 event_id (2026-08-29).
+        #   재통보를 "연결 성립 순간 한 번" 으로 두면, change_point 의 활성
+        #   목록이 그보다 늦게 도착할 때(실측 1.47초) 거울이 비어 있어 아무것도
+        #   못 보내고 다시는 기회가 없다. 무엇을 알렸는지로 판단하면 도착
+        #   순서가 어떻든 결과가 같다.
+        self._announced = set()
+        self._ws_live = False
+        # ★ "로봇 준비 완료" 신호 (2026-08-29).
+        #   서버의 connected 는 소켓이 열린 시점이라 로컬라이제이션만 떠도
+        #   켜진다. 그때는 AMCL 도 Nav2 도 없어서 로봇이 순찰도 못 하고
+        #   이벤트도 못 잡는다. 화면만 준비된 것처럼 보이는 구간이다.
+        #   실제로 준비된 시점은 두 가지가 다 맞아야 한다:
+        #     · change_point 가 armed (AMCL 확인 -> 좌표를 믿을 수 있다)
+        #     · patrol 이 WAIT_NAV2 를 벗어남 (Nav2 액션 서버가 응답했다)
+        self._armed = False
+        self._nav_ready = False
+        self._ready_sent = False
 
         # ★ 서버 -> 젯슨 수신 메시지를 그대로 중계할 퍼블리셔 (해석하지 않음)
         self.inbound_pub = self.create_publisher(String, inbound_topic, 10)
@@ -176,6 +222,29 @@ class WebSocketClient(Node):
         self.create_subscription(
             String, self.get_parameter('cleared_topic').value,
             self._cleared_cb, 10)
+        # ★ 이벤트 스냅샷 (2026-08-27). yolo_depth_publisher 가 **새 이벤트에
+        #   대해서만** 인코딩해 보내준다. 프론트가 핑을 눌렀을 때 "그때 무슨
+        #   일이 있었나" 를 보여줄 사진 한 장이다.
+        self.create_subscription(
+            String, self.get_parameter('snapshot_topic').value,
+            self._snapshot_cb, 10)
+
+        # ★ change_point 의 살아있는 이벤트 목록 (2026-08-29).
+        #   /map_point 는 새 이벤트만 나가므로, 재시작으로 복원된 것은
+        #   여기서 알 길이 없었다. 실제로 젯슨이 4건을 기억하는데 서버에는
+        #   1건만 재통보됐다. latch 로 받아 거울을 통째로 맞춘다.
+        self.create_subscription(
+            String, '/event_detection/active', self._active_list_cb,
+            QoSProfile(depth=1,
+                       durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=QoSReliabilityPolicy.RELIABLE))
+        self.create_subscription(
+            Bool, '/event_detection/armed', self._armed_cb,
+            QoSProfile(depth=1,
+                       durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=QoSReliabilityPolicy.RELIABLE))
+        self.create_subscription(
+            String, '/patrol/status', self._patrol_status_cb, 10)
         self.create_subscription(Odometry, ekf_topic, self._ekf_cb, 10)
         # ★ ship_pose는 ship_survey_node가 측량 끝날 때 딱 1번만 발행하고, 그 시점은
         #   매핑 랩 도중이라 이 노드보다 먼저 끝나 있을 수 있다. 기본 QoS(VOLATILE)로
@@ -220,11 +289,12 @@ class WebSocketClient(Node):
         if ekf_global is None or yaw is None:
             return
 
-        self._enqueue({
+        # ★ 큐가 아니라 슬롯에 덮어쓴다 (위 _pending_position 주석 참고)
+        self._pending_position = {
             'event_type': 'position',
             'ekf_global': ekf_global,
             'yaw': yaw,
-        })
+        }
 
         self._ping_count += 1
         if self._ping_count % 10 == 0:
@@ -250,6 +320,133 @@ class WebSocketClient(Node):
         level = extract_level(class_id)
         if level is not None:
             self._handle_block_level(class_id, level)
+
+    def _snapshot_cb(self, msg: String):
+        """이벤트 스냅샷을 서버로 그대로 넘긴다.
+
+        서버는 이 base64 를 파일로 저장하고 DB 에는 경로만 남긴다
+        (docs 협의: 이벤트 문서에 이미지를 통째로 넣으면 재접속 복원 때마다
+        이미지가 전부 다시 흐른다).
+        """
+        try:
+            d = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        if not d.get('image_b64'):
+            return
+        self._enqueue({
+            'event_type': 'event_snapshot',
+            'block_id': self.block_id,
+            'event_id': d.get('event_id'),
+            'cls': d.get('class_id'),
+            'image_b64': d['image_b64'],
+        })
+        self.get_logger().info(
+            f"[스냅샷 큐] {d.get('class_id')} event_id={d.get('event_id')} "
+            f"{len(d['image_b64'])/1024:.0f} KB")
+
+    def _active_list_cb(self, msg: String):
+        """change_point 가 알려준 살아있는 목록으로 거울을 맞춘다.
+
+        여기가 진실이다 — change_point 가 재시작으로 복원한 것까지 포함한다.
+        거울을 통째로 교체하므로 치워진 것이 남아 되살아나는 일도 없다.
+        """
+        try:
+            items = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        mirror = {}
+        for it in items:
+            eid = it.get('event_id')
+            etype = DANGER_CLASS_MAP.get(str(it.get('class_id', '')))
+            if not eid or etype is None:
+                continue      # level* 등 위험 이벤트가 아닌 것은 제외
+            mirror[eid] = {
+                'event_type': etype,
+                'confidence': float(it.get('confidence', 0.0)),
+                'map_xy': [float(it.get('map_x', 0.0)),
+                           float(it.get('map_y', 0.0))],
+                'event_id': eid,
+                'ekf_global': self._get_ekf_state()[0],
+            }
+        with self._active_lock:
+            before = len(self._active_events)
+            self._active_events = mirror
+            # 목록에서 빠진 것은 "알린 적 없음" 으로 되돌린다. 치웠다가 같은
+            # 자리에 다시 생기면 그때 또 알려야 하기 때문이다.
+            self._announced &= set(mirror)
+        if before != len(mirror):
+            self.get_logger().info(
+                f"[활성목록] change_point 기준으로 맞춤: {before} -> {len(mirror)}건")
+        self._reannounce()
+
+    def _armed_cb(self, msg: Bool):
+        self._armed = bool(msg.data)
+        self._check_ready()
+
+    def _patrol_status_cb(self, msg: String):
+        try:
+            state = json.loads(msg.data).get('state')
+        except (ValueError, TypeError):
+            return
+        # WAIT_NAV2 를 벗어났다 = Nav2 액션 서버가 응답했다.
+        # STOPPED/BLOCKED 도 준비된 상태다 — 멈춰 있을 뿐 Nav2 는 살아있다.
+        if state and state != 'WAIT_NAV2':
+            self._nav_ready = True
+            self._check_ready()
+
+    def _check_ready(self):
+        """둘 다 맞으면 한 번만 알린다."""
+        if self._ready_sent or not (self._armed and self._nav_ready):
+            return
+        self._ready_sent = True
+        self.get_logger().warn(
+            "🤖 로봇 준비 완료 — change_point armed + Nav2 응답. 서버에 알린다")
+        self._send_ready()
+
+    def _send_ready(self):
+        self._enqueue({
+            'event_type': 'jetson_ready',
+            'block_id': self.block_id,
+            'armed': self._armed,
+            'nav_ready': self._nav_ready,
+        })
+
+    def _reannounce(self):
+        """아직 서버에 안 알린 활성 이벤트를 replay 로 내보낸다.
+
+        연결 직후에도, 활성 목록이 늦게 도착했을 때도 같은 함수를 부른다.
+        무엇을 알렸는지로 판단하므로 두 번 불려도 중복 전송이 없다.
+        """
+        if not self._ws_live:
+            return            # 연결되면 그때 다시 부른다
+        with self._active_lock:
+            pending = [dict(v) for k, v in self._active_events.items()
+                       if k not in self._announced]
+            self._announced.update(self._active_events)
+        for ev in pending:
+            ev['replay'] = True
+            self._enqueue(ev)
+        if pending:
+            self.get_logger().info(
+                f"[위험이벤트 재통보] {len(pending)}건 재전송: "
+                + ', '.join(str(e.get('event_id')) for e in pending))
+
+    def _reset_if_asked(self, data):
+        """프론트 [초기화] 버튼이 서버를 거쳐 오면 거울도 비운다.
+
+        change_point 는 자기 목록을 비우고, 여기서는 재통보용 거울을 비운다.
+        둘 다 안 비우면 다음 재연결에 지워진 이벤트가 되살아난다.
+        """
+        if not isinstance(data, dict):
+            return
+        if data.get('event_type') != 'reset_events':
+            return
+        with self._active_lock:
+            n = len(self._active_events)
+            self._active_events.clear()
+            self._announced.clear()
+        self.get_logger().warn(f"🧹 재통보 거울 초기화 — {n}건 지움")
 
     def _map_point_cb(self, msg: String):
         """change_point_detector 가 위치 기준 중복 제거를 마친 위험 이벤트.
@@ -296,6 +493,13 @@ class WebSocketClient(Node):
             'event_id': det.get('event_id'),
             'ekf_global': ekf_global,
         }
+        # ★ 거울에 넣는다 — 재연결 때 다시 알리려고
+        #   (위 _active_events 주석 참고)
+        _eid = payload.get('event_id')
+        if _eid:
+            with self._active_lock:
+                self._active_events[_eid] = dict(payload)
+                self._announced.add(_eid)
         self._enqueue(payload)
         self.get_logger().info(
             f"[위험이벤트 큐] {event_type} conf={confidence:.2f} "
@@ -322,42 +526,74 @@ class WebSocketClient(Node):
             self.get_logger().warn(f"/cleared 파싱 실패: {e}")
             return
 
+        # 치워졌으므로 거울에서도 뺀다
+        _eid = payload.get('event_id')
+        if _eid:
+            with self._active_lock:
+                self._active_events.pop(_eid, None)
         self._enqueue(payload)
         self.get_logger().info(
             f"[치워짐 큐] {payload['cls']} event_id={payload['event_id']}")
 
     def _handle_block_level(self, class_id, level):
+        """최근 창에서 **다수결**로 조립 단계를 확정한다.
+
+        ★ 왜 다수결인가 (2026-08-27)
+
+        예전에는 "마지막 값이 block_level_stability_s 동안 계속 같아야" 확정했다.
+        값이 하나만 달라도 시계가 리셋되는 구조라, 검출이 조금만 흔들려도
+        영영 확정이 안 되거나, 반대로 틀린 값이 우연히 연속으로 나오면
+        그게 그대로 확정됐다.
+
+        실물에서 조립 단계 검출은 이렇게 흔들린다(실측):
+            깨끗한 정면      level3 0.434 (+ level1 0.036 딸려 나옴)
+            배가 40% 잘림    level3 0.629 + level4 0.345
+            배가 50% 잘림    level4 0.561   <- 뒤집힘
+            모션블러 7px     검출 없음
+
+        그래서 한 표씩 모아 다수결로 본다. 의견이 갈리면(득표율이
+        block_level_vote_ratio 미만) **아무것도 확정하지 않는다** — 틀린 값을
+        내보내는 것보다 조용한 편이 낫다.
+
+        (잘린 화면을 아예 안 받도록 하는 것은 yolo_depth_publisher 의
+         reject_level_touching_edge 가 맡는다. 여기까지 오는 표는 이미
+         "온전히 담긴 배" 에서 나온 것이다.)
+        """
         now = self.get_clock().now()
 
         with self._level_lock:
-            if self._level_candidate != level:
-                self._level_candidate = level
-                self._level_candidate_since = now
+            self._level_window.append((now, level))
+            cutoff = now - self.block_level_stability
+            while self._level_window and self._level_window[0][0] < cutoff:
+                self._level_window.popleft()
+
+            if len(self._level_window) < self._level_min_samples:
+                return
+
+            counts = Counter(lv for _, lv in self._level_window)
+            winner, votes = counts.most_common(1)[0]
+            ratio = votes / len(self._level_window)
+            if ratio < self._level_vote_ratio:
                 self.get_logger().info(
-                    f"[조립단계] 새 후보 감지: class_id={class_id} level={level} (안정화 대기 시작)")
+                    f"[조립단계] 의견이 갈림 {dict(counts)} — 확정 보류",
+                    throttle_duration_sec=10.0)
                 return
 
-            elapsed = now - self._level_candidate_since
-            if elapsed < self.block_level_stability:
+            if self._level_confirmed == winner:
                 return
-
-            if self._level_confirmed == level:
-                return
-
-            self._level_confirmed = level
+            self._level_confirmed = winner
 
         payload = {
             'event_type': 'block_level',
             'block_id': self.block_id,
-            'level': level,
+            'level': winner,
         }
         self._enqueue(payload)
-
-        # ★ ship_survey_node의 재측량 트리거 (interface.md ④: 조립 단계가 바뀌면
-        #   조립 과정에서 배가 밀리거나 돌아갔을 수 있으므로 다시 측량해야 함)
-        self.block_level_pub.publish(Int32(data=level))
-
-        self.get_logger().info(f"[조립단계 확정] level={level} -> 전송 + 재측량 트리거")
+        self.block_level_pub.publish(Int32(data=winner))
+        self.get_logger().info(
+            f"[조립단계 확정] level={winner} "
+            f"({votes}/{len(self._level_window)}표, {100*ratio:.0f}%) "
+            "-> 전송 + 재측량 트리거")
 
     def _ship_pose_cb(self, msg: String):
         try:
@@ -403,6 +639,10 @@ class WebSocketClient(Node):
 
             out_msg = String()
             out_msg.data = message
+            try:
+                self._reset_if_asked(json.loads(message))
+            except (ValueError, TypeError):
+                pass
             self.inbound_pub.publish(out_msg)
             self.get_logger().info(f"[수신] /server/inbound 로 중계: {message[:200]}")
 
@@ -438,11 +678,29 @@ class WebSocketClient(Node):
                     self.get_logger().info(
                         f"[배위치 재통보] map_xy={last_pose['map_xy']} 재전송")
 
+                # ★ 지금 살아있는 위험 이벤트도 다시 알린다 (2026-08-29).
+                #   서버가 재시작하면 프론트는 빈 화면인데 change_point 는
+                #   이미 기억하고 있어 재발행하지 않는다. 그대로 두면 불이
+                #   눈앞에 있는데 화면에는 아무것도 없는 상태가 **무기한**
+                #   이어진다(event_ttl 은 재검출마다 갱신되므로 만료 안 됨).
+                #   replay 를 실어 보내 프론트가 팝업 없이 핑만 그리게 한다.
+                with self._active_lock:
+                    self._announced.clear()
+                self._ws_live = True
+                self._reannounce()
+                if self._ready_sent:
+                    # 프론트가 새로고침됐을 수 있다. 준비 상태를 다시 알린다.
+                    self._send_ready()
+
                 while not self._stop_event.is_set():
+                    # 이벤트가 먼저다. 큐가 비었을 때만 최신 위치를 보낸다.
                     try:
-                        payload = self.send_queue.get(timeout=1.0)
+                        payload = self.send_queue.get(timeout=0.2)
                     except queue.Empty:
-                        continue
+                        payload = self._pending_position
+                        self._pending_position = None
+                        if payload is None:
+                            continue
 
                     try:
                         ws.send(json.dumps(payload))
@@ -471,6 +729,7 @@ class WebSocketClient(Node):
                     self._last_fail_log = now
                     self._fail_count = 0
             finally:
+                self._ws_live = False
                 if ws is not None:
                     try:
                         ws.close()

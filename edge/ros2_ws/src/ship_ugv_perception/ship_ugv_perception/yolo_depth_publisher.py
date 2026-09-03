@@ -33,8 +33,7 @@ Astra+ 카메라로 Color+Depth를 받아 YOLO로 객체를 검출하고,
   (슈퍼레졸루션과 다름). 화질을 올리는 게 아니라 "특징맵 상의 공간 여유"를
   늘려주는 것이다.
   개별 박스 처리(1차 필터 + depth 계산 + 발행)를 _evaluate_box() 로 공통화해
-  메인 검출(track_id 있음)과 crop 검출(track_id 없음 -> fallback 경로)이 같은
-  로직을 쓰게 했다. crop 좌표는 원본 프레임 좌표로 환산해서 넘긴다.
+  메인 검출과 crop 검출이 같은 로직을 쓰게 했다. crop 좌표는 원본 프레임 좌표로 환산해서 넘긴다.
 
   ⚠️ CPU 주의: person 한 명당 추론이 한 번씩 더 돈다. 2026-08-18 에 CPU 포화로
      Nav2 lifecycle 전환이 타임아웃되어 브링업이 통째로 실패한 적이 있으므로,
@@ -43,6 +42,8 @@ Astra+ 카메라로 Color+Depth를 받아 YOLO로 객체를 검출하고,
      person_crop_max_count / person_crop_target_size 를 줄인다.
 """
 
+import array
+import base64
 import json
 import time
 import math
@@ -78,11 +79,23 @@ def is_level_class(class_name: str) -> bool:
 #   전역값(기본 0.2)을 그대로 씁니다.
 #   예: no_helmet/fallen_person 은 놓치면 안 되니 낮게, fire/helmet 처럼
 #   배경 오탐이 잦은 클래스는 높게 두는 식으로 조정하세요.
+# 이벤트 스냅샷을 남길 클래스 (위험 이벤트만). 프론트가 핑을 눌렀을 때
+# "그때 무슨 일이 있었나" 를 보여주는 사진 한 장이다.
+SNAPSHOT_CLASSES = ('fire', 'fallen_person', 'no_helmet')
+
 CLASS_CONFIDENCE = {
     'no_helmet': 0.15,
     'fallen_person': 0.15,
     'fire': 0.45,
     'helmet': 0.35,
+    # ★ 조립 단계(level1~5) 임계값 신설 (2026-08-27).
+    #   여태 여기 없어서 전역값(0.1)을 그대로 썼고, 그 결과
+    #   conf 0.02~0.08 짜리 쓰레기 검출이 그대로 발행돼 대시보드 공정률이
+    #   요동쳤다. 실측: 깨끗한 정면 프레임에서 level3 0.434 가 1위인데
+    #   level1 0.036 / 0.014 가 같이 딸려 나왔다.
+    #   진짜 판정은 0.43~0.83 에서 나오므로 0.35 로 가른다.
+    'level1': 0.35, 'level2': 0.35, 'level3': 0.35,
+    'level4': 0.35, 'level5': 0.35,
 }
 
 
@@ -211,6 +224,84 @@ class YoloDepthPublisher(Node):
                 "person_crop_enabled=True 이지만 모델에 helmet/no_helmet 이 없음 - 비활성화")
             self.person_crop_enabled = False
 
+        # 1차 통과 문턱은 '가장 낮은 클래스 임계값'. 클래스별 판정은
+        # _evaluate_box 가 _conf_for() 로 다시 한다.
+        self._min_conf = min([self.conf_threshold] + list(self.class_conf.values()))
+
+        # ★ 이벤트 스냅샷 (2026-08-27).
+        #   프론트에서 핑을 누르면 "그 이벤트가 감지되던 순간의 사진" 을 본다.
+        #   ★★ 인코딩은 **중복 제거를 통과한 새 이벤트에 대해서만** 한다.
+        #   매 프레임 crop->JPEG 하면 초당 수십 번이 되어 CPU 그림이 완전히
+        #   달라진다(실측: crop 인코딩 1.28 ms + base64 0.12 ms). 그래서
+        #   여기서는 **자르기만 해서 들고 있고**(numpy 슬라이스 복사, 0.05 ms
+        #   수준), change_point_detector 가 새 이벤트를 확정해 발행했을 때
+        #   그 시점에 딱 한 번 인코딩한다.
+        # ★ 배가 화면에서 잘리면 조립 단계를 오판한다 (2026-08-27 실측).
+        #   같은 배를 잘라가며 재보니:
+        #       전체        level3 0.434
+        #       왼쪽 40% 잘림 level3 0.629 + level4 0.345
+        #       왼쪽 50% 잘림 level4 0.561   <- 뒤집힘
+        #   그래서 bbox 가 화면 테두리에 닿으면(= 잘린 것) 조립 단계 판정에서
+        #   제외한다.
+        #
+        #   ★ 실물에서도 True 로 둔다 (2026-08-27 판단).
+        #   실물 배는 순찰 거리에서 대개 화면에 다 안 들어온다. 그래서 처음엔
+        #   "실물이면 꺼야 한다" 고 봤는데, 다시 따져보니 그 반대다:
+        #     - 조립 단계는 **위험 이벤트가 아니다.** 빨리 갱신될 필요가 없고,
+        #       한 바퀴에 한 번만 맞게 갱신돼도 충분하다.
+        #     - 순찰 궤도 어딘가에는 배가 온전히 들어오는 지점이 생긴다.
+        #       그 지점의 판정만 받으면 된다.
+        #     - 잘린 화면으로 자주 갱신하는 것보다, 드물게 맞는 편이 낫다.
+        #   즉 **갱신 빈도를 내주고 정확도를 산다.** 위험 이벤트였다면
+        #   반대로 골랐겠지만 조립 단계는 그래도 된다.
+        #
+        #   ⚠️ 대신 위험이 하나 생긴다: 배가 **한 번도** 온전히 안 잡히면
+        #   공정률이 조용히 멈춘다. 그래서 아래 _warn_if_level_starved 로
+        #   시끄럽게 알린다. 조용한 실패가 제일 나쁘다.
+        self.declare_parameter('reject_level_touching_edge', True)
+        self.declare_parameter('edge_margin_px', 3)
+        self.reject_level_edge = bool(
+            self.get_parameter('reject_level_touching_edge').value)
+        self.edge_margin = int(self.get_parameter('edge_margin_px').value)
+        # ★ "온전한 배를 못 본 지 오래됐다" 를 무엇으로 재는가 (2026-08-27)
+        #
+        #   1순위는 **순찰 바퀴 수**다. patrol_mission_node 가 /patrol/status 로
+        #   laps 를 이미 발행하고 있으므로, 로봇 위치를 다시 계산할 필요가 없다.
+        #   "한 바퀴를 다 돌았는데 한 번도 온전히 못 봤다" 가 정확히 우리가
+        #   알고 싶은 것이고, 시간 기준과 달리 주행 속도·이벤트 정지·복구행동에
+        #   흔들리지 않는다. (같은 이유로 change_point 의 치워짐 판정도
+        #   시간 기준에서 위치 기준으로 바꿨다 — 그때 배운 것을 여기 적용한다)
+        #
+        #   다만 이 노드는 systemd 로 항상 떠 있고 Nav2 는 껐다 켠다. 순찰이
+        #   안 돌면 laps 가 영영 안 오므로, 그때는 시간 기준으로 물러난다.
+        self.declare_parameter('level_starved_warn_laps', 1)
+        self.declare_parameter('level_starved_warn_s', 180.0)
+        self.level_starved_laps = int(
+            self.get_parameter('level_starved_warn_laps').value)
+        self.level_starved_warn = float(
+            self.get_parameter('level_starved_warn_s').value)
+        self._level_last_pass = time.time()   # 마지막으로 '온전한 배'를 본 시각
+        self._level_edge_rejects = 0
+        self._patrol_laps = None              # 순찰이 안 돌면 None
+        self._level_last_pass_lap = None
+        self.create_subscription(
+            String, '/patrol/status', self._patrol_status_cb, 10)
+
+        self.declare_parameter('snapshot_enabled', True)
+        self.declare_parameter('snapshot_jpeg_quality', 70)
+        self.declare_parameter('snapshot_margin_px', 40)
+        self.snapshot_enabled = bool(self.get_parameter('snapshot_enabled').value)
+        self.snapshot_quality = int(self.get_parameter('snapshot_jpeg_quality').value)
+        self.snapshot_margin = int(self.get_parameter('snapshot_margin_px').value)
+        self._last_crop = {}          # class_name -> BGR crop (인코딩 전)
+        self._crop_lock = threading.Lock()
+
+        if self.snapshot_enabled:
+            self.snapshot_pub = self.create_publisher(
+                String, '/event_detection/snapshot', 10)
+            self.create_subscription(
+                String, '/event_detection/map_point', self._snapshot_cb, 10)
+
         self.pub = self.create_publisher(String, topic, 10)
         # 화면 중앙 뎁스 탐침 결과 (measure_ship_center.py 가 쓴다)
         self.probe_pub = self.create_publisher(
@@ -238,6 +329,16 @@ class YoloDepthPublisher(Node):
         depth_profile = profile_list.get_default_video_stream_profile()
         config.enable_stream(depth_profile)
 
+        # ★ 뎁스-컬러 정렬은 소프트웨어 모드로 둔다.
+        #   HW_MODE(카메라 칩이 정렬)로 바꿔 CPU 를 아낄 수 있는지 실측해
+        #   봤으나 차이가 없었다(2026-08-27: 1.77코어 -> 1.77코어). 이 카메라
+        #   에서는 HW_MODE 를 켜도 결국 같은 경로를 타는 것으로 보인다.
+        #   검증된 이득이 없는 변경은 되돌린다 — 정렬 방식이 바뀌면 뎁스
+        #   품질도 미묘하게 달라질 수 있어 굳이 위험을 질 이유가 없다.
+        #   (실제 CPU 범인은 영상 발행의 rclpy 원소 검사였다. _encode_and_publish
+        #    주석 참고)
+        #   DISABLE 은 선택지가 아니다 — (u,v) 로 뎁스를 못 찾아 좌표 변환이
+        #   통째로 깨진다.
         config.set_align_mode(OBAlignMode.SW_MODE)
         self.pipeline.start(config)
 
@@ -327,7 +428,15 @@ class YoloDepthPublisher(Node):
         msg = CompressedImage()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.format = 'jpeg'
-        msg.data = encoded.tobytes()
+        # ★ array.array 로 넣는다 — bytes 를 넣으면 안 된다 (2026-08-27).
+        #   rclpy 가 만든 uint8[] setter 는 array.array('B') 면 그대로 받고
+        #   끝내지만(O(1)), 그 외에는 원소를 전부 훑어 검사한다:
+        #       all(isinstance(v, int) for v in value)
+        #       all(0 <= val < 256 for val in value)
+        #   JPEG 한 장이 ~100KB 니 프레임당 20만 번, 30fps 면 초당 600만 번의
+        #   파이썬 루프다. py-spy 실측에서 이 한 줄이 프로세스 CPU 의 70% 를
+        #   먹고 있었다(추론보다 3.5배). CPU 포화로 Nav2 가 밀려 로봇이 멈췄다.
+        msg.data = array.array('B', encoded.tobytes())
         publisher.publish(msg)
 
     def _publish_center_probe(self, depth_image):
@@ -412,7 +521,8 @@ class YoloDepthPublisher(Node):
                     msg = CompressedImage()
                     msg.header.stamp = self.get_clock().now().to_msg()
                     msg.format = 'jpeg'
-                    msg.data = raw.tobytes()
+                    # 위 _encode_and_publish 의 주석 참고 — bytes 를 넣으면 안 된다
+                    msg.data = array.array('B', raw.tobytes())
                     self.raw_image_pub.publish(msg)
                     color_image = None      # 디코딩은 추론할 때만 (4 Hz)
                 else:
@@ -426,9 +536,18 @@ class YoloDepthPublisher(Node):
 
                 # ★ YOLO 처리 스레드(타이머)가 쓸 수 있게 최신 프레임 저장
                 with self._frame_lock:
-                    self._latest_raw = raw if is_jpeg else None
+                    # ★ .copy() 필수 (2026-08-27).
+                    #   raw 는 np.frombuffer 로 만든 **SDK 프레임 버퍼의 뷰**이고
+                    #   복사본이 아니다. 캡처 스레드가 다음 프레임으로 넘어가면
+                    #   SDK 가 그 버퍼를 재사용하므로, 추론 스레드가 250ms 뒤에
+                    #   읽을 때는 이미 다른 내용일 수 있다.
+                    #   영상 발행의 rclpy 원소 검사를 없애(2400배) 캡처 루프가
+                    #   빨라지자 이 경합이 바로 드러났다 — 카메라 화면은 멀쩡한데
+                    #   (발행 경로는 tobytes() 로 복사본을 쓴다) 추론만 검출 0건이
+                    #   되어 불을 봐도 로봇이 안 멈췄다.
+                    self._latest_raw = raw.copy() if is_jpeg else None
                     self._latest_color = color_image
-                    self._latest_depth = depth_image
+                    self._latest_depth = depth_image.copy()   # 위와 같은 이유(뷰 -> 복사)
                     # ★ 이 프레임을 언제 찍었는지 남긴다 (2026-08-19).
                     #   아래 _process_frame 이 YOLO 추론을 마친 뒤 검출을
                     #   발행하는데, 그 사이 55~305 ms 가 걸린다. 소비자
@@ -459,13 +578,31 @@ class YoloDepthPublisher(Node):
 
     # ------------------------------------------------------------------
     # ★ 박스 하나를 처리하는 공통 로직 (1차 필터 -> depth 계산 -> 발행).
-    #   메인 검출(track_id 있음)과 person crop 재검출(track_id None)이 함께 쓴다.
-    #   track_id 가 None 이면 자동으로 fallback(위치 기반) 경로를 타므로,
-    #   메인 검출과 위치가 겹치면 기존 dedup 이 알아서 중복을 걸러준다.
+    #   메인 검출과 person crop 재검출이 함께 쓴다. track_id 인자는 예전
+    #   트래커 시절의 잔재로 지금은 항상 None 이 들어온다(위 predict 주석
+    #   참고) — 즉 모든 검출이 연속 N프레임 확인 경로를 탄다.
     def _evaluate_box(self, class_name, conf, x1, y1, x2, y2, track_id,
                       depth_image, display_image, draw_box=True):
         if conf < self._conf_for(class_name):
             return
+
+        # ★ 잘린 배로 조립 단계를 판정하지 않는다 (위 reject_level_touching_edge
+        #   주석 참고). 위험 이벤트(fire 등)는 잘려도 "거기 있다" 는 사실이
+        #   중요하므로 이 규칙을 적용하지 않는다 — 조립 단계만 대상이다.
+        if self.reject_level_edge and class_name.startswith('level'):
+            h, w = depth_image.shape[:2]
+            m = self.edge_margin
+            if x1 <= m or y1 <= m or x2 >= w - m or y2 >= h - m:
+                self._level_edge_rejects += 1
+                self.get_logger().info(
+                    f"[조립단계] {class_name} conf={conf:.2f} — 배가 화면에서 "
+                    "잘려 판정 제외", throttle_duration_sec=10.0)
+                self._warn_if_level_starved()
+                return
+            # 온전히 들어온 배를 봤다 — 굶주림 시계와 바퀴 수를 되돌린다
+            self._level_last_pass = time.time()
+            self._level_last_pass_lap = self._patrol_laps
+            self._level_edge_rejects = 0
 
         u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
 
@@ -479,18 +616,6 @@ class YoloDepthPublisher(Node):
         if is_level_class(class_name):
             publish_ok = True
             key_info = "level(항상발행)"
-
-        elif track_id is not None:
-            # ★ 위치(맵 좌표) 기준 "이미 보고했나" 판단은 change_point_detector 가
-            #   한다. 여기서 화면좌표(u,v)로 한 번 더 걸러 영구히 기억해두면
-            #   (예전의 reported_tids/reported_fallbacks) 불을 옮기거나 다른
-            #   자리에 새로 놓아도 화면상 비슷한 위치라는 이유로 아예
-            #   발행조차 안 되는 사고가 난다(2026-08-24 실측: 불을 옮겨도
-            #   팝업/정지 둘 다 안 뜸). 트랙별로 매 프레임 그냥 발행하고,
-            #   실제 중복 제거는 map 좌표 기반인 change_point_detector 에
-            #   전부 맡긴다.
-            publish_ok = True
-            key_info = f"tid={track_id}"
 
         else:
             # ★ 트랙 ID가 없는 검출: 노이즈 필터링 목적으로만 연속
@@ -631,18 +756,139 @@ class YoloDepthPublisher(Node):
                                    None, depth_image, display_image, draw_box=False)
 
     # ------------------------------------------------------------------
+    def _patrol_status_cb(self, msg):
+        """순찰 바퀴 수만 받아둔다. 조립 단계 굶주림 판정에 쓴다."""
+        try:
+            self._patrol_laps = int(json.loads(msg.data).get('laps'))
+        except (ValueError, TypeError):
+            return
+        if self._level_last_pass_lap is None:
+            self._level_last_pass_lap = self._patrol_laps
+
+    def _warn_if_level_starved(self):
+        """배가 계속 잘려서 조립 단계가 한 번도 갱신되지 못하는 상황을 알린다.
+
+        reject_level_touching_edge 는 "온전히 보일 때만 판정한다" 는 정책이라,
+        순찰 궤도가 배에 너무 붙었거나 배가 커지면 **판정이 영영 안 나올 수
+        있다.** 그런데 그건 에러가 아니라 그냥 조용함이라 눈치채기 어렵다.
+        조용한 실패가 제일 나쁘므로 여기서 시끄럽게 만든다.
+
+        판정 기준은 **순찰 바퀴 수**다 — "한 바퀴를 다 돌았는데 한 번도
+        온전히 못 봤다" 가 정확히 알고 싶은 것이고, 주행 속도·이벤트 정지·
+        복구행동에 흔들리지 않는다. 순찰이 안 돌아 laps 가 없으면 시간으로
+        물러난다.
+        """
+        laps = self._patrol_laps
+        base = self._level_last_pass_lap
+        if laps is not None and base is not None:
+            behind = laps - base
+            if behind < self.level_starved_laps:
+                return
+            how = f"{behind}바퀴째"
+        else:
+            idle = time.time() - self._level_last_pass
+            if idle < self.level_starved_warn:
+                return
+            how = f"{idle/60:.0f}분째(순찰 정지 중이라 시간으로 잼)"
+
+        self.get_logger().warn(
+            f"[조립단계] {how} 배가 화면에 온전히 안 담긴다 "
+            f"(잘려서 제외한 검출 {self._level_edge_rejects}건). "
+            "공정률이 갱신되지 않고 있다 — 순찰 반경을 넓히거나, "
+            "reject_level_touching_edge 를 False 로 두고 부분 뷰 학습 모델을 쓸 것",
+            throttle_duration_sec=60.0)
+
+    # ------------------------------------------------------------------
+    def _stash_crop(self, class_name, color_image, x1, y1, x2, y2):
+        """검출 영역을 잘라서 들고만 있는다. 인코딩은 하지 않는다."""
+        h, w = color_image.shape[:2]
+        m = self.snapshot_margin
+        cx1 = max(0, int(x1) - m)
+        cy1 = max(0, int(y1) - m)
+        cx2 = min(w, int(x2) + m)
+        cy2 = min(h, int(y2) + m)
+        if cx2 - cx1 < 8 or cy2 - cy1 < 8:
+            return
+        crop = color_image[cy1:cy2, cx1:cx2].copy()
+        with self._crop_lock:
+            self._last_crop[class_name] = crop
+
+    def _snapshot_cb(self, msg):
+        """change_point_detector 가 **새 이벤트**를 확정했을 때만 불린다.
+
+        중복 제거를 통과한 것만 여기 오므로, 인코딩은 이벤트당 한 번뿐이다.
+        한 바퀴에 몇 건 수준이라 CPU 부담은 사실상 없다.
+        """
+        try:
+            det = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        cls = str(det.get('class_id', ''))
+        if cls not in SNAPSHOT_CLASSES:
+            return
+        with self._crop_lock:
+            crop = self._last_crop.get(cls)
+        if crop is None:
+            self.get_logger().warn(
+                f"[스냅샷] {cls} 이벤트인데 들고 있는 crop 이 없다 - 건너뜀")
+            return
+        try:
+            ok, enc = cv2.imencode(
+                '.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, self.snapshot_quality])
+            if not ok:
+                return
+            b64 = base64.b64encode(enc.tobytes()).decode('ascii')
+        except Exception as e:
+            self.get_logger().warn(f"[스냅샷] 인코딩 실패(무시): {e}")
+            return
+        out = String()
+        out.data = json.dumps({
+            'event_id': det.get('event_id'),
+            'class_id': cls,
+            'image_b64': b64,
+        })
+        self.snapshot_pub.publish(out)
+        self.get_logger().info(
+            f"[스냅샷] {cls} event_id={det.get('event_id')} "
+            f"{crop.shape[1]}x{crop.shape[0]} -> {len(b64)/1024:.0f} KB(base64)")
+
+    # ------------------------------------------------------------------
     # YOLO 처리 (캡처 스레드가 채워둔 최신 프레임을 가져다 씀, 카메라 속도와 무관)
     def _process_frame(self):
         color_image, depth_image = self._get_latest_frame()
         if color_image is None:
             return
 
-        results = self.model.track(
-            color_image,
-            persist=True,
-            verbose=False,
-            tracker=self.tracker_config
-        )[0]
+        # ★ track() 이 아니라 predict() 를 쓴다 (2026-08-27 실측 사고).
+        #   track(persist=True) 는 트래커 상태를 계속 누적하는데, 그 상태가
+        #   망가지면 **검출이 통째로 사라진다.** 실측: 같은 프레임에 대해
+        #       predict()  -> level3=0.79, fire=0.89
+        #       실행 중 노드 -> 검출 개수 0 (주석 영상에 박스가 하나도 없음)
+        #   YOLO 를 재시작하면 잠깐 정상으로 돌아왔다가 몇 분 뒤 다시 0이
+        #   되는 것도 "누적된 상태" 라는 설명과 맞는다.
+        #
+        #   그리고 우리는 이제 track_id 가 필요 없다. 예전에는 reported_tids
+        #   로 "이 트랙은 이미 보고했다" 를 기억했지만, 그 화면좌표 기반
+        #   중복 제거는 걷어냈다(커밋 057d5f3). 지금 위치 기반 중복 제거는
+        #   change_point_detector 가 map 좌표로 한다.
+        #   -> 트래커를 빼면 불안정 요인과 칼만 필터 CPU 가 함께 사라지고,
+        #      모든 검출이 아래 fallback 경로(연속 N프레임 확인)를 타므로
+        #      노이즈 필터는 오히려 일관돼진다.
+        #   ★ classes=None / conf 을 **매번 명시**해야 한다 (2026-08-27 실측 사고).
+        #   ultralytics 는 Model 하나가 predictor 하나를 공유하고, predict()
+        #   kwargs 를 그 predictor.args 에 **누적 병합**한다. 그래서 아래
+        #   _run_person_crop 이 self.model(crops, classes=[helmet,no_helmet])
+        #   를 한 번 부르면 그 classes 필터가 메인 추론에 눌러붙어, 그 뒤로는
+        #   fire/level 이 통째로 걸러진다. 재현:
+        #       predict()                 -> ['fire','fire']
+        #       model(x, classes=[2,8])   -> (person crop 경로)
+        #       predict()                 -> []        영구히 0건
+        #   화면에 사람이 한 번만 들어와도 그때부터 불을 영영 못 봤다.
+        #   conf 도 같은 이유로 명시한다 — 안 주면 ultralytics 기본값 0.25 라
+        #   confidence_threshold:=0.1 과 no_helmet/fallen_person 0.15 가
+        #   조용히 무시됐다(파라미터가 먹은 척만 하는 상태).
+        results = self.model.predict(color_image, verbose=False,
+                                     classes=None, conf=self._min_conf)[0]
 
         display_image = color_image.copy()
 
@@ -669,10 +915,17 @@ class YoloDepthPublisher(Node):
             cls = int(box.cls[0])
             conf = float(box.conf[0])
             class_name = self.model.names[cls]
-            track_id = int(box.id[0]) if box.id is not None else None
-
-            self._evaluate_box(class_name, conf, x1, y1, x2, y2, track_id,
+            # track_id 는 더 이상 쓰지 않는다(위 predict 주석 참고).
+            # None 을 넘겨 모든 검출이 연속 프레임 확인 경로를 타게 한다.
+            self._evaluate_box(class_name, conf, x1, y1, x2, y2, None,
                                depth_image, display_image)
+
+            # ★ 자르기만 해두고 인코딩은 안 한다 (위 snapshot 주석 참고).
+            #   display_image 가 아니라 color_image 를 쓴다 — 박스가 그려지기
+            #   전의 깨끗한 화면이어야 사진으로서 쓸모가 있다.
+            if (self.snapshot_enabled and class_name in SNAPSHOT_CLASSES
+                    and conf >= self._conf_for(class_name)):
+                self._stash_crop(class_name, color_image, x1, y1, x2, y2)
 
             # person 은 confidence 미달이면 crop 대상에서도 제외
             if (self.person_crop_enabled and class_name == 'person'

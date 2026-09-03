@@ -1,0 +1,15 @@
+[Unit]
+Description=MediaMTX RTSP/WebRTC Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/ship_yard/mediamtx /home/ship_yard/mediamtx.yml
+WorkingDirectory=/home/ship_yard
+Restart=always
+RestartSec=3
+User=ship_yard
+
+[Install]
+WantedBy=multi-user.target
+

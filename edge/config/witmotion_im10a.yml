@@ -1,0 +1,90 @@
+# WitMotion IM10A IMU 설정 — 우리가 튜닝한 값이다
+#
+# ★ 이 파일이 왜 여기 있나 (2026-08-28)
+#
+#   실제 사용 경로는 서브모듈 안이다:
+#       edge/ros2_ws/src/wit_ros2_imu/config/im10a.yml
+#   그런데 wit_ros2_imu 는 **남의 저장소(BlackPearlFSAE)** 라 우리가 커밋할
+#   수 없다. 그래서 이 파일은 서브모듈 안에서 추적되지 않는 채로 있었고,
+#   **젯슨이 날아가면 같이 사라지는 상태**였다.
+#
+#   covariance 값들은 기본값이 아니라 이 IMU 로 실측해 넣은 것이다. 다시
+#   재려면 시간이 든다. 그래서 우리 저장소에 원본을 두고, 서브모듈 쪽은
+#   이 파일을 가리키는 심링크로 만들었다:
+#
+#       edge/ros2_ws/src/wit_ros2_imu/config/im10a.yml
+#           -> ../../../../config/witmotion_im10a.yml   (이 파일)
+#
+#   즉 **여기가 원본이다.** 값을 바꾸려면 이 파일을 고치면 된다.
+#
+#   젯슨을 새로 세팅할 때 심링크가 없으면 이렇게 다시 만든다:
+#       ln -sf ../../../../config/witmotion_im10a.yml \
+#              edge/ros2_ws/src/wit_ros2_imu/config/im10a.yml
+#
+#   (같은 이유로 video_streamer.py 도 edge/streaming/ 으로 옮겨 심링크로
+#    연결했다. edge/streaming/README.md 참고)
+
+witmotion:
+  ros__parameters:
+    port: imu
+    baud_rate: 9600 # baud
+    polling_interval: 50 # ms
+    timeout_ms: 150 # ms
+    restart_service_name: /restart_imu
+    imu_publisher:
+      topic_name: /imu/data_raw
+      frame_id: imu
+      use_native_orientation: false
+      measurements:
+        acceleration:
+          enabled: true
+          covariance: [0.0088, 0.0, 0.0, 0.0, 0.0550, 0.0, 0.0, 0.0, 0.0267]
+        angular_velocity:
+          enabled: true
+          covariance: [0.1199, 0.0, 0.0, 0.0, 0.5753, 0.0, 0.0, 0.0, 0.0267]
+        orientation:
+          enabled: true
+          covariance: [0.0190, 0.0, 0.0, 0.0, 0.0120, 0.0, 0.0, 0.0, 0.0107]
+    temperature_publisher:
+      enabled: true
+      topic_name: /temperature
+      frame_id: base_link
+      from_message: magnetometer # acceleration, angular_vel, orientation, magnetometer
+      variance: 0.02683
+      coefficient: 1.0 # Linear calibration parameters: coefficient
+      addition: 0.0 # and addendum
+    magnetometer_publisher:
+      enabled: true
+      topic_name: /magnetometer
+      frame_id: imu
+      coefficient: 0.00000001 # Linear calibration parameters: coefficient
+      addition: 0.0 # and addendum
+      covariance:
+        [0.000000187123, 0.0, 0.0, 0.0, 0.000000105373, 0.0, 0.0, 0.0, 0.000000165816]
+    barometer_publisher:
+      enabled: true
+      topic_name: /barometer
+      frame_id: base_link
+      variance: 0.001
+      coefficient: 1.0 # Linear calibration parameters: coefficient
+      addition: 0.0 # and addendum
+    altimeter_publisher:
+      enabled: true
+      topic_name: /altitude
+      coefficient: 1.0 # Linear calibration parameters: coefficient
+      addition: 0.0 # and addendum
+    orientation_publisher:
+      enabled: true
+      topic_name: /orientation
+    gps_publisher:
+      enabled: false
+      navsat_fix_frame_id: world
+      navsat_fix_topic_name: /gps
+      navsat_altitude_topic_name: /gps_altitude
+      navsat_satellites_topic_name: /gps_satellites
+      navsat_variance_topic_name: /gps_variance
+      ground_speed_topic_name: /gps_ground_speed
+    rtc_publisher:
+      enabled: true
+      topic_name: /witmotion_clock
+      presync: true

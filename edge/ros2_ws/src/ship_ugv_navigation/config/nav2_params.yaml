@@ -123,8 +123,39 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /odometry/local    # 실물·시뮬 공통 (ekf_local 출력)
-    bt_loop_duration: 10
-    default_server_timeout: 20
+    # ★ 10 -> 50 (2026-08-28). Nav2 기본값 10ms(100 Hz)는 시뮬 기준이다.
+    #   젯슨에서는 이 속도를 못 지켰다 — 실측 16바퀴 도는 동안
+    #       Behavior Tree tick rate 100.00 was exceeded!   74회
+    #   전체 CPU 는 3.60/6 로 여유가 있었으므로 포화가 아니라, 이 노드만
+    #   제때 못 돈 것이다. YOLO·영상·EKF 와 코어를 나눠 쓰는 환경에서
+    #   100 Hz 는 과하다.
+    #
+    #   순찰은 초당 100번 판단할 일이 없다 — 웨이포인트 하나에 약 3초가
+    #   걸리므로 20 Hz(50ms)면 목표당 60번 틱이다. 충분하다.
+    #
+    #   ⚠️ 이 값은 **판단 주기이지 제어 주기가 아니다.** 실제 바퀴 명령은
+    #   controller_frequency(20 Hz)가 낸다. 여기를 낮춰도 주행이 거칠어지지
+    #   않는다. 반대로 여기만 높여도 제어가 부드러워지지 않는다.
+    bt_loop_duration: 50
+    # ★ 20 -> 200 (2026-08-28). 단위는 밀리초. BT 가 다른 노드에 뭘 시키고
+    #   응답을 기다리는 최대 시간이다. 20ms 는 Nav2 기본값이지만 시뮬 기준이라
+    #   젯슨에서는 코스트맵 하나 지우는 것도 못 끝낸다. 실측으로 세 번의 주행
+    #   모두에서 목표 100건당 4~6회씩 났다:
+    #       Node timed out while executing service call to
+    #           local_costmap/clear_entirely_local_costmap
+    #       Failed to get result for follow_path in node halt!
+    #
+    #   ★ 실제 사고 (2026-08-28 19:55): 사람이 로봇 앞을 막아섰다.
+    #     라이다가 사람을 보고 컨트롤러가 멈춘 것까지는 **정상 동작**이다.
+    #     그런데 사람이 비킨 뒤 BT 가 "코스트맵을 지워라" 로 복구하려는데
+    #     그 호출이 20ms 를 넘겨 실패했고, 코스트맵에 사람이 유령으로 남았다.
+    #     로봇은 있지도 않은 장애물을 피하려다 **진짜 벽에 부딪혔다.**
+    #     코스트맵 비우기는 바로 이런 상황을 위한 복구인데, 문턱이 너무
+    #     빡빡해서 정작 필요할 때 작동하지 못했다.
+    #
+    #   bt_loop_duration(50ms)의 4틱 분량이라 여유가 있다. 크게 잡으면 진짜
+    #   죽은 서버를 오래 기다리게 되므로 200 을 넘기지 말 것.
+    default_server_timeout: 200
 
     # ★ 행동트리(BT)는 Nav2 기본 대신 우리 것을 쓴다. space 가 골라준다.
     #     space:=narrow -> behavior_trees/navigate_no_spin.xml

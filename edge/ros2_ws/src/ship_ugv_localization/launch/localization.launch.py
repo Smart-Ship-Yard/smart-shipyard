@@ -10,15 +10,153 @@ ship_ugv_localization/launch/localization.launch.py
 이 launch에 포함하지 않았다. 실제 로봇 연결 후 별도 드라이버 launch를 추가할 것.
 """
 
+import json
 import os
 import sys
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 import subprocess
+import time
 
-from launch.actions import LogInfo
+from launch.actions import (ExecuteProcess, LogInfo, OpaqueFunction,
+                            RegisterEventHandler)
+from launch.event_handlers import OnProcessExit, OnShutdown
 from launch_ros.actions import Node
+
+
+def _check_yolo_freshness():
+    """YOLO(systemd)가 현재 소스보다 오래된 코드로 돌고 있으면 재시작한다.
+
+    ★ 왜 필요한가 (2026-08-26 실측 사고) ★
+    YOLO 는 이 launch 가 아니라 systemd 가 띄운다(아래 주석 참고). 그런데
+    파이썬은 프로세스를 시작할 때 코드를 한 번 읽고 끝이라, git pull +
+    colcon build 를 해도 **이미 돌고 있는 YOLO 는 옛 코드 그대로**다.
+    실제로 7시간 동안 팀원이 머지한 개선(클래스별 confidence, person crop)이
+    하나도 안 걸린 채 시험하고 있었고, 아무도 몰랐다. 파라미터가 없어서
+    ros2 param set 이 실패하고 나서야 발견했다.
+
+    그래서 여기서 "소스 수정 시각 > 프로세스 시작 시각" 이면 재시작한다.
+    - **최신이면 아무것도 안 한다** (매번 sudo 암호를 물으면 금방 안 쓰게 된다)
+    - 재시작이 필요할 때만 sudo 가 암호를 묻는다
+    - 실패해도 launch 를 죽이지 않는다. 크게 알리고 판단은 사람이 한다
+      (장치 확인 배너와 같은 철학)
+
+    반환: (mark, text) — 배너 한 줄로 쓸 표시와 설명.
+    """
+    # ★ realpath 로 심볼릭 링크를 먼저 푼다.
+    #   ros2 launch 로 실행하면 __file__ 은 install/ 쪽 경로다:
+    #       install/ship_ugv_localization/share/ship_ugv_localization/launch/...
+    #   colcon --symlink-install 이라 그 파일은 src/ 를 가리키는 심볼릭 링크인데,
+    #   abspath 는 링크를 풀지 않아 install/ 밑에서 소스를 찾다가 실패했다.
+    #   (src/ 에서 직접 돌린 테스트만 해서 못 잡았다 — 2026-08-26)
+    here = os.path.realpath(__file__)
+    rel = os.path.join('ship_ugv_perception', 'ship_ugv_perception',
+                       'yolo_depth_publisher.py')
+    src = None
+    d = os.path.dirname(here)
+    for _ in range(6):          # launch -> 패키지 -> src -> ... 위로 훑는다
+        for cand in (os.path.join(d, rel), os.path.join(d, 'src', rel)):
+            if os.path.exists(cand):
+                src = cand
+                break
+        if src:
+            break
+        d = os.path.dirname(d)
+    if src is None:
+        return '❔', '소스를 못 찾음 — 확인 생략 (경로 구조가 바뀌었는지 볼 것)'
+
+    # 래퍼(ros2 run)가 아니라 실제 노드 프로세스를 찾는다.
+    r = subprocess.run(['pgrep', '-f', 'lib/ship_ugv_perception/yolo_depth_publisher'],
+                       capture_output=True, text=True)
+    pids = [x for x in r.stdout.split() if x.isdigit()]
+    if not pids:
+        return '❌', 'YOLO 가 안 떠 있음 — sudo systemctl start yolo-depth-publisher'
+
+    try:
+        # /proc/<pid> 디렉터리의 mtime 이 곧 프로세스 시작 시각이다.
+        started = os.path.getmtime('/proc/' + pids[0])
+    except OSError:
+        return '❔', '프로세스 시작 시각을 못 읽음 — 확인 생략'
+
+    src_mtime = os.path.getmtime(src)
+    if src_mtime <= started:
+        return '✅', '소스와 실행본 일치 — systemd 구동이라 git pull 만으론 최신화 안 됨'
+
+    fmt = '%H:%M:%S'
+    old = time.strftime(fmt, time.localtime(started))
+    new = time.strftime(fmt, time.localtime(src_mtime))
+    print(f'\n⚠️  YOLO 가 옛 코드로 돌고 있다 (실행 {old} < 소스 {new}).')
+    print('   최신 코드로 재시작한다 — 관리자 암호를 입력할 것.')
+    print('   (중단하려면 Ctrl+C — 그 경우 launch 를 시작하지 않는다)')
+
+    # ★ 성공할 때까지 다시 묻는다. sudo 는 자체적으로 3회까지 받고 실패로
+    #   끝나므로, 그 위를 한 번 더 감싸 무한 재시도로 만든다. 설치할 때
+    #   sudo 를 쓰는 것과 같은 감각으로 쓰라고.
+    #
+    # ★ 실패한 채로는 launch 를 진행하지 않는다.
+    #   옛 코드로 도는 YOLO 는 "돌긴 도는데 최신 개선이 안 걸린" 상태라
+    #   증상이 조용하다. 실제로 그 상태로 7시간을 시험하며 엉뚱한 원인을
+    #   쫓았다. 경고만 띄우고 진행하면 그 사고가 그대로 재현되므로,
+    #   여기서는 아예 시작을 막는다(장치 확인과 달리 조치가 확실하므로).
+    while True:
+        try:
+            rc = subprocess.run(
+                ['sudo', 'systemctl', 'restart', 'yolo-depth-publisher']).returncode
+        except KeyboardInterrupt:
+            print('\n\n중단됨 — YOLO 가 옛 코드인 채로는 시작하지 않는다.')
+            print('   나중에 직접 하려면:  sudo systemctl restart yolo-depth-publisher')
+            sys.exit(1)
+        except Exception as e:
+            print(f'\n재시작을 실행하지 못했다: {e}')
+            sys.exit(1)
+        if rc == 0:
+            break
+        print('\n암호가 틀렸거나 재시작에 실패했다. 다시 시도한다 '
+              '(중단하려면 Ctrl+C).')
+
+    return '🔄', (f'옛 코드 감지 -> 재시작함 ({old} -> 방금) — '
+                  f'systemd 구동이라 git pull 만으론 최신화 안 됨')
+
+
+def _remembered_events(ttl_s: float = 600.0):
+    """change_point 가 재시작 후 되살릴 이벤트를 미리 읽어 요약한다.
+
+    ★ 왜 배너에 넣나 (2026-08-28)
+
+    이벤트 기억이 복원되면 **그 자리에서는 로봇이 다시 멈추지 않는다.**
+    의도된 동작이지만, 모르고 그 자리에 불을 놓으면 "왜 안 멈추지?" 가 된다.
+    2026-08-27~28 이틀 동안 바로 그 증상으로 몇 시간을 썼다 — 원인은 매번
+    달랐지만(YOLO predictor 누수, change_point 사망, clock_type 불일치)
+    겉으로 보이는 모습은 늘 같았다.
+
+    change_point 노드도 같은 내용을 로그로 찍지만 수십 줄 사이에 묻힌다.
+    사람이 실제로 읽는 것은 이 배너뿐이라 여기에도 낸다.
+
+    반환: (복원될 목록, 버려질 개수, 파일경로). 읽기 실패면 목록이 None.
+    """
+    path = os.path.join(os.path.expanduser('~'), '.ros',
+                        'change_point_events.json')
+    try:
+        with open(path, encoding='utf-8') as f:
+            saved = json.load(f)
+    except FileNotFoundError:
+        return [], 0, path
+    except Exception:
+        return None, 0, path
+
+    now_ns = time.time() * 1e9
+    alive, dropped = [], 0
+    for ev in saved:
+        try:
+            age = (now_ns - float(ev['last_seen_ns'])) / 1e9
+            if age >= ttl_s:
+                dropped += 1
+            else:
+                alive.append((ev['event_id'], age))
+        except Exception:
+            dropped += 1
+    return alive, dropped, path
 
 
 def generate_launch_description():
@@ -57,6 +195,43 @@ def generate_launch_description():
         calib_file = calib_arg if calib_arg.endswith('.json') else os.path.join(
             get_package_share_directory('ship_ugv_navigation'),
             'maps', 'calibration_records', f'calib_{calib_arg}.json')
+
+        # ★ 파일이 없으면 **여기서 멈춘다** (2026-08-27 실측 사고).
+        #   맵 이름 끝에 점 하나가 더 붙었을 뿐인데
+        #       calib:=shipyard_map_hall_v6.
+        #   에러도 경고도 없이 그냥 캘리브레이션 없이 떴다. map<-uwb_frame
+        #   이 항등변환(0,0,0)이 되어 UWB 원시 좌표가 그대로 map 좌표로
+        #   쓰였고, 로봇이 자기를 맵 밖 4m 지점에 있다고 믿어 제자리만
+        #   돌았다(Nav2 recovery 7회). 로봇이 눈에 띄게 이상해서 알아챘지
+        #   조금만 어긋났으면 "오늘따라 부정확하네" 하고 넘어갔을 것이다.
+        #
+        #   조용히 잘못된 상태로 도는 것보다 안 뜨는 게 낫다. 장치 확인은
+        #   경고만 하고 진행하지만(없는 장치로 할 수 있는 일이 남아 있다),
+        #   이건 조치가 명확하고 잘못 진행하면 주행이 통째로 망가진다.
+        if not os.path.exists(calib_file):
+            d = os.path.dirname(calib_file)
+            avail = sorted(f[len('calib_'):-len('.json')]
+                           for f in os.listdir(d)
+                           if f.startswith('calib_') and f.endswith('.json')) \
+                    if os.path.isdir(d) else []
+            print('\n' + '━' * 60)
+            print('  ❌ 캘리브레이션 파일이 없다 — 시작하지 않는다')
+            print(f'     찾은 이름 : calib_{calib_arg}.json')
+            print(f'     찾은 경로 : {d}')
+            near = [a for a in avail if a.strip('. ') == calib_arg.strip('. ')]
+            if near:
+                print(f'\n  💡 이름이 거의 같은 것이 있다 — 오타로 보인다:')
+                print(f'        calib:={calib_arg}   ->   calib:={near[0]}')
+            elif avail:
+                print('\n  쓸 수 있는 이름:')
+                for a in avail:
+                    print(f'        calib:={a}')
+            else:
+                print('\n  저장된 캘리브레이션이 하나도 없다. 먼저 캘리브레이션을 할 것:')
+                print('        ros2 service call /uwb_map_calibration/calibrate '
+                      'std_srvs/srv/Trigger')
+            print('━' * 60 + '\n')
+            sys.exit(1)
 
     uwb_calibration_node = Node(
         package='uwb_map_calibration',
@@ -109,12 +284,89 @@ def generate_launch_description():
         remappings=[('odometry/filtered', '/odometry/global')],
     )
 
+    # ★ change_point_detector 는 **조용히 죽으면 안 되는 노드다** (2026-08-27).
+    #   이게 죽으면 /event_detection/map_point 와 /cleared 가 통째로 끊긴다.
+    #   그런데 위험 이벤트 팝업과 핑은 websocket_client 가 원본 /uvd 로도
+    #   받으므로 **화면상으론 멀쩡해 보인다.** 실제로 겪은 증상:
+    #       - 프론트 팝업 뜨고 핑도 찍힘        (정상처럼 보임)
+    #       - 로봇은 불을 봐도 안 멈춤          (map_point 가 안 나감)
+    #       - 불을 치워도 핑이 영영 안 지워짐   (cleared 가 안 나감)
+    #   원인을 인지(YOLO) 쪽으로 두 번 오진했다. 그래서 죽으면 자동 복구하고,
+    #   동시에 **놓칠 수 없게 크게 찍는다.**
     change_point_node = Node(
         package='ship_ugv_perception',
         executable='change_point',
         name='change_point_detector',
         output='screen',
+        respawn=True,
+        respawn_delay=2.0,
     )
+
+    # ★ change_point 감시견 (2026-08-27). 배너 한 번은 스크롤에 묻힌다.
+    #   죽어 있는 동안 5초마다 계속 찍고, 재시작(PID 변화)도 놓치지 않는다.
+    #   pgrep 패턴의 [c] 는 감시견 자기 자신을 세지 않기 위한 것이다
+    #   (자기 cmdline 에도 같은 글자가 들어 있어 그냥 쓰면 항상 살아있다고 나온다).
+    change_point_watchdog = ExecuteProcess(
+        cmd=['bash', '-c', r"""
+        prev=""; crashes=0; last=0
+        while true; do
+          pid=$(pgrep -f '[c]hange_point --ros-args' | head -1)
+          if [ -n "$pid" ] && [ -n "$prev" ] && [ "$pid" != "$prev" ]; then
+            crashes=$((crashes+1))
+            echo "🔁 change_point_detector 재시작됨 (누적 $crashes 회) - 위로 스크롤해 Traceback 확인"
+          fi
+          [ -n "$pid" ] && prev="$pid"
+          # 런치를 통째로 내릴 때도 change_point 는 당연히 사라진다. 그때까지
+          # 경고하면 늑대소년이 되므로, **다른 노드가 살아있을 때만** 경고한다.
+          # ekf_node 를 기준으로 삼는다 (이 런치가 항상 띄우는 노드).
+          if [ -z "$pid" ] && pgrep -f '[e]kf_node' >/dev/null; then
+            now=$(date +%s)
+            if [ $((now-last)) -ge 5 ]; then
+              last=$now
+              echo "🚨 change_point_detector 죽어있음 - 로봇이 불을 봐도 안 멈추고, 핑도 안 지워진다 (팝업/핑은 계속 떠서 속기 쉬움)"
+            fi
+          fi
+          sleep 1
+        done
+        """],
+        output='screen',
+    )
+
+    # ★ Ctrl+C 로 끌 때는 배너를 띄우지 않는다 (2026-08-27).
+    #   런치를 내리면 change_point 도 당연히 종료되는데(파이썬 노드는 SIGINT
+    #   에도 exit 1 이라 크래시와 종료 코드가 같다), 그때마다 🚨 를 띄우면
+    #   **진짜 죽었을 때도 무시하게 된다.** 늑대소년이 제일 나쁜 실패다.
+    _shutdown = {'started': False}
+
+    def _mark_shutdown(context, *a, **kw):
+        _shutdown['started'] = True
+        return []
+
+    def _banner_if_crashed(context, *a, **kw):
+        if _shutdown['started']:
+            return []       # 정상 종료 — 조용히 넘어간다
+        return [
+            LogInfo(msg='\n' + '=' * 68),
+            LogInfo(msg='🚨🚨🚨  change_point_detector 가 죽었다  🚨🚨🚨'),
+            LogInfo(msg=''),
+            LogInfo(msg='   지금부터 이렇게 된다 — 겉보기엔 멀쩡해서 속기 쉽다:'),
+            LogInfo(msg='     · 프론트 팝업/핑은 계속 뜬다 (websocket_client 가 원본을 봄)'),
+            LogInfo(msg='     · 로봇은 불을 봐도 안 멈춘다  (map_point 끊김)'),
+            LogInfo(msg='     · 불을 치워도 핑이 안 지워진다 (cleared 끊김)'),
+            LogInfo(msg=''),
+            LogInfo(msg='   2초 뒤 자동 재시작한다. 위로 스크롤해 Traceback 을 볼 것.'),
+            LogInfo(msg='   계속 반복되면 시나리오를 멈추고 원인부터 고칠 것.'),
+            LogInfo(msg='=' * 68 + '\n'),
+        ]
+
+    shutdown_marker = RegisterEventHandler(OnShutdown(
+        on_shutdown=[OpaqueFunction(function=_mark_shutdown)]))
+
+    change_point_died_banner = RegisterEventHandler(OnProcessExit(
+        target_action=change_point_node,
+        on_exit=[OpaqueFunction(function=_banner_if_crashed)],
+    ))
+
 
     # ★ yolo_depth_publisher 는 **여기서 띄우지 않는다** (2026-08-19 제거).
     #
@@ -318,7 +570,11 @@ def generate_launch_description():
     ]
     missing = [(p, name, impact) for p, name, impact in DEVICES if not os.path.exists(p)]
 
+    # ★ 장치보다 먼저 — YOLO 가 최신 코드로 돌고 있는지 (필요하면 재시작)
+    yolo_mark, yolo_text = _check_yolo_freshness()
+
     banner = [LogInfo(msg='─── 센서 장치 확인 ' + '─' * 41)]
+    banner.append(LogInfo(msg=f"  {yolo_mark} {'YOLO 코드':<14} {yolo_text}"))
     for path, name, _ in DEVICES:
         mark = '✅' if os.path.exists(path) else '❌'
         banner.append(LogInfo(msg=f'  {mark} {name:<14} {path}'))
@@ -355,6 +611,24 @@ def generate_launch_description():
         msg=f"  {'✅' if calib_file else '⏸️'} {'캘리브 불러오기':<12} "
             + (os.path.basename(calib_file) if calib_file
                else '끔 — 새로 잰다 (되살리려면 calib:=<맵이름>)')))
+    # ★ 되살아날 이벤트 — 그 자리에서는 로봇이 다시 안 멈춘다
+    _remembered, _dropped, _mem_path = _remembered_events()
+    if _remembered is None:
+        banner.append(LogInfo(
+            msg=f"  ⚠️ {'이벤트 기억':<12} 파일을 못 읽음 — 빈 상태로 시작한다"))
+    elif _remembered:
+        _ids = ', '.join(f'{e}({a:.0f}초전)' for e, a in _remembered[:4])
+        _more = f' 외 {len(_remembered) - 4}건' if len(_remembered) > 4 else ''
+        banner.append(LogInfo(
+            msg=f"  🧠 {'이벤트 기억':<12} {len(_remembered)}건 되살아남 — "
+                "이 자리들은 다시 안 멈춘다"))
+        banner.append(LogInfo(msg=f"       {_ids}{_more}"))
+        banner.append(LogInfo(msg=f"       깨끗이 시작하려면:  rm {_mem_path}"))
+    else:
+        banner.append(LogInfo(
+            msg=f"  ✅ {'이벤트 기억':<12} 비어 있음 — 모든 이벤트를 새로 잡는다"
+                + (f' (오래된 {_dropped}건 버림)' if _dropped else '')))
+
     if not yolo_up:
         banner.append(LogInfo(msg='━' * 60))
         banner.append(LogInfo(
@@ -376,6 +650,9 @@ def generate_launch_description():
         ekf_local_node,
         ekf_global_node,
         change_point_node,
+        shutdown_marker,
+        change_point_died_banner,
+        change_point_watchdog,
         *( [ship_survey_node] if survey_on else [ship_pose_pub_node] ),
         websocket_client_node,
         laser_static_tf_node,

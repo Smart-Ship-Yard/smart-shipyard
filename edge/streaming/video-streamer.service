@@ -1,0 +1,23 @@
+[Unit]
+Description=Video Streamer (ROS2 raw frame -> RTSP)
+After=network.target mediamtx.service yolo-depth-publisher.service
+# ★ mediamtx 는 Wants (약한 의존). 중앙 미디어 서버로 옮기면 젯슨에서
+#   내리게 되는데, Requires 로 두면 그때 video-streamer 가 아예 안 뜬다.
+#   Wants 는 있으면 같이 띄우고 없어도 그냥 진행한다. 순서는 After 가 잡는다.
+Wants=mediamtx.service
+# YOLO 는 진짜 필수다 — 프레임을 주는 쪽이라 없으면 보낼 것이 없다.
+Requires=yolo-depth-publisher.service
+
+[Service]
+# ★ 중앙 미디어 서버로 옮길 때 이 줄의 주석만 풀고 IP 를 바꾼다.
+#   코드는 건드리지 않는다 (video_streamer.py 가 이 환경변수를 읽는다).
+#Environment=RTSP_URL=rtsp://192.168.0.5:8554/ugv1
+Type=simple
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/ship_yard/smart-shipyard/edge/ros2_ws/install/setup.bash && python3 /home/ship_yard/video_streamer.py'
+Restart=always
+RestartSec=10
+User=ship_yard
+Environment=HOME=/home/ship_yard
+
+[Install]
+WantedBy=multi-user.target
