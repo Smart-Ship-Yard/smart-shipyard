@@ -1,0 +1,27 @@
+# 중앙 미디어 서버 (서버 노트북 192.168.0.5)
+#
+# 설치:
+#   sudo cp server/streaming/mediamtx.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mediamtx
+# 로그:
+#   journalctl -u mediamtx -f
+#
+# 바이너리는 저장소에 넣지 않는다 (55MB). ~/mediamtx/ 에 풀어둔다:
+#   https://github.com/bluenviron/mediamtx/releases  (linux_amd64)
+[Unit]
+Description=mediamtx — 중앙 미디어 서버 (젯슨 RTSP push -> 브라우저 WebRTC)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lee
+# 설정은 저장소 것을 그대로 읽는다 — git pull 하면 설정도 같이 따라온다.
+ExecStart=/home/lee/mediamtx/mediamtx /home/lee/smart-shipyard/server/streaming/mediamtx.yml
+WorkingDirectory=/home/lee/mediamtx
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

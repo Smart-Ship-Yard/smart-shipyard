@@ -7,16 +7,20 @@ main.py — 스마트 조선소 FastAPI 백엔드 서버
               프론트엔드(React+Three.js 대시보드)로 즉시 브로드캐스트
             - 위험 이벤트 4종 + block_level + ship_pose는 MongoDB에 영구 로그 저장
             - WebRTC 시그널링(webrtc_signal) 쪽지를 프론트↔젯슨 양방향 중계
-              (영상은 WebRTC P2P 직결로 변경 — 2026-07-10 팀 결정)
-            - 실시간 영상(JPEG 바이너리) 중계 채널은 P2P 실패 시 폴백용으로 유지
-            - 프론트의 stream_boost(영상 화질 전환) 명령을 젯슨으로 전달
+            - 감지 순간 스냅샷을 파일로 저장하고 /snapshots 로 서빙
             - REST API로 대시보드 초기 로딩 데이터 및 과거 이벤트 이력 제공
 
-웹소켓 채널 4개 (통신 스펙 v1.2 = docs/interface.md 참조):
-    /ws/jetson           젯슨 JSON 채널 (이벤트 수신 + stream_boost 송신)
-    /ws/frontend         프론트 JSON 채널 (이벤트 브로드캐스트 + stream_boost 수신)
-    /ws/jetson-stream    젯슨 영상 채널 (JPEG 바이너리 수신)
-    /ws/frontend-stream  프론트 영상 채널 (JPEG 바이너리 브로드캐스트)
+웹소켓 채널 2개 (통신 스펙 = docs/interface.md 참조):
+    /ws/jetson           젯슨 JSON 채널 (이벤트 수신 + 서버→젯슨 쪽지 송신)
+    /ws/frontend         프론트 JSON 채널 (이벤트 브로드캐스트 + 쪽지 수신)
+
+★ 영상은 이 FastAPI 프로세스를 거치지 않는다.
+  젯슨이 H.264 로 한 번만 인코딩해 rtsp://192.168.0.5:8554/ugv1 로 밀어올리면,
+  같은 노트북에서 도는 **별개 프로세스 mediamtx** 가 받아 브라우저들에게 WebRTC 로
+  뿌린다. 이 서버는 영상 바이트를 아예 만지지 않는다.
+  설치·방화벽은 server/streaming/README.md, 배경은 docs/interface.md ⑤ 참조.
+
+  ※ mediamtx 가 UDP 8000 을 잡는다. 이 서버는 TCP 8000 이라 충돌하지 않는다.
 
 작성자     : 이정기 (Backend & Streaming Engineer)
 작성일     : 2026-07-06
@@ -41,17 +45,28 @@ main.py — 스마트 조선소 FastAPI 백엔드 서버
 """
 
 import asyncio
+# 젯슨이 보내는 스냅샷은 base64 문자열이라 원래 바이트로 되돌려야 하고,
+# 파일 이름은 event_id 를 해시해서 만든다 (아래 [이벤트 스냅샷 구역] 참조).
+import base64
+import hashlib
+import secrets
 import json
 import os
+import urllib.error
+import urllib.parse
+import urllib.request
 # python-dotenv 패키지: .env 파일에 적힌 키=값 쌍을 읽어서
 # os.environ(환경변수)에 등록해주는 역할. 아래 load_dotenv() 호출과 짝을 이룸.
 from dotenv import load_dotenv
 
 # FastAPI 핵심 클래스와, 웹소켓 연결 객체 / 연결 끊김 예외를 가져옴
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 # 다른 도메인(프론트엔드)에서의 API 요청을 허용해주는 미들웨어
 from fastapi.middleware.cors import CORSMiddleware
+
+# 저장해둔 스냅샷 사진을 그냥 URL 로 꺼내 쓸 수 있게 해주는 정적 파일 서빙
+from fastapi.staticfiles import StaticFiles
 
 # MongoDB를 비동기(async)로 다루기 위한 motor 라이브러리의 클라이언트
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -85,16 +100,15 @@ SHIP_POSE = "ship_pose"          # 배 위치 측량 결과 (block_id, map_xy, y
 # (이 메시지 자체의 event_type 은 "event_cleared" 고정이라 종류를 따로 실어야 함).
 EVENT_CLEARED = "event_cleared"
 
-# 프론트→서버→젯슨 방향 명령 (DB 저장 대상 아님).
-# 프론트가 영상 팝업을 열/닫을 때 젯슨의 영상 화질을 전환시키는 명령.
+# 감지 순간의 사진 (젯슨→서버, 2026-08-28).
+# 위험 이벤트 3종(fire/fallen_person/no_helmet)을 보낸 **직후 별도 메시지**로
+# 오며, 그 이벤트와 event_id 가 정확히 같다. 필드: block_id, event_id, cls,
+# image_b64(검출 박스 + 사방 40px 여백을 자른 JPEG, 보통 10~40KB).
+# 중복 제거를 통과한 새 이벤트에만 오므로 같은 자리 불로 계속 오지 않는다.
 #
-# 🅿️ 현재 미사용 · 예비 스펙 (2026-08-07 확인)
-#   영상이 WebRTC P2P 직결로 바뀌면서 화질 전환을 젯슨↔프론트가 직접
-#   처리하게 되어 이 명령을 아무도 보내지 않는다. 그럼에도 남겨두는 이유는
-#   나중에 화질 제어를 서버 경유로 되돌리거나 유사한 명령이 필요해질 때
-#   그대로 쓸 수 있고, 유지 비용이 이 상수와 아래 action 검증 3줄뿐이기 때문이다.
-#   지우려면 interface.md ⑥번 항목과 프론트 쪽 잔여 코드도 함께 확인할 것.
-STREAM_BOOST = "stream_boost"    # action: "start"(부스트) / "stop"(원복)
+# ⚠️ LOGGED_EVENT_TYPES 에 넣지 말 것 — 아래 [이벤트 스냅샷 구역]에 이유가 있다.
+EVENT_SNAPSHOT = "event_snapshot"
+
 
 # WebRTC 시그널링 쪽지 (영상 P2P 직결용, 양방향, DB 저장 대상 아님).
 # payload 안의 내용(SDP/ICE)은 WebRTC 라이브러리가 자동 생성한 것 —
@@ -115,9 +129,50 @@ WEBRTC_SIGNAL = "webrtc_signal"
 # (예: {"event_type": "event_ack"})
 EVENT_ACK = "event_ack"
 
+# 이벤트 기억 초기화 (프론트 → 서버 → 젯슨, DB 저장 안 함).
+#
+# 유령 핑이나 엉뚱한 자리의 이벤트가 생겼을 때, 프로세스를 껐다 켜지 않고
+# 화면과 로봇 기억을 한 번에 정리한다. 젯슨은 이걸 받으면 change_point 의
+# 보고 이력과 재통보 거울을 비운다.
+#
+# ★ 서버도 같이 움직여야 한다.
+#   젯슨만 비우면 서버는 계속 옛 이벤트를 복원한다. 아래 복원 기준선을
+#   지금 시각으로 밀어야 새로고침해도 안 돌아온다.
+#
+# ★ DB 는 지우지 않는다.
+#   기록은 증빙이다. "안 보이게 하는 것" 과 "지우는 것" 은 다르다.
+#   기준선만 밀면 화면에서 사라지고, 기록은 감사용으로 남는다.
+RESET_EVENTS = "reset_events"
+
+# 로봇이 실제로 일할 수 있게 됐다는 통보 (젯슨 → 서버 → 프론트, DB 저장 안 함).
+#
+#   {"event_type":"jetson_ready", "block_id":"B1", "armed":true, "nav_ready":true}
+#
+# ★ jetson_status(연결됨)와 **다른 것**이다. 서로 대체할 수 없다.
+#   젯슨의 websocket_client 는 로컬라이제이션에서 뜨는데 AMCL·Nav2 는 그보다
+#   늦게 뜬다. 그 사이 소켓은 살아 있어서 화면에는 "연결됨" 이 뜨지만, 로봇은
+#   순찰도 못 하고 이벤트도 못 잡는다. 그때 관제사가 확인을 눌러봐야 소용이 없다.
+#
+#     jetson_status  소켓이 살아 있나        (서버가 판단)
+#     jetson_ready   로봇이 일할 수 있나      (젯슨이 판단: armed + nav_ready)
+#
+# 둘 다 갖춰졌을 때 1회 오고, 재연결 시 다시 온다(프론트가 새로고침됐을 수 있어서).
+# 저장 대상이 아니라 그대로 프론트로 흘러간다 — 추가 중계 코드가 필요 없다.
+JETSON_READY = "jetson_ready"
+
+# 로봇 연결 상태 알림 (서버 → 프론트, DB 저장 안 함).
+#
+# ★ 왜 필요한가 (2026-08-29)
+#   로봇이 꺼져도 화면의 위험 핑은 그대로 남는다(위험이 사라진 게 아니니 맞는
+#   동작이다). 문제는 **관제사가 그 사실을 모른다**는 것이다. 화면은 평소와
+#   똑같은데 실시간 순찰 정보만 조용히 멈춘다. 그래서 서버가 알려준다.
+#
+#   {"event_type": "jetson_status", "connected": true/false}
+JETSON_STATUS = "jetson_status"
+
 # 프론트→서버→젯슨 방향으로 '그대로 전달'하는 메시지 종류 모음.
 # (젯슨→프론트 방향은 기존 브로드캐스트가 모든 메시지를 전달하므로 목록 불필요)
-JETSON_BOUND_TYPES = {STREAM_BOOST, WEBRTC_SIGNAL, EVENT_ACK}
+JETSON_BOUND_TYPES = {WEBRTC_SIGNAL, EVENT_ACK, RESET_EVENTS}
 
 # 이벤트 timestamp 기록용 한국 표준시.
 # 시간대 정보 없는(naive) 시각은 환경마다 해석이 달라지므로 +09:00을 명시한다.
@@ -127,6 +182,8 @@ KST = timezone(timedelta(hours=9))
 # block_level/ship_pose는 '바뀔 때만' 오는 희소 이벤트라 저장량 부담이 없고,
 # 최신 값을 init-data 상태 복원에 쓰므로 저장 대상에 포함.
 LOGGED_EVENT_TYPES = {SHIP_DEFECT, NO_HELMET, FALLEN_PERSON, FIRE, BLOCK_LEVEL, SHIP_POSE, EVENT_CLEARED}
+# ※ EVENT_SNAPSHOT 이 여기 없는 것은 빠뜨린 게 아니라 의도된 것이다.
+#   사진은 파일로 저장하고 문서에는 URL 만 붙인다 ([이벤트 스냅샷 구역] 참조).
 
 # =========================================================
 # [서버 수명 주기 구역]
@@ -197,6 +254,115 @@ app.add_middleware(
 )
 
 # =========================================================
+# [스냅샷 정적 서빙 구역]
+# 저장해둔 감지 사진을 브라우저가 그냥 주소로 꺼내 볼 수 있게 한다.
+#   http://192.168.0.5:8000/snapshots/<해시>.jpg
+# =========================================================
+
+# 서버를 어느 폴더에서 띄우든 항상 backend/snapshots 를 가리키게 절대경로로 잡는다.
+# (상대경로 "snapshots" 로 두면 uvicorn 을 다른 폴더에서 실행했을 때 엉뚱한 곳에 쌓인다)
+SNAPSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapshots")
+
+# ★ 이 한 줄이 없으면 바로 아래 StaticFiles 가 폴더를 못 찾고 **서버가 시작조차 못 한다.**
+#   .gitignore 가 사진만 막고 .gitkeep 으로 폴더는 남기지만, 누가 폴더를 지우거나
+#   새 환경에서 처음 띄우는 경우까지 여기서 막아준다.
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+
+app.mount("/snapshots", StaticFiles(directory=SNAPSHOT_DIR), name="snapshots")
+
+
+# =========================================================
+# [접근 암호 구역]
+# 관제 화면과 영상에 아무나 들어오지 못하게 막는다.
+# =========================================================
+#
+# ★ 안 걸면 지금과 똑같이 동작한다 (2026-08-29).
+#   .env 에 DASHBOARD_PASSWORD 가 없으면 인증을 아예 하지 않는다. 팀원이
+#   각자 노트북에서 받아 그대로 실행할 수 있어야 하고, 시연 직전에 암호 때문에
+#   화면이 안 뜨는 상황을 만들면 안 되기 때문이다.
+#   현장 적용 전에는 반드시 설정한다.
+#
+# ★ 계정이 아니라 공유 암호 하나다.
+#   누가 봤는지까지 남기려면 계정이 필요하지만, 지금 필요한 것은 "같은 망의
+#   아무나 들어오는 것" 을 막는 것이다. 그 목적에는 이걸로 충분하고,
+#   나중에 계정으로 넓힐 때도 이 통로(토큰 검사)를 그대로 쓴다.
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
+AUTH_ENABLED = bool(DASHBOARD_PASSWORD)
+
+# 토큰은 암호에서 **유도**한다. 무작위로 만들어 메모리에 두지 않는다.
+#
+# ★ 왜 바꿨나 (2026-08-29)
+#   처음에는 무작위 토큰을 메모리 집합에 넣어뒀다. 그랬더니 **서버를 재시작하는
+#   순간 모든 토큰이 무효**가 됐다. 대시보드는 그 사실을 모른 채 옛 토큰으로
+#   계속 재접속을 시도했고, 서버 로그에는 "토큰 없음/불일치" 만 끝없이 찍혔다.
+#   화면은 "서버와의 연결이 끊겼습니다" 에서 영원히 못 벗어났다.
+#
+#   암호에서 유도하면 서버를 껐다 켜도 같은 토큰이 유효하다. 재시작이 잦은
+#   개발·시연 환경에서 이게 훨씬 실용적이다.
+#
+# ★ 보안상 무엇을 포기했나
+#   이 토큰은 사실상 "암호를 안다는 증명" 이다. 새어 나가면 암호가 샌 것과 같고,
+#   개별 취소도 안 된다(암호를 바꾸면 전부 무효가 된다). 계정별 추적이 필요해지면
+#   그때 무작위 토큰 + 저장소로 바꾼다. 지금 막으려는 것은 "같은 망의 아무나
+#   들어오는 것" 이고, 그 목적에는 이걸로 충분하다.
+_TOKEN_SALT = "shipyard-dashboard-v1"
+
+
+def issue_token() -> str:
+    """암호에서 토큰을 유도한다. 같은 암호면 항상 같은 값이다."""
+    return hashlib.sha256((_TOKEN_SALT + DASHBOARD_PASSWORD).encode("utf-8")).hexdigest()
+
+
+def token_ok(token: Optional[str]) -> bool:
+    """암호를 안 걸었으면 항상 통과. 걸었으면 유도한 토큰만 통과."""
+    if not AUTH_ENABLED:
+        return True
+    if not token:
+        return False
+    return secrets.compare_digest(token, issue_token())
+
+
+@app.post("/api/login")
+async def login(body: dict):
+    """공유 암호를 확인하고 토큰을 준다.
+
+    ★ 암호 비교에 secrets.compare_digest 를 쓴다.
+      == 는 앞에서부터 비교하다 다르면 즉시 멈춰서, 응답 시간 차이로 암호를
+      한 글자씩 알아낼 수 있다(타이밍 공격). 같은 시간이 걸리게 비교한다.
+    """
+    if not AUTH_ENABLED:
+        return {"ok": True, "token": "", "auth_required": False}
+    given = str((body or {}).get("password", ""))
+    # ★ 반드시 바이트로 비교한다.
+    #   compare_digest 는 비ASCII 문자열을 받으면 TypeError 를 낸다. 문자열끼리
+    #   비교하면 한글 암호나 한글이 섞인 오타 입력에서 500 이 나간다(실측).
+    #   utf-8 로 인코딩하면 어떤 글자든 안전하고, 같은 시간 비교도 그대로 유지된다.
+    if not secrets.compare_digest(given.encode("utf-8"),
+                                  DASHBOARD_PASSWORD.encode("utf-8")):
+        print("🔒 [로그인] 암호 불일치")
+        raise HTTPException(status_code=401, detail="암호가 맞지 않습니다")
+    print("🔓 [로그인] 성공 — 토큰 발급")
+    return {"ok": True, "token": issue_token(), "auth_required": True}
+
+
+@app.get("/api/auth-required")
+async def auth_required():
+    """프론트가 로그인 화면을 띄울지 판단하는 용도."""
+    return {"auth_required": AUTH_ENABLED}
+
+
+@app.get("/api/mediamtx-auth")
+async def mediamtx_auth():
+    """mediamtx 인증 위임용. 지금은 자리만 잡아둔다.
+
+    mediamtx 의 authMethod: http + authHTTPAddress 가 이 주소로 물어보게 하면
+    영상까지 같은 암호로 묶인다. 다만 **브라우저가 mediamtx 에 직접 붙으므로**
+    토큰을 어떻게 실어 보낼지(쿼리스트링/쿠키)를 함께 정해야 한다.
+    그 설계가 끝나기 전에는 켜지 않는다 — server/streaming/README.md 참조.
+    """
+    return {"auth_required": AUTH_ENABLED, "wired": False}
+
+# =========================================================
 # [데이터베이스 셋업 구역]
 # MongoDB Atlas와 통신하는 선을 연결하는 곳.
 # =========================================================
@@ -230,6 +396,181 @@ db = client.shipyard_db
 
 # 그 안의 'events' 컬렉션(=서류함)을 선택. 여기에 4종 이벤트 로그가 쌓임.
 event_collection = db.events
+
+
+# 위험 이벤트 4종 — 대시보드 재접속 시 되살릴 대상.
+DANGER_TYPES = {SHIP_DEFECT, NO_HELMET, FALLEN_PERSON, FIRE}
+
+# 이 서버 프로세스가 켜진 시각. 복원은 이 시각 이후에 들어온 것만 한다.
+#
+# ★ 왜 필요한가 (2026-08-27)
+#   "살아있다"의 판정은 event_cleared 가 오는지에 전적으로 기대고 있는데,
+#   그 신호가 한 번이라도 안 오면 그 이벤트는 **영원히 살아있는 것으로 남는다.**
+#   실제로 이 제한을 넣기 전 DB 에는 복원 대상이 56건 있었고, 그중 46건이 하루
+#   이상 된 것이었다. 옛 좌표의 불을 로봇이 다시 지나갈 일이 없으니
+#   event_cleared 가 올 수 없고, 젯슨 쪽 clear 로직을 고쳐도 이미 쌓인 것은
+#   그대로 남는다.
+#
+#   서버를 다시 켰다는 것은 "여기서부터 새로 본다"는 뜻이므로 그 시각을
+#   바닥으로 깐다. 이전 세션의 찌꺼기가 올라올 여지가 아예 없어진다.
+#
+#   이것은 clear 가 깨졌을 때 화면이 무너지지 않게 막아주는 안전장치이지,
+#   clear 를 대신하는 장치가 아니다. clear 가 안 되면 대시보드보다 로봇이 더
+#   문제다 — 같은 자리 불로 계속 멈추기 때문이다.
+#
+#   ⚠️ 반드시 KST 로 잡는다 (2026-08-28 버그 수정).
+#     아래 비교는 ISO 문자열의 사전순 비교인데, 문자열 비교는 시간대 표기를
+#     읽지 않는다. 이 값을 UTC 로 만들면 "22:23+09:00" >= "14:23+00:00" 이
+#     참이 되어 통과한다 — 실제로는 22:23 KST = 13:23 UTC 로 서버가 켜지기
+#     전인데도 그렇다. 즉 바닥이 9시간 뒤로 밀려, 서버 켜기 직전 9시간의
+#     이벤트가 전부 되살아났다. 대시보드에 유령 핑이 뜬 원인이 이것이다.
+#
+#     DB 의 timestamp 는 datetime.now(KST) 로 쓰므로 바닥도 같은 시간대여야
+#     문자열 비교가 곧 시간 비교가 된다.
+# 이 시각보다 오래된 이벤트는 복원하지 않는다.
+#
+# 이름이 "서버 시작 시각" 이 아닌 이유 — 서버가 켜질 때뿐 아니라
+# 프론트의 [초기화](reset_events)로도 지금 시각으로 밀린다. 즉 "복원의 바닥"
+# 이지 "프로세스가 뜬 시각" 이 아니다.
+RESTORE_FLOOR_AT = datetime.now(KST)
+
+# 젯슨이 "이건 아직 살아있다"고 알려준 이벤트 id 들.
+#
+# ★ 왜 필요한가 (2026-08-29)
+#   젯슨은 서버에 (재)연결할 때 지금 살아있는 위험을 replay:true 로 다시 보낸다.
+#   그 메시지는 **DB에 저장하지 않는다** — 이미 있는 이벤트의 중복 기록이고,
+#   실제로 그 시각에 감지된 것도 아니라 감사 기록을 흐린다.
+#
+#   그런데 저장을 안 하면 구멍이 하나 생긴다. 서버를 재시작한 뒤라면 그 이벤트의
+#   원래 DB 기록은 RESTORE_FLOOR_AT 아래에 있어 복원 대상이 아니다. 그래서
+#   젯슨 재통보로 핑은 떴는데 **브라우저를 새로고침하면 사라진다.**
+#
+#   그래서 저장하는 대신 "젯슨이 살아있다고 한 것" 을 여기 기억해두고, 복원할 때
+#   시각 바닥과 무관하게 함께 꺼내온다. DB 는 그대로 두고 판정만 넓히는 것이다.
+#
+#   젯슨이 이 판정의 주인이다 — 로봇이 그 자리를 다시 보고 확인하므로 며칠 전
+#   기록보다 훨씬 믿을 만하다. 젯슨 연결이 새로 열리면 통째로 비우고 다시 채운다.
+#
+#   ⚠️ 다만 이것만 믿으면 안 된다 (2026-08-29).
+#     이 목록은 젯슨이 재연결할 때마다 비워지고 그 연결의 재통보로 다시 찬다.
+#     젯슨 소켓이 한 번 끊겼다 붙는 사이에 대시보드를 새로고침하면 목록이 비어
+#     있어 핑이 통째로 사라진다. 그래서 _backfill_replay_event 가 이번 세션의
+#     DB 기록도 한 건 남긴다 — 복원이 시각만으로도 성립하게 하는 안전장치다.
+jetson_live_event_ids: set = set()
+
+# 지금 백필이 돌고 있는 event_id.
+#
+# ★ 왜 필요한가 (2026-08-29)
+#   _backfill_replay_event 는 "있나 확인 → 없으면 넣기" 인데 그 사이가 비어 있다.
+#   재통보는 **묶음으로** 온다(젯슨이 복원한 것을 재연결 때 한꺼번에 올린다).
+#   젯슨이 짧은 간격으로 두 번 붙으면 같은 event_id 의 백필 두 개가 동시에 돌아
+#   둘 다 "없음" 을 보고 각각 넣는다 —— 중복 기록이 생긴다.
+#
+#   여기 넣어두고 끝나면 뺀다. 이미 돌고 있으면 두 번째는 그냥 넘어간다.
+_backfill_inflight: set = set()
+
+
+async def _backfill_replay_event(doc: dict):
+    """재통보로만 알게 된 이벤트를 처음 한 번 기록한다.
+
+    이미 같은 event_id 의 위험 기록이 있으면 아무것도 하지 않는다 —
+    중복 저장은 감사 기록을 흐리고, 복원은 어차피 기존 문서로 된다.
+
+    저장할 때 replay 플래그를 지우지 않는다. "이 기록은 재통보로 알게 된
+    것" 이라는 사실을 남겨야 나중에 감사할 때 감지 시각을 오해하지 않는다.
+    """
+    eid = doc.get("event_id")
+    if eid in _backfill_inflight:
+        return              # 같은 이벤트를 이미 넣는 중이다
+    _backfill_inflight.add(eid)
+    try:
+        # ★ "아예 없을 때" 가 아니라 "이번 세션 기록이 없을 때" 저장한다
+        #   (2026-08-29 수정).
+        #
+        #   원래는 같은 event_id 기록이 하나라도 있으면 건너뛰었다. 그러면 그
+        #   이벤트는 복원될 때 **메모리의 jetson_live_event_ids 에만** 기대게 되는데,
+        #   그 목록은 젯슨이 재연결할 때마다 비워진다. 젯슨 소켓이 한 번만 끊겼다
+        #   붙어도(재연결 루프가 있다) 목록이 날아가고, 그 뒤 대시보드를
+        #   새로고침하면 **살아있는 위험 핑이 통째로 사라졌다.**
+        #
+        #   이번 세션(RESTORE_FLOOR_AT 이후) 기록을 한 번 남겨두면 복원이
+        #   시각만으로 성립해서, 메모리 상태가 어떻든 흔들리지 않는다.
+        #   세션당 event_id 하나에 최대 한 건이라 무한히 쌓이지도 않는다.
+        exists = await event_collection.find_one(
+            {"event_id": eid,
+             "event_type": {"$in": list(DANGER_TYPES)},
+             "timestamp": {"$gte": RESTORE_FLOOR_AT.isoformat()}},
+            {"_id": 1},
+        )
+        if exists:
+            return
+        doc["timestamp"] = datetime.now(KST).isoformat()
+        await event_collection.insert_one(doc)
+        print(f"💾 [재통보] 이번 세션 기록으로 남김: {eid}")
+    except Exception as e:
+        print(f"⚠️ [재통보] 기록 실패({type(e).__name__}): {eid}")
+    finally:
+        _backfill_inflight.discard(eid)
+
+
+def schedule_replay_backfill(doc: dict):
+    """DB 를 기다리지 않는다 — 젯슨 수신 루프가 멈추면 안 된다."""
+    task = asyncio.create_task(_backfill_replay_event(doc))
+    _save_tasks.add(task)
+    task.add_done_callback(_save_tasks.discard)
+
+
+async def broadcast_jetson_status():
+    """로봇 연결 상태를 프론트 전체에 알린다. DB에 저장하지 않는다."""
+    await manager.broadcast({
+        "event_type": JETSON_STATUS,
+        "connected": jetson_connection is not None,
+    })
+
+
+async def _active_danger_events(limit: int = 300):
+    """지금도 살아있는 위험 이벤트를 오래된 순으로 돌려준다.
+
+    '살아있다' = 등록된 뒤 같은 event_id 로 event_cleared 가 오지 않았다는 뜻.
+    젯슨의 change_point_detector 가 "로봇이 그 자리를 다시 지나갔는데 안 보인다"
+    를 확인해야만 event_cleared 를 보내므로, 이 판정은 젯슨의 판단을 그대로
+    따르는 것이다. 서버가 따로 시간 만료 같은 규칙을 두지 않는 이유다.
+
+    최신 limit 건만 훑는다. 그보다 오래된 것이 아직 살아있을 가능성은 낮고,
+    전체 스캔은 접속할 때마다 도는 경로라 비용을 묶어두는 편이 안전하다.
+    """
+    # RESTORE_FLOOR_AT 도 KST 라 timestamp 와 표기가 같다 → 사전순 = 시간순.
+    cutoff = RESTORE_FLOOR_AT.isoformat()
+    docs = await event_collection.find({
+        "event_type": {"$in": list(DANGER_TYPES) + [EVENT_CLEARED]},
+        "$or": [
+            # timestamp 는 서버가 저장할 때 붙이는 ISO 문자열이라 사전순 비교가
+            # 곧 시간순 비교다. 필드가 없는 구버전 문서는 여기서 함께 걸러진다.
+            {"timestamp": {"$gte": cutoff}},
+            # 서버가 켜지기 전 기록이어도, 젯슨이 아직 살아있다고 한 것은 꺼낸다.
+            {"event_id": {"$in": list(jetson_live_event_ids)}},
+        ],
+    }).sort("_id", -1).to_list(length=limit)
+    docs.reverse()                      # 오래된 것부터 훑어야 등록/해제 순서가 맞다
+
+    alive = {}
+    for d in docs:
+        eid = d.get("event_id")
+        if not eid:
+            continue                    # event_id 없는 구버전 문서는 짝을 못 지어 건너뛴다
+        if d["event_type"] == EVENT_CLEARED:
+            alive.pop(eid, None)
+        else:
+            # ★ 사진을 잃지 않게 이어붙인다 (2026-08-29).
+            #   같은 event_id 의 문서가 여럿일 수 있다 — 처음 감지된 기록(사진 있음)과
+            #   재통보로 남긴 기록(사진 없음)이 그렇다. 뒤엣것이 그냥 덮으면
+            #   **복원된 이벤트에서 감지 순간 사진이 사라진다.**
+            #   실제로 구획·핑을 눌러도 사진이 안 나오는 증상이 됐다.
+            prev = alive.get(eid)
+            if prev and not d.get("image_url") and prev.get("image_url"):
+                d = {**d, "image_url": prev["image_url"]}
+            alive[eid] = d
+    return list(alive.values())
 
 
 # =========================================================
@@ -334,6 +675,130 @@ async def retry_failed_saves():
 
 
 # =========================================================
+# [이벤트 스냅샷 구역 — 감지 순간의 사진]
+# =========================================================
+#
+# 젯슨은 위험 이벤트를 보낸 **직후**, 같은 event_id 로 그 순간의 crop 사진을
+# event_snapshot 메시지에 base64 로 실어 보낸다.
+# (설계 근거: docs/이벤트_스냅샷_및_위치표기_요청.md)
+#
+# ★ base64 를 DB 에 넣지도, 프론트로 흘리지도 않는다.
+#
+#   - DB 에 넣으면: 문서가 통째로 커진다. 게다가 재접속 복원은 문서를 그대로
+#     다시 보내는 구조라, 대시보드를 새로고침할 때마다 살아있는 이벤트의 사진이
+#     **전부 다시 흐른다.** base64 는 원본 바이트보다 33% 크기까지 하다.
+#   - 프론트로 릴레이하면: 같은 이유. URL 이면 브라우저가 캐시해 두 번째부터는
+#     안 받지만, 메시지에 박힌 base64 는 매번 새로 받는다.
+#
+#   그래서 서버는 사진을 **파일로 떨어뜨리고 URL 만** 남긴다. 실시간 표시는
+#   URL 만 담은 가벼운 메시지로, 재접속 복원은 이벤트 문서에 붙인 image_url 로.
+#
+# ⚠️ 사진에는 작업자 얼굴이 찍힐 수 있다. .gitignore 가 backend/snapshots/* 를
+#    막고 있으니 절대 풀지 말 것.
+
+# DB 갱신 재시도 간격(초). 왜 재시도가 필요한지는 _attach_snapshot_url 참조.
+SNAPSHOT_ATTACH_RETRY_S = (0.5, 1.5, 3.0)
+
+
+def _snapshot_name(event_id: str) -> str:
+    """event_id 를 파일 이름으로 쓸 수 있는 형태로 바꾼다.
+
+    event_id 는 'fire@0.63,-0.23' 처럼 @ 와 쉼표, 마이너스가 섞여 있어 그대로
+    파일 이름에 쓰면 OS 와 URL 양쪽에서 말썽이 난다. 해시로 고정 길이 이름을
+    만들면 그 문제가 사라지고, 같은 event_id 는 항상 같은 이름이 나오므로
+    재전송이 와도 그냥 덮어쓰기가 된다(사진이 중복으로 쌓이지 않는다).
+    """
+    return hashlib.sha1(event_id.encode("utf-8")).hexdigest()[:16] + ".jpg"
+
+
+def _write_snapshot_file(path: str, blob: bytes):
+    """별도 스레드에서 돌 파일 쓰기 (아래 asyncio.to_thread 로 호출)."""
+    with open(path, "wb") as f:
+        f.write(blob)
+
+
+async def _attach_snapshot_url(event_id: str, url: str):
+    """짝이 되는 위험 이벤트 문서에 사진 URL 을 붙인다.
+
+    ★ 새 문서를 만들지 않는다. 이미 저장된 그 이벤트에 필드 하나를 더하는 것이다.
+      새로 만들면 복원 때 같은 위험이 두 번 뜬다.
+
+    ★ 경쟁 상태를 견뎌야 한다.
+      위험 이벤트 저장은 schedule_save 가 백그라운드로 돌리는데 젯슨은 그
+      직후에 스냅샷을 보낸다. 그래서 이 갱신이 정작 저장보다 **먼저** 도착할
+      수 있다. 짧게 몇 번 다시 시도하면 대부분 해결된다.
+
+      끝내 못 붙어도 실시간 표시는 이미 끝난 상태고(브로드캐스트는 별개),
+      재접속 복원에서만 그 한 건의 사진이 빠진다.
+    """
+    for delay in SNAPSHOT_ATTACH_RETRY_S:
+        try:
+            doc = await event_collection.find_one_and_update(
+                {"event_id": event_id, "event_type": {"$in": list(DANGER_TYPES)}},
+                {"$set": {"image_url": url}},
+                # 같은 자리에서 치웠다가 다시 발생한 경우 문서가 여럿일 수 있다.
+                # 최신 것에 붙여야 지금 살아있는 이벤트의 사진이 된다.
+                sort=[("_id", -1)],
+            )
+            if doc is not None:
+                return
+        except Exception as e:
+            print(f"⚠️ [스냅샷] DB 갱신 실패({type(e).__name__}): {event_id}")
+            return
+        await asyncio.sleep(delay)
+
+    print(f"⚠️ [스냅샷] 짝이 되는 위험 이벤트를 못 찾음: {event_id} "
+          f"(사진은 저장됨 · 실시간 표시 정상 · 재접속 복원에서만 빠짐)")
+
+
+async def handle_event_snapshot(data: dict) -> Optional[dict]:
+    """스냅샷을 파일로 저장하고, 프론트에 보낼 가벼운 메시지를 돌려준다.
+
+    돌려주는 메시지에는 base64 가 없고 image_url 만 있다.
+    저장하지 못하면 None — 그때는 아무것도 브로드캐스트하지 않는다.
+    """
+    event_id = data.get("event_id")
+    image_b64 = data.get("image_b64")
+    if not event_id or not image_b64:
+        print(f"⚠️ [스냅샷] event_id 나 image_b64 가 없어 무시: {list(data)}")
+        return None
+
+    try:
+        blob = base64.b64decode(image_b64)
+    except Exception as e:
+        print(f"⚠️ [스냅샷] base64 해독 실패({type(e).__name__}): {event_id}")
+        return None
+
+    name = _snapshot_name(event_id)
+    path = os.path.join(SNAPSHOT_DIR, name)
+    try:
+        # 수십 KB 라 금방 끝나지만 디스크 쓰기는 이벤트 루프를 멈춘다.
+        # 별도 스레드로 넘겨 그동안 젯슨의 다음 메시지 수신이 밀리지 않게 한다.
+        await asyncio.to_thread(_write_snapshot_file, path, blob)
+    except Exception as e:
+        print(f"⚠️ [스냅샷] 파일 저장 실패({type(e).__name__}): {path}")
+        return None
+
+    url = f"/snapshots/{name}"
+    print(f"📸 [스냅샷] {data.get('cls') or '?'} @ {data.get('block_id') or '?'} "
+          f"→ {url} ({len(blob) / 1024:.0f}KB)")
+
+    # DB 갱신은 기다리지 않는다 — 사진은 이미 디스크에 있고, 실시간 표시는
+    # 호출한 쪽이 곧바로 브로드캐스트한다. (schedule_save 와 같은 이유)
+    task = asyncio.create_task(_attach_snapshot_url(event_id, url))
+    _save_tasks.add(task)
+    task.add_done_callback(_save_tasks.discard)
+
+    return {
+        "event_type": EVENT_SNAPSHOT,
+        "block_id": data.get("block_id"),
+        "event_id": event_id,
+        "cls": data.get("cls"),
+        "image_url": url,
+    }
+
+
+# =========================================================
 # [웹소켓 연결 관리자 구역]
 # 프론트엔드의 접속 상태를 기억하고 관리한다.
 # =========================================================
@@ -357,6 +822,18 @@ class ConnectionManager:
         # 이미 제거된 연결을 또 지우려다 에러 나는 것을 방지하기 위해 존재 여부 확인.
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
+
+    def status_line(self) -> str:
+        """현재 접속 상태를 한 줄로. 로그 끝에 항상 붙인다.
+
+        왜 필요한가 — 연결/해제 로그만 찍으면 마지막 줄이 "끊어짐"일 때
+        정말 아무도 없는 건지, 다른 창이 아직 붙어 있는 건지 알 수 없다.
+        브라우저를 새로고침하면 새 연결이 먼저 붙고 옛 연결이 나중에 끊기는
+        순서라(겹침), "연결됨 → 연결됨 → 끊어짐" 으로 보여 접속이 끊긴 것처럼
+        읽힌다. 실제로는 1개가 살아 있다. 그래서 대수를 함께 찍는다.
+        """
+        n = len(self.active_connections)
+        return f"현재 접속 {n}대" if n else "현재 접속 없음"
 
     async def broadcast(self, message: dict):
         """
@@ -383,27 +860,9 @@ class ConnectionManager:
         for dead in dead_connections:
             self.disconnect(dead)
 
-    async def broadcast_bytes(self, data: bytes):
-        """
-        바이너리 데이터(영상 JPEG 프레임)를 접속 중인 모든 연결로 전송한다.
-        broadcast()와 동일한 패턴이며 전송 방식만 send_bytes로 다름.
-        """
-        dead_connections = []
-        for connection in self.active_connections:
-            try:
-                await connection.send_bytes(data)
-            except Exception:
-                dead_connections.append(connection)
-        for dead in dead_connections:
-            self.disconnect(dead)
+manager = ConnectionManager()   # /ws/frontend (이벤트 JSON)
 
-
-# 이벤트(JSON) 채널과 영상(바이너리) 채널의 프론트엔드 연결을 각각 따로 관리.
-# 채널을 분리하는 이유: 영상 프레임이 몰릴 때 이벤트 JSON 전달이 밀리지 않게 하기 위함.
-manager = ConnectionManager()         # /ws/frontend        (이벤트 JSON)
-stream_manager = ConnectionManager()  # /ws/frontend-stream (영상 바이너리)
-
-# 현재 접속 중인 젯슨의 JSON 채널 웹소켓 (서버→젯슨 stream_boost 전달용).
+# 현재 접속 중인 젯슨의 JSON 채널 웹소켓 (서버→젯슨 쪽지 전달용).
 # 젯슨은 1대뿐이므로 목록이 아닌 단일 참조로 관리. 미접속 시 None.
 jetson_connection: Optional[WebSocket] = None
 
@@ -414,13 +873,14 @@ jetson_connection: Optional[WebSocket] = None
 # =========================================================
 
 @app.get("/api/init-data")
-async def get_init_data():
+async def get_init_data(token: Optional[str] = None):
     """프론트엔드 대시보드가 처음 켜질 때 필요한 3D 맵 기본 정보를 준다.
 
     각 블록에는 현재 조립 단계(level)를 함께 담아준다.
     block_level 이벤트는 단계가 '바뀔 때만' 오기 때문에, 변화 이후에
     새로 열린 대시보드는 그 메시지를 놓친다 → 최신 상태는 이 REST로 복원.
     """
+    require_token(token)
     # 하드코딩된 블록 목록. 추후 DB나 설정 파일에서 읽도록 확장 예정.
     #
     # x, y 는 ship_pose 기록이 아직 없을 때만 쓰이는 자리표시값이다. 아래에서
@@ -472,6 +932,241 @@ async def get_init_data():
     }
 
 
+def require_token(token: Optional[str]):
+    """조회 API 공용 — 암호를 걸었으면 토큰 없이는 못 본다."""
+    if not token_ok(token):
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다")
+
+
+# =========================================================
+# [녹화 파일 구역]
+# mediamtx 가 쌓는 녹화를 확인하고 지운다.
+# =========================================================
+#
+# mediamtx 는 WorkingDirectory(~/mediamtx) 기준 ./recordings/<path>/ 에 쌓는다.
+# 다른 곳에 두려면 RECORDINGS_DIR 로 덮어쓴다.
+RECORDINGS_DIR = os.getenv(
+    "RECORDINGS_DIR", os.path.expanduser("~/mediamtx/recordings"))
+
+
+def _recording_files():
+    """녹화 파일 목록 (경로, 크기, 수정시각). 폴더가 없으면 빈 목록."""
+    out = []
+    for root, _dirs, files in os.walk(RECORDINGS_DIR):
+        for f in files:
+            if not f.lower().endswith((".mp4", ".ts")):
+                continue
+            fp = os.path.join(root, f)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            out.append((fp, st.st_size, st.st_mtime))
+    out.sort(key=lambda x: x[2])
+    return out
+
+
+# mediamtx 제어 API. 127.0.0.1 로만 열려 있어 이 서버에서만 부를 수 있다.
+MEDIAMTX_API = os.getenv("MEDIAMTX_API", "http://127.0.0.1:9997")
+MEDIAMTX_PLAYBACK = os.getenv("MEDIAMTX_PLAYBACK", "http://127.0.0.1:9996")
+
+
+def _http_json(method: str, url: str, json_body=None, timeout: float = 3.0):
+    """작은 HTTP 호출 하나. 표준 라이브러리만 쓴다.
+
+    ★ aiohttp/httpx 를 새로 넣지 않는다.
+      호출이 몇 개뿐이라 의존성을 늘릴 값이 없고, 늘리면 팀원 모두가 다시
+      설치해야 한다(requirements.txt 변경). urllib 로 충분하다.
+    """
+    data = json.dumps(json_body).encode() if json_body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Content-Type": "application/json"} if data else {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+        return json.loads(raw) if raw else {}
+
+
+async def _mtx(method: str, path: str, json_body=None):
+    """mediamtx API 호출. 실패하면 (None, 사유) 를 돌려준다.
+
+    mediamtx 가 안 떠 있는 것은 흔한 상황이라(영상 서버를 따로 껐거나 아직 안 켬)
+    예외로 터뜨리지 않고 프론트가 안내할 수 있게 사유를 넘긴다.
+
+    urllib 은 동기라 이벤트 루프를 막는다. 별도 스레드로 넘긴다.
+    """
+    try:
+        d = await asyncio.to_thread(_http_json, method, MEDIAMTX_API + path, json_body)
+        return d, None
+    except urllib.error.HTTPError as e:
+        return None, f"mediamtx 응답 {e.code}"
+    except Exception as e:
+        return None, type(e).__name__
+
+
+@app.get("/api/recording-state")
+async def recording_state(token: Optional[str] = None):
+    """지금 녹화 중인가."""
+    require_token(token)
+    data, err = await _mtx("GET", "/v3/config/pathdefaults/get")
+    if err:
+        return {"available": False, "reason": err, "recording": None}
+    return {"available": True, "recording": bool(data.get("record")),
+            "delete_after": data.get("recordDeleteAfter")}
+
+
+@app.post("/api/recording")
+async def recording_set(on: bool, token: Optional[str] = None):
+    """녹화를 켜거나 끈다."""
+    require_token(token)
+    _, err = await _mtx("PATCH", "/v3/config/pathdefaults/patch", {"record": on})
+    if err:
+        raise HTTPException(status_code=503, detail=f"미디어 서버에 연결하지 못했습니다 ({err})")
+    print(f"🎬 [녹화] {'시작' if on else '정지'}")
+    return {"ok": True, "recording": on}
+
+
+@app.get("/api/recording-segments")
+async def recording_segments(path: str = "ugv1", token: Optional[str] = None):
+    """녹화 조각 목록 (시작 시각 + 길이). 타임라인을 그리는 데 쓴다."""
+    require_token(token)
+    url = f"{MEDIAMTX_PLAYBACK}/list?path={urllib.parse.quote(path)}"
+    try:
+        return {"segments": await asyncio.to_thread(_http_json, "GET", url, None, 5.0)}
+    except urllib.error.HTTPError as e:
+        return {"segments": [], "reason": f"재생 API 응답 {e.code}"}
+    except Exception as e:
+        return {"segments": [], "reason": type(e).__name__}
+
+
+@app.get("/api/recordings")
+async def recordings_stats(token: Optional[str] = None):
+    """녹화가 얼마나 쌓였는지. 삭제 버튼에 숫자를 보여주려는 것이다."""
+    require_token(token)
+    files = _recording_files()
+    total = sum(f[1] for f in files)
+    return {
+        "dir": RECORDINGS_DIR,
+        "count": len(files),
+        "bytes": total,
+        "oldest": (datetime.fromtimestamp(files[0][2], KST).isoformat() if files else None),
+        "newest": (datetime.fromtimestamp(files[-1][2], KST).isoformat() if files else None),
+    }
+
+
+@app.post("/api/recordings/clear")
+async def recordings_clear(oldest: Optional[int] = None,
+                           token: Optional[str] = None):
+    """녹화 파일을 지운다.
+
+    oldest 를 주면 **오래된 것부터 그 개수만** 지운다. 안 주면 전부.
+    조각이 대략 1분짜리라 개수가 곧 분이다 — "앞의 30분만 지우기" 처럼 쓴다.
+
+    ★ 지금 쓰고 있는 조각(가장 최근 파일)은 남긴다.
+      mediamtx 가 열어둔 채로 쓰고 있는 파일을 지우면, 지워도 공간이 안 돌아오고
+      (열린 파일이라) 그 조각이 깨진 채 남는다. 다음 조각으로 넘어가면 알아서
+      보관 기간에 걸려 사라지므로 굳이 건드리지 않는다.
+
+    ★ 폴더는 지우지 않는다. 파일만 지운다.
+      mediamtx 가 폴더를 다시 만들긴 하지만, 지우는 순간 쓰기가 실패할 수 있다.
+    """
+    require_token(token)
+    files = _recording_files()                  # 오래된 것부터 정렬돼 있다
+    keep = files[-1][0] if files else None      # 지금 쓰는 중일 가능성이 높은 것
+
+    if oldest is not None and oldest > 0:
+        files = files[:oldest]
+
+    removed = 0
+    freed = 0
+    errors = []
+    for fp, size, _mt in files:
+        if fp == keep:
+            continue
+        try:
+            os.remove(fp)
+            removed += 1
+            freed += size
+        except OSError as e:
+            errors.append(f"{os.path.basename(fp)}: {e.strerror}")
+
+    print(f"🗑️ [녹화] {removed}개 삭제, {freed / 1024 / 1024:.0f}MB 확보"
+          + (f" · 실패 {len(errors)}개" if errors else "")
+          + (" · 사용 중인 조각 1개는 남김" if keep else ""))
+    return {"removed": removed, "freed_bytes": freed,
+            "kept": os.path.basename(keep) if keep else None,
+            "errors": errors[:5]}
+
+
+@app.get("/api/event-days")
+async def get_event_days(token: Optional[str] = None):
+    """이벤트가 하루라도 있었던 날짜 목록 (최신순).
+
+    프론트의 날짜 선택기가 "고를 수 있는 날" 만 보여주게 하기 위한 것이다.
+    빈 날짜를 고르고 "왜 아무것도 없지" 하는 일을 없앤다.
+
+    timestamp 는 "2026-08-29T05:12:33+09:00" 같은 KST ISO 문자열이라
+    앞 10글자가 곧 날짜다. 파싱 없이 자를 수 있다.
+    """
+    require_token(token)
+    try:
+        days = await event_collection.aggregate([
+            {"$match": {"event_type": {"$in": list(DANGER_TYPES)},
+                        "timestamp": {"$exists": True}}},
+            {"$group": {"_id": {"$substrBytes": ["$timestamp", 0, 10]},
+                        "count": {"$sum": 1}}},
+            {"$sort": {"_id": -1}},
+            {"$limit": 60},
+        ]).to_list(length=60)
+    except Exception as e:
+        print(f"⚠️ [조회] 날짜 목록 실패({type(e).__name__})")
+        return {"days": []}
+    return {"days": [{"date": d["_id"], "count": d["count"]} for d in days if d["_id"]]}
+
+
+@app.get("/api/events")
+async def get_events(date: Optional[str] = None, limit: int = 200,
+                     token: Optional[str] = None):
+    """하루치 위험 이벤트를 시간순으로. 사진 URL 도 함께 준다.
+
+    date 는 "YYYY-MM-DD" (KST 기준). 없으면 오늘.
+
+    ★ 위험 4종만 준다. 관제 기록을 되짚어 보는 화면이라 position·block_level
+      같은 것은 잡음이다. event_cleared 는 "언제 치워졌나" 를 붙이는 데 쓰려고
+      함께 읽되, 목록에는 위험 이벤트만 남긴다.
+    """
+    require_token(token)
+    day = date or datetime.now(KST).date().isoformat()
+    try:
+        docs = await event_collection.find({
+            "event_type": {"$in": list(DANGER_TYPES) + [EVENT_CLEARED]},
+            "timestamp": {"$gte": day, "$lt": day + "\uffff"},
+        }).sort("_id", 1).to_list(length=max(limit, 1) * 3)
+    except Exception as e:
+        print(f"⚠️ [조회] {day} 이벤트 실패({type(e).__name__})")
+        return {"date": day, "events": [], "error": str(e)}
+
+    cleared_at = {}
+    for d in docs:
+        if d.get("event_type") == EVENT_CLEARED and d.get("event_id"):
+            cleared_at[d["event_id"]] = d.get("timestamp")
+
+    out = []
+    for d in docs:
+        if d.get("event_type") == EVENT_CLEARED:
+            continue
+        d.pop("_id", None)
+        eid = d.get("event_id")
+        # 같은 event_id 가 여러 번이면(재통보 등) 한 번만 보여준다.
+        if eid and any(e.get("event_id") == eid for e in out):
+            continue
+        d["cleared_at"] = cleared_at.get(eid)
+        out.append(d)
+        if len(out) >= limit:
+            break
+    return {"date": day, "events": out}
+
+
 @app.get("/api/history")
 async def get_history():
     """프론트엔드 통계 페이지가 켜질 때, DB에서 과거 이벤트 기록을 꺼내서 준다."""
@@ -501,12 +1196,64 @@ async def websocket_frontend(websocket: WebSocket):
     global jetson_connection
 
     # ConnectionManager에 등록 (accept + 목록 추가가 여기서 함께 처리됨).
+    # 🔒 암호를 걸었으면 토큰이 있어야 붙을 수 있다.
+    #   토큰은 쿼리스트링으로 받는다 — 브라우저 WebSocket API 가 헤더를 못 붙인다.
+    #   (같은 이유로 표준 관행이다. LAN 안 + wss 가 아닌 환경이라 완벽하진 않지만,
+    #    "같은 망의 아무나 들어오는 것" 을 막는다는 목적에는 맞는다)
+    if not token_ok(websocket.query_params.get("token")):
+        print("🔒 [프론트엔드] 토큰 없음/불일치 — 연결 거부")
+        await websocket.close(code=4401)
+        return
+
     await manager.connect(websocket)
-    print("🖥️ [프론트엔드] 대시보드 웹소켓 연결됨!")
+    print(f"🖥️ [프론트엔드] 대시보드 연결됨 — {manager.status_line()}")
+
+    # 지금 로봇이 붙어 있는지 먼저 알려준다.
+    # 로봇이 이미 꺼진 상태에서 대시보드를 여는 경우, 이게 없으면 관제사는
+    # 화면이 멀쩡해 보여서 실시간 정보가 멈춘 줄 모른다.
+    try:
+        await websocket.send_json({
+            "event_type": JETSON_STATUS,
+            "connected": jetson_connection is not None,
+        })
+    except Exception as e:
+        print(f"⚠️ [프론트엔드] 로봇 상태 전송 실패({type(e).__name__})")
+
+    # ★ 재접속 복원 (2026-08-27).
+    #   프론트는 WebSocket 으로 받은 것만 그리므로, 새로고침하면 화면의 위험
+    #   핑이 전부 사라진다. 불이 그 자리에 그대로 있어도 안 뜬다.
+    #
+    #   젯슨이 다시 보내게 만들면 안 된다. change_point_detector 가 이미 보고한
+    #   이벤트를 재발행하지 않는 것은 같은 자리 불로 로봇이 반복 정지하지 않게
+    #   하는 핵심 로직이다. 복원은 DB 를 들고 있는 서버가 해야 한다.
+    #
+    #   broadcast 가 아니라 **방금 접속한 소켓에만** 보낸다. broadcast 하면
+    #   이미 보고 있던 다른 대시보드에 같은 핑이 하나 더 생긴다.
+    try:
+        # 배 위치를 **먼저** 보낸다. 프론트가 map_xy -> 구획 좌표로 바꿀 때
+        # ship_pose 가 필요한데, 없으면 전부 첫 구획으로 떨어져 핑이 엉뚱한
+        # 자리에 찍힌다 (mapXYToPingWorld).
+        pose = await event_collection.find_one(
+            {"event_type": SHIP_POSE}, sort=[("_id", -1)])
+        if pose:
+            pose.pop("_id", None)       # ObjectId 는 send_json 에서 직렬화 안 된다
+            await websocket.send_json(pose)
+
+        restored = await _active_danger_events()
+        for doc in restored:
+            doc.pop("_id", None)
+            doc["replay"] = True        # 프론트가 팝업을 안 띄우게 하는 표시
+            await websocket.send_json(doc)
+        if restored:
+            print(f"🖥️ [프론트엔드] 살아있는 위험 이벤트 {len(restored)}건 복원 전송")
+    except Exception as e:
+        # 복원이 실패해도 연결은 살린다. 핑이 안 뜨는 것은 불편이지만,
+        # 여기서 예외가 새어나가면 대시보드가 아예 붙지 못한다.
+        print(f"⚠️ [프론트엔드] 재접속 복원 실패(무시하고 계속): {e}")
 
     try:
         # 연결이 살아있는 동안 무한 대기하며 메시지를 수신.
-        # 프론트→서버 방향 메시지: stream_boost(화질 명령), webrtc_signal(시그널링).
+        # 프론트→서버 방향 메시지: webrtc_signal(시그널링), event_ack(이벤트 확인).
         while True:
             raw = await websocket.receive_text()
 
@@ -519,15 +1266,24 @@ async def websocket_frontend(websocket: WebSocket):
 
             event_type = data.get("event_type")
 
-            # 프론트→젯슨 전달 대상: stream_boost(화질 명령), webrtc_signal(시그널링).
-            # 서버는 내용을 판단하지 않고 젯슨에게 그대로 배달만 한다.
-            if event_type in JETSON_BOUND_TYPES:
-                # stream_boost만 action 값을 검증. webrtc_signal의 payload는
-                # WebRTC 라이브러리가 만든 것이라 서버가 검사할 필요가 없다.
-                if event_type == STREAM_BOOST and data.get("action") not in ("start", "stop"):
-                    print(f"⚠️ [프론트엔드] stream_boost의 action 값이 이상함: {data}")
-                    continue
+            # 프론트→젯슨 전달 대상: webrtc_signal(시그널링), event_ack(이벤트 확인),
+            # reset_events(기억 초기화).
+            # 서버는 내용을 판단하지 않고 젯슨에게 그대로 배달만 한다 —
+            # webrtc_signal 의 payload 는 WebRTC 라이브러리가 만든 것이고
+            # event_ack 는 젯슨의 Nav2 가 해석할 것이라, 서버가 검사할 게 없다.
+            # 🧹 이벤트 기억 초기화 — 젯슨으로 보내기 전에 **서버도 같이** 비운다.
+            #   젯슨만 비우면 서버는 계속 옛 이벤트를 복원해서, 새로고침하면
+            #   방금 지운 핑이 되살아난다.
+            if event_type == RESET_EVENTS:
+                global RESTORE_FLOOR_AT
+                RESTORE_FLOOR_AT = datetime.now(KST)
+                cleared = len(jetson_live_event_ids)
+                jetson_live_event_ids.clear()
+                print(f"🧹 [초기화] 복원 기준선을 지금으로 밀었다 "
+                      f"({RESTORE_FLOOR_AT.isoformat()[11:19]}) · 생존 목록 {cleared}건 비움. "
+                      f"DB 기록은 그대로 둔다(증빙).")
 
+            if event_type in JETSON_BOUND_TYPES:
                 if jetson_connection is None:
                     print(f"⚠️ [중계] {event_type} 전달 실패: 젯슨 미접속 상태")
                     continue
@@ -546,7 +1302,13 @@ async def websocket_frontend(websocket: WebSocket):
     except WebSocketDisconnect:
         # 브라우저 창을 닫는 등으로 연결이 끊기면 이 예외가 발생.
         manager.disconnect(websocket)
-        print("🖥️ [프론트엔드] 연결 끊어짐.")
+        # 새로고침이면 여기서 0 이 아니다 (새 연결이 먼저 붙어 있으므로).
+        # 대수를 함께 찍어야 "끊겼는데 왜 아직 되지?" 로 헷갈리지 않는다.
+        if manager.active_connections:
+            print(f"🖥️ [프론트엔드] 창 하나 닫힘 (새로고침일 수 있음) — "
+                  f"{manager.status_line()}")
+        else:
+            print(f"🖥️ [프론트엔드] 연결 끊어짐 — {manager.status_line()}")
 
 
 @app.websocket("/ws/jetson")
@@ -558,10 +1320,14 @@ async def websocket_jetson(websocket: WebSocket):
     # (젯슨은 1대뿐이라 브로드캐스트 대상 목록에 넣을 필요가 없음).
     await websocket.accept()
 
-    # 서버→젯슨 방향(stream_boost 전달)에 쓸 수 있도록 연결을 기억해 둠.
+    # 서버→젯슨 방향(webrtc_signal·event_ack 전달)에 쓸 수 있도록 연결을 기억해 둠.
     # 재접속 등으로 새 연결이 오면 마지막 연결이 이전 것을 덮어씀.
     jetson_connection = websocket
-    print("🚗 [젯슨 RC카] 웹소켓 연결됨!")
+    # 새 연결은 곧바로 "살아있는 위험" 묶음을 재통보한다. 옛 목록을 비워두고
+    # 그것으로 다시 채워야 젯슨이 이미 잊은 이벤트가 남지 않는다.
+    jetson_live_event_ids.clear()
+    print("🚗 [젯슨 RC카] 연결됨 — 현재 접속 중")
+    await broadcast_jetson_status()
 
     try:
         while True:
@@ -572,9 +1338,37 @@ async def websocket_jetson(websocket: WebSocket):
             # 수신한 메시지의 event_type 값을 확인.
             event_type = data.get("event_type")
 
+            # 📸 [스냅샷] 감지 순간의 사진. 다른 메시지와 처리 방식이 아예 다르다.
+            #   DB 에 통째로 저장하지 않고 파일로 떨군 뒤, base64 를 뺀 가벼운
+            #   메시지만 프론트로 보낸다. 자세한 이유는 [이벤트 스냅샷 구역] 참조.
+            #   continue 로 아래 저장/브로드캐스트 경로를 타지 않게 한다 —
+            #   그냥 흘려보내면 base64 가 프론트까지 그대로 간다.
+            if event_type == EVENT_SNAPSHOT:
+                light = await handle_event_snapshot(data)
+                if light is not None:
+                    await manager.broadcast(light)
+                continue
+
             # 🚨 [DB 저장 로직] 팀이 합의한 저장 대상(위험 이벤트 4종 +
             # BLOCK_LEVEL 단계 변화 + SHIP_POSE 배 위치)만 DB에 영구 저장한다.
             # (평상시 위치 핑 등 그 외 메시지는 저장하지 않고 브로드캐스트만 함)
+            # 📣 젯슨 재연결 시 "아직 살아있다" 재통보 (replay:true).
+            #   이미 아는 이벤트면 저장하지 않는다 — 중복 기록이 되고, 실제로
+            #   그 시각에 감지된 것도 아니라 감사 기록을 흐린다. 대신 생존
+            #   목록에 넣어 복원 판정이 시각 바닥을 넘어 꺼내오게 한다.
+            if data.get("replay") and event_type in DANGER_TYPES:
+                eid = data.get("event_id")
+                if eid:
+                    jetson_live_event_ids.add(eid)
+                    # ★ 단, 처음 보는 이벤트면 저장해야 한다 (2026-08-29).
+                    #   서버가 꺼져 있는 동안 처음 감지된 불은 이 재통보가
+                    #   **유일한 전달 경로**다. 안 남기면 DB 에 기록이 아예 없어,
+                    #   생존 목록에 id 는 있는데 꺼내올 문서가 없다 —— 핑은 떴다가
+                    #   새로고침하면 사라진다.
+                    schedule_replay_backfill(data.copy())
+                await manager.broadcast(data)
+                continue
+
             if event_type in LOGGED_EVENT_TYPES:
                 # 서버 수신 시각을 timestamp 필드로 추가 (감사/증빙 자료 용도).
                 # 한국 표준시 + 오프셋 명시(+09:00 포함 ISO 8601)로 기록 —
@@ -593,6 +1387,11 @@ async def websocket_jetson(websocket: WebSocket):
                 #   원본이 바뀌면 엉뚱한 값이 저장될 수 있다.
                 schedule_save(data.copy())
 
+            # 치워졌다고 하면 생존 목록에서도 뺀다 — 안 그러면 시각 바닥을
+            # 넘어 계속 꺼내오는 유령이 된다.
+            if event_type == EVENT_CLEARED and data.get("event_id"):
+                jetson_live_event_ids.discard(data["event_id"])
+
             # DB 저장 여부와 관계없이, 프론트엔드에는 지연 없이 즉시 브로드캐스트.
             await manager.broadcast(data)
 
@@ -600,47 +1399,15 @@ async def websocket_jetson(websocket: WebSocket):
         # 젯슨 전원이 꺼지거나 통신이 끊기면 발생.
         # 이 연결이 현재 기억된 연결일 때만 해제 (재접속 직후 옛 연결이
         # 끊기면서 새 연결 참조를 지워버리는 것을 방지).
+        # 프론트와 같은 이유로 대수 대신 "지금 붙어 있나"를 함께 찍는다.
+        # 재접속이면 새 연결이 이미 jetson_connection 을 차지한 뒤라
+        # 옛 연결이 끊기는 이 시점에도 접속은 살아 있다.
         if jetson_connection is websocket:
             jetson_connection = None
-        print("🚗 [젯슨 RC카] 연결 끊어짐.")
+            print("🚗 [젯슨 RC카] 연결 끊어짐 — 현재 접속 없음")
+            # 재접속이면 새 연결이 이미 알렸으므로 여기서는 보내지 않는다.
+            # (그래야 "끊김 → 연결됨" 이 순서가 뒤집혀 도착하지 않는다)
+            await broadcast_jetson_status()
+        else:
+            print("🚗 [젯슨 RC카] 옛 연결 정리됨 (재접속) — 현재 접속 중")
 
-
-# =========================================================
-# 3. 영상 스트림 중계 구역 (젯슨 → 서버 → 프론트엔드, 바이너리)
-# 젯슨이 보내는 JPEG 프레임을 디코딩 없이 그대로 프론트로 흘려보낸다.
-# 이벤트 JSON 채널과 분리해서 영상 때문에 이벤트 전달이 밀리지 않게 함.
-# =========================================================
-
-@app.websocket("/ws/jetson-stream")
-async def websocket_jetson_stream(websocket: WebSocket):
-    """젯슨이 실시간 영상 JPEG 프레임(바이너리)을 보내는 전용 채널."""
-    await websocket.accept()
-    print("🎥 [젯슨 영상] 스트림 채널 연결됨!")
-
-    try:
-        while True:
-            # JPEG 한 장 = 바이너리 메시지 한 개.
-            frame = await websocket.receive_bytes()
-
-            # 서버는 프레임을 열어보지 않고(디코딩 없음) 바이트 그대로 중계.
-            await stream_manager.broadcast_bytes(frame)
-
-    except WebSocketDisconnect:
-        print("🎥 [젯슨 영상] 스트림 채널 끊어짐.")
-
-
-@app.websocket("/ws/frontend-stream")
-async def websocket_frontend_stream(websocket: WebSocket):
-    """프론트엔드가 실시간 영상을 받기 위해 연결하는 채널 (수신 전용)."""
-    await stream_manager.connect(websocket)
-    print("🖥️ [프론트엔드 영상] 스트림 시청 시작!")
-
-    try:
-        # 이 채널은 서버→프론트 단방향. 아래 수신 대기는 데이터를 쓰기 위함이
-        # 아니라 연결 유지와 끊김(WebSocketDisconnect) 감지를 위한 것.
-        while True:
-            await websocket.receive_text()
-
-    except WebSocketDisconnect:
-        stream_manager.disconnect(websocket)
-        print("🖥️ [프론트엔드 영상] 스트림 시청 종료.")

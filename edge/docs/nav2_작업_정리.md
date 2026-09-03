@@ -357,9 +357,13 @@ PR #14에 있다. **머지 전에는 실물에서 Nav2가 로봇을 움직일 �
 ### 🔴 이슈 4. 백엔드 확인(ack) 경로 신설 — Step 7 선결 조건
 
 **2026-08-07 결정으로 필수 작업이 됐다.** 이벤트 재개를 관제 확인 버튼으로 하기로
-했으므로 **서버 → 젯슨 경로가 반드시 필요하다.** 현재 `docs/interface.md`의
-서버→젯슨 메시지는 `stream_boost` 하나뿐이고, 젯슨 쪽 `websocket_client.py`에는
-수신 코드(`ws.recv()`) 자체가 없다.
+했으므로 **서버 → 젯슨 경로가 반드시 필요하다.** 당시 `docs/interface.md`의
+서버→젯슨 메시지는 `stream_boost` 하나뿐이었고, 젯슨 쪽 `websocket_client.py`에는
+수신 코드(`ws.recv()`) 자체가 없었다.
+
+> 이후 경과 (2026-08-28): `event_ack` 가 신설돼 이 이슈는 해결됐고,
+> `stream_boost` 는 아무도 쓰지 않아 코드에서 삭제됐다. 지금 서버→젯슨 메시지는
+> `event_ack` 와 `webrtc_signal` 둘이다.
 
 **방침: 기존 `/ws/jetson` 중계 경로를 재사용한다. 새 엔드포인트를 만들지 않는다.**
 프론트→젯슨 중계 코드는 [backend/main.py:318](../../backend/main.py#L318)에
